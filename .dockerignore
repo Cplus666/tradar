@@ -1,0 +1,15 @@
+# Don't copy these into the image — keeps image small
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.idea/
+.vscode/
+*.log
+notebooks/
+reports/
+data/
+logs/
+.DS_Store
+.env

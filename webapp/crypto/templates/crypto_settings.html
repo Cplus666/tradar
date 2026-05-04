@@ -1,0 +1,251 @@
+{% extends 'crypto_base.html' %}
+{% block title %}Settings · Tradar{% endblock %}
+
+{% block content %}
+<h1 class="text-xl font-semibold mb-4">Crypto settings</h1>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+  <!-- LEFT COLUMN: trading toggles -->
+  <form method="post" action="{{ url_for('crypto.settings') }}" class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 space-y-5">
+    <h3 class="font-semibold border-b border-zinc-800 pb-2">Trading controls</h3>
+    <div>
+      <label class="block text-sm font-semibold mb-1">Crypto kill switch</label>
+      <p class="text-xs text-zinc-500 mb-2">Independent of stock kill switch. ON = no crypto trades placed.</p>
+      <select name="crypto_kill_switch" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-48">
+        <option value="off" {% if kill_switch == 'off' %}selected{% endif %}>OFF — trading allowed</option>
+        <option value="on" {% if kill_switch == 'on' %}selected{% endif %}>ON — block all trades</option>
+      </select>
+    </div>
+
+    <div>
+      <label class="block text-sm font-semibold mb-1">Trading mode</label>
+      <p class="text-xs text-zinc-500 mb-2">Paper = simulated. Live = real Binance orders.</p>
+      <select name="crypto_trading_mode" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-48">
+        <option value="paper" {% if trading_mode == 'paper' %}selected{% endif %}>paper</option>
+        <option value="live" {% if trading_mode == 'live' %}selected{% endif %}>LIVE — real money</option>
+      </select>
+      {% if trading_mode != 'live' %}
+        <p class="text-xs text-amber-400 mt-2">To switch to LIVE, also type <span class="mono font-bold">I UNDERSTAND</span> below:</p>
+        <input type="text" name="live_confirm" placeholder="type: I UNDERSTAND"
+               class="mt-1 bg-zinc-950 border border-amber-700 rounded px-3 py-1 text-xs w-64 mono">
+      {% endif %}
+    </div>
+
+    <hr class="border-zinc-800">
+
+    <h4 class="text-sm font-semibold text-zinc-300">Hard guardrails</h4>
+
+    <div>
+      <label class="block text-xs font-semibold mb-1">Max position size (USD per trade)</label>
+      <input type="number" step="1" min="1" name="crypto_max_position_usd" value="{{ max_position_usd }}"
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+      <p class="text-xs text-zinc-500 mt-1">Hard cap. System refuses any intent above this.</p>
+    </div>
+
+    <div>
+      <label class="block text-xs font-semibold mb-1">Max concurrent open positions</label>
+      <input type="number" step="1" min="1" max="10" name="crypto_max_concurrent" value="{{ max_concurrent }}"
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+      <p class="text-xs text-zinc-500 mt-1">No new entries while at cap.</p>
+    </div>
+
+    <div>
+      <label class="block text-xs font-semibold mb-1">Drawdown halt (% from peak)</label>
+      <input type="number" step="1" min="1" max="50" name="crypto_drawdown_halt_pct" value="{{ drawdown_halt_pct }}"
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+      <p class="text-xs text-zinc-500 mt-1">If portfolio drops this % from peak, halt new entries (manual unlock).</p>
+    </div>
+
+    <div>
+      <label class="block text-xs font-semibold mb-1">Min USDT balance before live mode allowed</label>
+      <input type="number" step="10" min="0" name="crypto_min_balance_usd" value="{{ min_balance_usd }}"
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+      <p class="text-xs text-zinc-500 mt-1">Live orders refused if free USDT &lt; this.</p>
+    </div>
+
+    <hr class="border-zinc-800">
+    <h4 class="text-sm font-semibold text-zinc-300">Scheduler intervals</h4>
+
+    <div>
+      <label class="block text-xs font-semibold mb-1">Full scan interval (minutes)</label>
+      <input type="number" step="1" min="5" max="60" name="crypto_loop_interval_min" value="{{ loop_interval_min }}"
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+      <p class="text-xs text-zinc-500 mt-1">Heavy loop: refresh klines + scan all strategies + sync. Min 5 (Binance rate limits), max 60.</p>
+    </div>
+
+    <div>
+      <label class="block text-xs font-semibold mb-1">Fast exit-check interval (seconds)</label>
+      <input type="number" step="5" min="0" max="600" name="crypto_fast_check_interval_sec" value="{{ fast_check_interval_sec }}"
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+      <p class="text-xs text-zinc-500 mt-1">
+        Light loop in <strong>seconds</strong>: just checks current prices vs stop/target on open positions. Fires exits FAST. <br>
+        Set to <span class="mono">0</span> to disable. Common values: <span class="mono">30</span> (every 30s), <span class="mono">60</span> (1 min), <span class="mono">15</span> (very aggressive).<br>
+        Floor: 10s when enabled (rate-limit safety). Max: 600s (10 min).
+      </p>
+    </div>
+
+    <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 rounded">Save settings</button>
+  </form>
+
+  <!-- RIGHT COLUMN: Binance API credentials -->
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 space-y-4">
+    <h3 class="font-semibold border-b border-zinc-800 pb-2">Binance API credentials</h3>
+
+    {% if has_keys %}
+      <div class="bg-emerald-900/20 border border-emerald-800 rounded p-3 text-sm">
+        <div class="text-emerald-300 font-semibold mb-1">✓ Keys saved</div>
+        <div class="text-xs text-zinc-400 space-y-1">
+          <div>API Key: <span class="mono">{{ api_key_masked }}</span></div>
+          <div>Secret:  <span class="mono">{{ api_secret_masked }}</span></div>
+        </div>
+      </div>
+      <form method="post" action="{{ url_for('crypto.test_connection') }}" class="inline">
+        <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 rounded text-sm">Test connection</button>
+      </form>
+      <form method="post" action="{{ url_for('crypto.clear_credentials') }}" class="inline" onsubmit="return confirm('Clear saved Binance keys?');">
+        <button class="bg-zinc-700 hover:bg-zinc-600 text-zinc-200 px-4 py-2 rounded text-sm">Clear keys</button>
+      </form>
+    {% else %}
+      <div class="bg-amber-950/20 border border-amber-800 rounded p-3 text-sm text-amber-300">
+        ⚠ No keys saved. Paste your read-only Binance API keys below.
+      </div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('crypto.save_credentials') }}" class="space-y-3">
+      <div>
+        <label class="block text-xs font-semibold text-zinc-400 mb-1">API Key {% if has_keys %}(replace existing){% endif %}</label>
+        <input type="text" name="api_key" autocomplete="off" spellcheck="false"
+               placeholder="paste your Binance API key" class="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm mono">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold text-zinc-400 mb-1">Secret Key</label>
+        <input type="password" name="api_secret" autocomplete="off" spellcheck="false"
+               placeholder="paste your Binance secret key (will be masked)" class="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm mono">
+        <p class="text-xs text-zinc-500 mt-1">Stored in local SQLite (<span class="mono">data/app.db</span>, gitignored). Not transmitted anywhere except Binance.</p>
+      </div>
+      <button class="bg-blue-700 hover:bg-blue-600 text-white px-4 py-2 rounded text-sm">Save credentials</button>
+    </form>
+
+    <details class="text-xs text-zinc-500 mt-3">
+      <summary class="cursor-pointer hover:text-zinc-300">How to generate read-only keys</summary>
+      <ol class="list-decimal pl-5 mt-2 space-y-1 text-zinc-400">
+        <li>Login to <span class="mono">binance.com</span> → Profile → API Management</li>
+        <li>Click "Create API" → "System generated"</li>
+        <li>Name it: <span class="mono">stock-platform-readonly</span></li>
+        <li>Permissions: <span class="text-emerald-400">✓ Enable Reading only</span>. Leave trading + withdrawals OFF.</li>
+        <li>Optional: IP-restrict to your Mac's public IP</li>
+        <li>Copy both API Key + Secret (Secret shown ONCE)</li>
+        <li>Paste into the fields above</li>
+      </ol>
+    </details>
+  </div>
+
+  <!-- IP whitelist helper card (lazy-loaded on click) -->
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 lg:col-span-2">
+    <div class="flex items-center justify-between border-b border-zinc-800 pb-2 mb-3 flex-wrap gap-2">
+      <h3 class="font-semibold">🌐 Server IP — for Binance API whitelist</h3>
+      <button onclick="revealIp()" id="ip-reveal-btn"
+              class="text-sm bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1.5 rounded">
+        👁 Reveal IP
+      </button>
+    </div>
+
+    <div id="ip-hidden-msg" class="text-sm text-zinc-500">
+      Click <strong>👁 Reveal IP</strong> to look up this server's outbound IP. Only needed when setting up the Binance API whitelist or troubleshooting -2015 errors.
+    </div>
+
+    <div id="ip-content" class="hidden">
+      <div class="flex items-center gap-3 flex-wrap">
+        <div>
+          <div class="text-xs text-zinc-500 mb-1">This server's outbound IP (what Binance sees)</div>
+          <div id="ip-display" class="text-2xl font-bold mono text-emerald-300 bg-zinc-950 inline-block px-3 py-2 rounded">—</div>
+        </div>
+        <button onclick="copyIp()" class="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-2 rounded text-sm">📋 Copy</button>
+        <span id="ip-copied" class="text-emerald-400 text-sm hidden">✓ Copied!</span>
+        <a href="https://www.binance.com/en/my/settings/api-management" target="_blank" rel="noopener"
+           class="ml-auto bg-amber-700 hover:bg-amber-600 text-white px-3 py-2 rounded text-sm">
+          → Open Binance API Management
+        </a>
+      </div>
+
+      <div class="mt-4 bg-amber-950/30 border border-amber-800 rounded p-3 text-xs text-amber-200 leading-relaxed">
+        <strong>⚠ VPN warning:</strong> If you're on a VPN, the IP can rotate between adjacent addresses (e.g. .11/.12/.13).
+        When that happens, your API calls fail with -2015 and trades stop firing.
+        <br><br>
+        <strong>Recommendation:</strong> Add a small range to the Binance whitelist instead of just one IP. Suggested range:
+        <pre id="ip-range" class="mt-2 bg-zinc-950 p-2 rounded mono text-zinc-300 inline-block"></pre>
+      </div>
+
+      <details class="text-xs text-zinc-500 mt-3">
+        <summary class="cursor-pointer hover:text-zinc-300">How to add IPs to your Binance API key</summary>
+        <ol class="list-decimal pl-5 mt-2 space-y-1 text-zinc-400">
+          <li>Click "→ Open Binance API Management" above</li>
+          <li>Find your API key → click <strong>Edit restrictions</strong></li>
+          <li>Under "IP access restrictions" select <strong>Restrict access to trusted IPs only</strong></li>
+          <li>Paste the IP(s) above into the whitelist field (one per line, or comma-separated)</li>
+          <li>Tick <strong>Enable Spot &amp; Margin Trading</strong> (only available after IPs are restricted)</li>
+          <li>Save — Binance will require email + 2FA confirmation</li>
+        </ol>
+      </details>
+    </div>
+
+    <div id="ip-error" class="hidden text-sm text-rose-400 mt-2"></div>
+  </div>
+</div>
+
+<script>
+function revealIp() {
+  const btn = document.getElementById('ip-reveal-btn');
+  btn.disabled = true;
+  btn.textContent = 'fetching…';
+  fetch('{{ url_for("crypto.api_server_ip") }}')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.ip) {
+        document.getElementById('ip-error').classList.remove('hidden');
+        document.getElementById('ip-error').textContent = '⚠ Could not detect public IP. Run `curl ifconfig.me` on the server.';
+        btn.textContent = '👁 Retry';
+        btn.disabled = false;
+        return;
+      }
+      document.getElementById('ip-display').textContent = data.ip;
+      document.getElementById('ip-hidden-msg').classList.add('hidden');
+      document.getElementById('ip-content').classList.remove('hidden');
+      btn.textContent = '👁 Hide';
+      btn.disabled = false;
+      btn.onclick = hideIp;
+
+      // Build range suggestion
+      const octets = data.ip.split('.');
+      if (octets.length === 4) {
+        const last = parseInt(octets[3]);
+        const base = octets.slice(0,3).join('.');
+        const range = [-2,-1,0,1,2].map(d => `${base}.${last + d}`).join('\n');
+        document.getElementById('ip-range').textContent = range;
+      }
+    })
+    .catch(e => {
+      document.getElementById('ip-error').classList.remove('hidden');
+      document.getElementById('ip-error').textContent = 'Network error: ' + e.message;
+      btn.textContent = '👁 Retry';
+      btn.disabled = false;
+    });
+}
+function hideIp() {
+  document.getElementById('ip-content').classList.add('hidden');
+  document.getElementById('ip-hidden-msg').classList.remove('hidden');
+  const btn = document.getElementById('ip-reveal-btn');
+  btn.textContent = '👁 Reveal IP';
+  btn.onclick = revealIp;
+}
+function copyIp() {
+  const ip = document.getElementById('ip-display').textContent.trim();
+  navigator.clipboard.writeText(ip).then(() => {
+    const t = document.getElementById('ip-copied');
+    t.classList.remove('hidden');
+    setTimeout(() => t.classList.add('hidden'), 2000);
+  });
+}
+</script>
+{% endblock %}

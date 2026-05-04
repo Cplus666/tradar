@@ -1,0 +1,198 @@
+{% extends 'crypto_base.html' %}
+{% block title %}{{ symbol }} · Tradar{% endblock %}
+
+{% block extra_head %}
+  <script src="{{ url_for('static', filename='plotly.min.js') }}"></script>
+{% endblock %}
+
+{% block content %}
+<div class="flex items-baseline gap-3 mb-4">
+  <h1 class="text-2xl font-semibold mono">{{ symbol }}</h1>
+  <div class="text-2xl mono num font-semibold">
+    {% if readout.last < 0.01 %}${{ "%.6f"|format(readout.last) }}
+    {% elif readout.last < 1 %}${{ "%.4f"|format(readout.last) }}
+    {% else %}${{ "%.2f"|format(readout.last) }}{% endif %}
+  </div>
+  <div class="text-lg mono num {% if readout.chg_pct > 0 %}pos{% elif readout.chg_pct < 0 %}neg{% endif %}">
+    {{ "%+.2f"|format(readout.chg_pct) }}%
+  </div>
+  <span class="text-xs px-2 py-0.5 rounded ml-2
+    {% if readout.status_color == 'emerald' %}bg-emerald-900/40 text-emerald-300 font-semibold
+    {% elif readout.status_color == 'amber' %}bg-amber-900/40 text-amber-300
+    {% elif readout.status_color == 'sky' %}bg-sky-900/40 text-sky-300
+    {% else %}bg-zinc-800 text-zinc-400{% endif %}">{{ readout.status_label }}</span>
+  <a href="{{ url_for('crypto.universe') }}" class="ml-auto text-xs text-zinc-500 hover:text-zinc-300">← back to universe</a>
+</div>
+
+<!-- Readout cards -->
+<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+    <div class="text-xs text-zinc-500">RSI(14)</div>
+    <div class="text-lg mono num font-semibold {% if readout.rsi14 and readout.rsi14 > 70 %}text-amber-400{% elif readout.rsi14 and readout.rsi14 < 30 %}text-emerald-400{% endif %}">
+      {% if readout.rsi14 is not none %}{{ "%.0f"|format(readout.rsi14) }}{% else %}—{% endif %}
+    </div>
+  </div>
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+    <div class="text-xs text-zinc-500">SMA50</div>
+    <div class="text-lg mono num">
+      {% if readout.sma50 is not none %}
+        {% if readout.sma50 < 0.01 %}${{ "%.6f"|format(readout.sma50) }}{% elif readout.sma50 < 1 %}${{ "%.4f"|format(readout.sma50) }}{% else %}${{ "%.2f"|format(readout.sma50) }}{% endif %}
+      {% else %}—{% endif %}
+    </div>
+  </div>
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+    <div class="text-xs text-zinc-500">20-bar high</div>
+    <div class="text-lg mono num">
+      {% if readout.prior_high20 < 0.01 %}${{ "%.6f"|format(readout.prior_high20) }}{% elif readout.prior_high20 < 1 %}${{ "%.4f"|format(readout.prior_high20) }}{% else %}${{ "%.2f"|format(readout.prior_high20) }}{% endif %}
+    </div>
+  </div>
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+    <div class="text-xs text-zinc-500">Gap to high</div>
+    <div class="text-lg mono num {% if readout.gap_to_high and readout.gap_to_high > 0 %}pos{% elif readout.gap_to_high and readout.gap_to_high < 0 %}neg{% endif %}">
+      {% if readout.gap_to_high is not none %}{{ "%+.1f"|format(readout.gap_to_high) }}%{% else %}—{% endif %}
+    </div>
+  </div>
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+    <div class="text-xs text-zinc-500">Vol vs avg</div>
+    <div class="text-lg mono num {% if readout.vol_ratio and readout.vol_ratio > 1.5 %}pos font-semibold{% elif readout.vol_ratio and readout.vol_ratio > 1 %}text-amber-400{% endif %}">
+      {% if readout.vol_ratio is not none %}{{ "%.1f"|format(readout.vol_ratio) }}x{% else %}—{% endif %}
+    </div>
+  </div>
+</div>
+
+{% if has_position and position %}
+<div class="bg-blue-950/40 border border-blue-800 rounded-lg p-4 mb-4">
+  <div class="text-xs text-blue-300 font-semibold uppercase mb-1">Open position</div>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+    <div>Entry: <span class="mono">${{ "%.6f"|format(position.entry_price) }}</span></div>
+    <div>Qty: <span class="mono">{{ "%.4f"|format(position.qty) }}</span></div>
+    <div>Value now: <span class="mono">${{ "%.2f"|format(position.value_now) }}</span></div>
+    <div>P&L: <span class="mono font-semibold {% if position.pnl > 0 %}pos{% else %}neg{% endif %}">${{ "%.2f"|format(position.pnl) }} ({{ "%+.1f"|format(position.pnl_pct) }}%)</span></div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Chart -->
+<div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3" style="height: 600px;">
+  <div id="chart" style="width: 100%; height: 100%;"></div>
+</div>
+
+<script>
+  const data = {{ chart_json | safe }};
+  const trades = {{ trades_json | safe }};
+
+  const volColors = data.close.map((c, i) => c >= data.open[i] ? 'rgba(16,185,129,0.5)' : 'rgba(239,68,68,0.5)');
+
+  const traces = [
+    {
+      x: data.dates, open: data.open, high: data.high, low: data.low, close: data.close,
+      type: 'candlestick', name: 'Price', yaxis: 'y',
+      increasing: { line: { color: '#10b981' } },
+      decreasing: { line: { color: '#ef4444' } },
+      hoverinfo: 'x+y',
+    },
+    {
+      x: data.dates, y: data.sma50, type: 'scatter', mode: 'lines', name: 'SMA 50',
+      line: { color: '#fbbf24', width: 1.5 }, yaxis: 'y', connectgaps: true,
+    },
+    {
+      x: data.dates, y: data.high20, type: 'scatter', mode: 'lines', name: '20-bar high (breakout level)',
+      line: { color: '#60a5fa', width: 1, dash: 'dot' }, yaxis: 'y', opacity: 0.7, connectgaps: true,
+    },
+    {
+      x: data.dates, y: data.volume, type: 'bar', name: 'Volume',
+      marker: { color: volColors }, yaxis: 'y2', showlegend: false,
+    },
+    {
+      x: data.dates, y: data.rsi14, type: 'scatter', mode: 'lines', name: 'RSI(14)',
+      line: { color: '#e5e5e5', width: 1.5 }, yaxis: 'y3', connectgaps: true,
+    },
+  ];
+
+  // ---- Historical BUY/SELL markers ----
+  const buys = trades.filter(t => t.side === 'BUY');
+  const sells = trades.filter(t => t.side === 'SELL');
+
+  if (buys.length > 0) {
+    traces.push({
+      x: buys.map(t => t.x),
+      y: buys.map(t => t.price * 0.985),  // slightly below candle so triangle sits under
+      type: 'scatter', mode: 'markers', name: 'BUY',
+      marker: { symbol: 'triangle-up', size: 16, color: '#10b981',
+                line: { width: 1.5, color: '#0a0a0a' } },
+      text: buys.map(t => `${t.strategy}<br>qty ${t.qty.toFixed(4)}<br>$${t.quote.toFixed(2)} spent`),
+      hovertemplate: '<b>BUY</b> %{x}<br>price $%{customdata}<br>%{text}<extra></extra>',
+      customdata: buys.map(t => t.price < 1 ? t.price.toFixed(8) : t.price.toFixed(4)),
+      yaxis: 'y',
+    });
+  }
+
+  if (sells.length > 0) {
+    traces.push({
+      x: sells.map(t => t.x),
+      y: sells.map(t => t.price * 1.015),  // slightly above candle for sells
+      type: 'scatter', mode: 'markers', name: 'SELL',
+      marker: { symbol: 'triangle-down', size: 16, color: '#ef4444',
+                line: { width: 1.5, color: '#0a0a0a' } },
+      text: sells.map(t => `${t.strategy}<br>qty ${t.qty.toFixed(4)}<br>$${t.quote.toFixed(2)} received`),
+      hovertemplate: '<b>SELL</b> %{x}<br>price $%{customdata}<br>%{text}<extra></extra>',
+      customdata: sells.map(t => t.price < 1 ? t.price.toFixed(8) : t.price.toFixed(4)),
+      yaxis: 'y',
+    });
+  }
+
+  const shapes = [
+    { type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y3', y0: 70, y1: 70,
+      line: { color: '#ef4444', width: 1, dash: 'dot' } },
+    { type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y3', y0: 30, y1: 30,
+      line: { color: '#10b981', width: 1, dash: 'dot' } },
+  ];
+
+  const layout = {
+    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+    font: { color: '#a1a1aa', family: 'Inter, sans-serif' },
+    margin: { l: 60, r: 80, t: 10, b: 30 },
+    // X-axis: allow zoom/pan horizontally
+    xaxis: {
+      rangeslider: { visible: false }, gridcolor: '#27272a',
+      showgrid: true, type: 'category', fixedrange: false,
+    },
+    // Y-axes: locked — no vertical zoom; auto-scales to visible price range
+    yaxis:  { domain: [0.42, 1],   gridcolor: '#27272a', title: 'Price (USDT)', fixedrange: true, autorange: true },
+    yaxis2: { domain: [0.27, 0.40], gridcolor: '#27272a', title: 'Vol',          fixedrange: true, autorange: true },
+    yaxis3: { domain: [0, 0.22],   gridcolor: '#27272a', title: 'RSI(14)',      fixedrange: true, range: [0, 100], dtick: 30 },
+    showlegend: true,
+    legend: { orientation: 'h', y: 1.06, x: 0, font: { size: 11 } },
+    shapes: shapes,
+    hovermode: 'x unified',
+    dragmode: 'zoom',  // default to x-zoom box
+    // Vertical toolbar at top-right, dark-themed to match dashboard
+    modebar: {
+      orientation: 'v',
+      bgcolor: 'rgba(24,24,27,0.85)',     // zinc-900 with slight transparency
+      color: '#71717a',                    // zinc-500 — idle icons
+      activecolor: '#10b981',              // emerald — hover/active
+    },
+  };
+  // Mode bar: keep only useful buttons, prominently include "Reset axes"
+  Plotly.newPlot('chart', traces, layout, {
+    displayModeBar: true,
+    displaylogo: false,
+    responsive: true,
+    modeBarButtonsToRemove: [
+      'lasso2d', 'select2d', 'autoScale2d',
+      'zoomIn2d', 'zoomOut2d',  // remove +/- buttons (use box-zoom + reset instead)
+      'toggleSpikelines',
+    ],
+    // Resulting bar: zoom (box), pan, reset axes, download — clean + functional
+  });
+</script>
+
+<div class="mt-4 text-xs text-zinc-500 leading-relaxed">
+  <strong>Reading the chart:</strong>
+  Yellow = SMA50 (trend filter — system only buys when price is above this).
+  Blue dotted = 20-bar high (breakout level — close above this on volume = buy signal).
+  Green/red bars = volume (green up-day, red down-day).
+  RSI dotted lines: red 70 (overbought), green 30 (oversold).
+</div>
+{% endblock %}

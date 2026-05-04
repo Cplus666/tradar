@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Runtime data — these are user-specific, never commit
+data/
+logs/
+
+# Secrets
+.env
+*.key
+*.pem

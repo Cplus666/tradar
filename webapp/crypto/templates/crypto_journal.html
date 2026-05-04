@@ -1,0 +1,269 @@
+{% extends 'crypto_base.html' %}
+{% block title %}Journal · Tradar{% endblock %}
+
+{% block content %}
+<div class="flex items-baseline gap-3 mb-4 flex-wrap">
+  <h1 class="text-xl font-semibold">Journal</h1>
+  <div id="journal-counts" class="text-zinc-500 text-sm">loading…</div>
+  <div id="journal-totals" class="ml-auto text-right text-sm text-zinc-500">
+    loading P&L…
+  </div>
+</div>
+
+<div id="journal-pagination-top" class="bg-zinc-900 border border-zinc-800 rounded-lg mb-3 hidden"></div>
+<div id="journal-entries" class="space-y-3">
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-10 text-center text-zinc-500">
+    Loading journal…
+  </div>
+</div>
+<div id="journal-pagination-bottom" class="bg-zinc-900 border border-zinc-800 rounded-lg mt-3 hidden"></div>
+
+<script>
+function fmtPrice(p) {
+  if (p == null) return '—';
+  if (p < 0.01) return '$' + p.toFixed(8);
+  if (p < 1) return '$' + p.toFixed(4);
+  return '$' + p.toFixed(2);
+}
+function fmtMoney(v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }
+function fmtPct(v) { return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+function fmtDt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  // Display as MYT (UTC+8)
+  const myt = new Date(d.getTime() + 8 * 60 * 60 * 1000);
+  const Y = myt.getUTCFullYear(), M = String(myt.getUTCMonth()+1).padStart(2,'0'),
+        D = String(myt.getUTCDate()).padStart(2,'0'),
+        h = String(myt.getUTCHours()).padStart(2,'0'),
+        m = String(myt.getUTCMinutes()).padStart(2,'0');
+  return `${Y}-${M}-${D} ${h}:${m} MYT`;
+}
+function pnlClass(v) { return v == null ? '' : v > 0 ? 'pos' : v < 0 ? 'neg' : ''; }
+
+function renderEntry(e) {
+  const borderCls = e.is_open ? 'border-blue-700 bg-blue-950/10'
+    : e.pnl_pct > 0 ? 'border-emerald-800'
+    : e.pnl_pct < 0 ? 'border-rose-800'
+    : 'border-zinc-800';
+  const statusBadge = e.is_open
+    ? '<span class="text-xs px-2 py-0.5 rounded bg-blue-900/50 text-blue-300 font-semibold">OPEN</span>'
+    : '<span class="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-500">CLOSED</span>';
+
+  // P&L section: closed = computed from DB; open = placeholder until prices arrive
+  let pnlSection;
+  if (e.is_open) {
+    pnlSection = `<div class="text-lg text-zinc-500" data-pnl>loading P&L…</div>
+                  <div class="text-xs text-zinc-600" data-pnl-sub>fetching live price</div>`;
+  } else if (e.pnl_pct != null) {
+    const cls = pnlClass(e.pnl_pct);
+    pnlSection = `<div class="text-xl font-bold mono num ${cls}">${fmtPct(e.pnl_pct)} / ${fmtMoney(e.pnl_usd)} USDT</div>
+                  <div class="text-xs text-zinc-500">held ${e.held_h.toFixed(1)} hours</div>`;
+  } else {
+    pnlSection = `<div class="text-lg text-zinc-500">P&L: N/A</div>`;
+  }
+
+  let exitBlock;
+  if (e.is_open) {
+    exitBlock = `<div>
+      <div class="text-xs text-zinc-500">Current (live)</div>
+      <div class="mono text-zinc-500">— still open · ${e.held_h.toFixed(1)}h held</div>
+      <div class="mono font-semibold" data-current-value>loading…</div>
+      <div class="text-xs text-zinc-500 mono" data-current-price>@ —</div>
+    </div>`;
+  } else {
+    exitBlock = `<div>
+      <div class="text-xs text-zinc-500">Exit</div>
+      <div class="mono">${fmtDt(e.exit_at)}</div>
+      <div class="mono font-semibold">received $${e.exit_value.toFixed(2)}</div>
+      <div class="text-xs text-zinc-500 mono">@ ${fmtPrice(e.exit_price)}</div>
+    </div>`;
+  }
+
+  let reasonsBlock = '';
+  if (e.entry_reason || e.exit_reason || e.is_open) {
+    const entryR = e.entry_reason
+      ? `<div class="bg-zinc-950 rounded p-2"><div class="text-zinc-500 mb-1">Why we entered</div><div class="text-zinc-300">${e.entry_reason}</div></div>` : '';
+    const exitR = e.exit_reason
+      ? `<div class="bg-zinc-950 rounded p-2"><div class="text-zinc-500 mb-1">Why we exited</div><div class="text-zinc-300">${e.exit_reason}</div></div>`
+      : (e.is_open
+        ? `<div class="bg-zinc-950 rounded p-2 border border-blue-900/30"><div class="text-zinc-500 mb-1">Status</div><div class="text-blue-300">Still open — exit will populate when stop/target/time-stop fires (or you sell from Holdings)</div></div>`
+        : '');
+    reasonsBlock = `<div class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">${entryR}${exitR}</div>`;
+  }
+
+  return `<div class="bg-zinc-900 border rounded-lg p-4 ${borderCls}">
+    <div class="flex items-baseline justify-between flex-wrap gap-2 mb-2">
+      <div class="flex items-baseline gap-2 flex-wrap">
+        <a href="/crypto/coin/${e.symbol}" class="text-lg font-bold hover:underline">${e.symbol}</a>
+        <span class="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">${e.strategy || '?'}</span>
+        ${statusBadge}
+      </div>
+      <div class="text-right">${pnlSection}</div>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-sm">
+      <div data-entry-iso="${e.entry_at}">
+        <div class="text-xs text-zinc-500">Entry</div>
+        <div class="mono">${fmtDt(e.entry_at)}</div>
+        <div class="mono font-semibold">spent $${e.entry_value.toFixed(2)}</div>
+        <div class="text-xs text-zinc-500 mono">@ ${fmtPrice(e.entry_price)}</div>
+      </div>
+      ${exitBlock}
+      <div>
+        <div class="text-xs text-zinc-500">Stop / Target</div>
+        ${e.stop ? `<div class="mono text-rose-400">${fmtPrice(e.stop)}</div>` : ''}
+        ${e.target ? `<div class="mono text-emerald-400">${fmtPrice(e.target)}</div>` : ''}
+      </div>
+      <div>
+        <div class="text-xs text-zinc-500">Position size</div>
+        <div class="mono">$${e.notional.toFixed(2)}</div>
+        <div class="text-xs text-zinc-500">${e.qty} units</div>
+      </div>
+    </div>
+    ${reasonsBlock}
+  </div>`;
+}
+
+function renderPagination(p) {
+  if (!p || p.pages <= 1) return '';
+  const link = (page, label, enabled) => enabled
+    ? `<a href="?page=${page}" class="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300">${label}</a>`
+    : `<span class="px-2 py-1 rounded text-zinc-600">${label}</span>`;
+  return `<div class="flex items-center justify-between px-4 py-3 border-t border-zinc-800 text-sm">
+    <div class="text-zinc-500">Showing <span class="text-zinc-300 mono">${p.start_idx}-${p.end_idx}</span> of <span class="text-zinc-300 mono">${p.total}</span></div>
+    <div class="flex items-center gap-2">
+      ${link(1, '« first', p.has_prev)}
+      ${link(p.page - 1, '‹ prev', p.has_prev)}
+      <span class="px-3 py-1 mono text-zinc-300">page ${p.page} / ${p.pages}</span>
+      ${link(p.page + 1, 'next ›', p.has_next)}
+      ${link(p.pages, 'last »', p.has_next)}
+    </div>
+  </div>`;
+}
+
+// Track currently displayed open entries so we can update them when prices arrive
+let _openEntriesIndex = {};  // symbol → array of entry objects
+
+function loadJournal() {
+  const params = new URLSearchParams(location.search);
+  const page = parseInt(params.get('page') || '1');
+
+  // STAGE 1 — fast: DB data only (no Binance). Renders cards immediately.
+  fetch('/crypto/api/journal?page=' + page)
+    .then(r => r.json())
+    .then(d => {
+      // Counts
+      document.getElementById('journal-counts').innerHTML =
+        `<span class="text-blue-300">${d.open_count} open</span> · ${d.closed_count} closed`;
+      // Totals (realized known immediately, unrealized waits for stage 2)
+      const realCls = pnlClass(d.realized_pnl);
+      let totalsHtml = `<div class="text-sm text-zinc-500">Realized: <span class="mono font-semibold ${realCls}">${fmtMoney(d.realized_pnl)} USDT</span></div>`;
+      if (d.open_count > 0) {
+        totalsHtml += `<div class="text-sm text-zinc-500" id="journal-unrealized-line">Unrealized: <span class="mono text-zinc-500">loading…</span></div>`;
+      }
+      document.getElementById('journal-totals').innerHTML = totalsHtml;
+
+      // Render cards immediately (open ones with placeholder for live data)
+      if (d.entries.length === 0) {
+        document.getElementById('journal-entries').innerHTML =
+          `<div class="bg-zinc-900 border border-zinc-800 rounded-lg p-10 text-center text-zinc-500">No trades yet.</div>`;
+      } else {
+        document.getElementById('journal-entries').innerHTML = d.entries.map(renderEntry).join('');
+      }
+      // Build index for stage 2 update
+      _openEntriesIndex = {};
+      for (const e of d.entries) {
+        if (e.is_open) {
+          (_openEntriesIndex[e.symbol] = _openEntriesIndex[e.symbol] || []).push(e);
+        }
+      }
+
+      // Pagination
+      const pagHtml = renderPagination(d);
+      ['journal-pagination-top', 'journal-pagination-bottom'].forEach(id => {
+        const el = document.getElementById(id);
+        if (pagHtml) {
+          el.innerHTML = pagHtml; el.classList.remove('hidden');
+        } else {
+          el.classList.add('hidden');
+        }
+      });
+
+      // STAGE 2 — slow: fetch live prices and update only the cells that need them
+      if (d.open_symbols && d.open_symbols.length > 0) {
+        loadLivePrices(d.open_symbols);
+      }
+    })
+    .catch(e => {
+      document.getElementById('journal-entries').innerHTML =
+        `<div class="bg-rose-900/20 border border-rose-800 rounded-lg p-6 text-rose-400">Failed to load journal: ${e.message}</div>`;
+    });
+}
+
+function loadLivePrices(symbols) {
+  fetch('/crypto/api/journal/prices')
+    .then(r => r.json())
+    .then(pd => {
+      if (!pd.ok) return;
+      let totalUnrealized = 0;
+      // Update each open entry's card with the live data
+      for (const sym of symbols) {
+        const cur = pd.prices[sym];
+        if (cur == null) continue;
+        const entries = _openEntriesIndex[sym] || [];
+        for (const e of entries) {
+          updateOpenEntryCard(e, cur);
+          totalUnrealized += (cur - e.entry_price) * e.qty;
+        }
+      }
+      // Update unrealized total
+      const line = document.getElementById('journal-unrealized-line');
+      if (line) {
+        const cls = pnlClass(totalUnrealized);
+        line.innerHTML = `Unrealized: <span class="mono font-semibold ${cls}">${fmtMoney(totalUnrealized)} USDT</span> <span class="text-xs text-zinc-600">(live)</span>`;
+      }
+    })
+    .catch(e => console.warn('live prices failed:', e));
+}
+
+function updateOpenEntryCard(entry, currentPrice) {
+  // Find the rendered card for this open entry and update its live cells.
+  // Match: the symbol link's href + entry_at (in case of multiple positions on same symbol)
+  const cards = document.querySelectorAll('#journal-entries > div');
+  for (const card of cards) {
+    const link = card.querySelector('a[href$="/' + entry.symbol + '"]');
+    if (!link) continue;
+    // Verify this is the right card by matching entry timestamp
+    const entryTimeText = card.querySelector('[data-entry-iso="' + entry.entry_at + '"]');
+    if (!entryTimeText) continue;
+    // Compute updated values
+    const value = currentPrice * entry.qty;
+    const pnlPct = (currentPrice - entry.entry_price) / entry.entry_price * 100;
+    const pnlUsd = (currentPrice - entry.entry_price) * entry.qty;
+    // Update the placeholder elements
+    const priceEl = card.querySelector('[data-current-price]');
+    const valueEl = card.querySelector('[data-current-value]');
+    const pnlEl = card.querySelector('[data-pnl]');
+    const pnlSubEl = card.querySelector('[data-pnl-sub]');
+    if (priceEl) priceEl.textContent = '@ ' + fmtPrice(currentPrice);
+    if (valueEl) valueEl.textContent = 'value $' + value.toFixed(2);
+    if (pnlEl) {
+      pnlEl.className = 'text-xl font-bold mono num ' + pnlClass(pnlPct);
+      pnlEl.textContent = fmtPct(pnlPct) + ' / ' + fmtMoney(pnlUsd) + ' USDT';
+    }
+    if (pnlSubEl) {
+      pnlSubEl.className = 'text-xs text-zinc-500';
+      pnlSubEl.textContent = 'unrealized · live';
+    }
+    return;  // matched
+  }
+}
+
+loadJournal();
+// Refresh live prices every 30s (only stage 2; cards stay rendered)
+setInterval(() => {
+  if (Object.keys(_openEntriesIndex).length > 0) {
+    loadLivePrices(Object.keys(_openEntriesIndex));
+  }
+}, 30000);
+</script>
+{% endblock %}

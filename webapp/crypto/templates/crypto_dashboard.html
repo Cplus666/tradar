@@ -1,0 +1,410 @@
+{% extends 'crypto_base.html' %}
+{% block title %}Dashboard · Tradar{% endblock %}
+{% block extra_head %}
+  <script src="{{ url_for('static', filename='plotly.min.js') }}"></script>
+{% endblock %}
+
+{% block content %}
+{% if not has_keys %}
+<section class="bg-amber-950/40 border border-amber-800 rounded-lg p-5 mb-4">
+  <h2 class="text-amber-300 font-semibold mb-2">🔑 Binance API keys not configured</h2>
+  <a href="{{ url_for('crypto.settings') }}" class="inline-block bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm">→ Set up Binance API keys</a>
+</section>
+{% endif %}
+
+{# === BIG P&L BANNER (lazy-loaded) === #}
+<section id="pnl-banner" class="rounded-xl p-5 mb-4 border-2 bg-zinc-900 border-zinc-700">
+  <div class="flex items-center justify-between flex-wrap gap-3">
+    <div>
+      <div class="text-xs text-zinc-400 uppercase tracking-wide">Account value</div>
+      <div id="pnl-account-value" class="text-4xl font-bold mono num mt-1 text-zinc-600">loading…</div>
+      <div id="pnl-starting" class="text-sm text-zinc-500 mt-1"></div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-zinc-400 uppercase tracking-wide">Today's P&L</div>
+      <div id="pnl-today" class="text-4xl font-bold mono num mt-1 text-zinc-600">—</div>
+      <div id="pnl-today-detail" class="text-sm mt-1"></div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-zinc-400 uppercase tracking-wide">Today</div>
+      <div id="pnl-wl" class="text-2xl font-semibold mt-1 text-zinc-600">—</div>
+      <div id="pnl-open" class="text-sm text-zinc-500 mt-1"></div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-zinc-400 uppercase tracking-wide">Mode</div>
+      <div class="text-xl font-bold {% if trading_mode == 'live' %}text-amber-400{% else %}text-emerald-400{% endif %} mt-1">
+        {{ trading_mode | upper }}
+      </div>
+      {% if kill_switch == 'on' %}<div class="text-sm text-red-400 mt-1">⛔ KILL SWITCH ON</div>{% endif %}
+    </div>
+  </div>
+</section>
+
+<div class="grid grid-cols-12 gap-4">
+
+  {# === LIVE POSITION CARDS === #}
+  <div class="col-span-12">
+    <section class="bg-zinc-900 border border-zinc-800 rounded-lg">
+      <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+        <h2 class="font-semibold">Open positions <span class="text-xs text-zinc-500 font-normal">— live P&L, distance to stop/target</span></h2>
+        <div class="flex gap-2">
+          <form method="post" action="{{ url_for('crypto.sync_balances') }}" class="inline">
+            <button class="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1.5 rounded">↻ Sync</button>
+          </form>
+          <form method="post" action="{{ url_for('crypto.run_loop_now') }}" class="inline">
+            <button class="text-xs bg-blue-800 hover:bg-blue-700 text-blue-100 px-3 py-1.5 rounded">▶ Run loop</button>
+          </form>
+          <a href="{{ url_for('crypto.universe') }}" class="text-xs bg-amber-800 hover:bg-amber-700 text-amber-100 px-3 py-1.5 rounded">🔥 Universe</a>
+        </div>
+      </div>
+      <div id="position-cards" class="p-4 text-center text-zinc-500 text-sm">Loading positions…</div>
+    </section>
+  </div>
+
+  {# === EQUITY CURVE === #}
+  <div class="col-span-12 lg:col-span-8">
+    <section class="bg-zinc-900 border border-zinc-800 rounded-lg">
+      <div class="px-4 py-3 border-b border-zinc-800">
+        <h2 class="font-semibold">Equity curve <span class="text-xs text-zinc-500 font-normal">— account value over last 7 days</span></h2>
+      </div>
+      <div id="equity-chart" style="height: 280px;" class="p-2"></div>
+    </section>
+  </div>
+
+  {# === STRATEGY BREAKDOWN === #}
+  <div class="col-span-12 lg:col-span-4">
+    <section class="bg-zinc-900 border border-zinc-800 rounded-lg h-full">
+      <div class="px-4 py-3 border-b border-zinc-800">
+        <h2 class="font-semibold">Strategy performance</h2>
+      </div>
+      {% if strat_breakdown %}
+        <table class="w-full text-xs">
+          <thead class="text-zinc-500">
+            <tr>
+              <th class="text-left px-3 py-2">Strategy</th>
+              <th class="text-right">W/L</th>
+              <th class="text-right pr-3">Net $</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for s in strat_breakdown %}
+              <tr class="border-t border-zinc-800">
+                <td class="px-3 py-2">{{ s.strategy }}</td>
+                <td class="text-right mono num">
+                  <span class="pos">{{ s.wins }}</span>/<span class="neg">{{ s.losses }}</span>
+                  {% if s.win_rate is not none %}<span class="text-zinc-500"> ({{ "%.0f"|format(s.win_rate) }}%)</span>{% endif %}
+                </td>
+                <td class="text-right pr-3 mono num font-semibold {% if s.net_usd > 0 %}pos{% elif s.net_usd < 0 %}neg{% endif %}">
+                  {{ "%+.2f"|format(s.net_usd) }}
+                </td>
+              </tr>
+              {% if s.avg_win_pct or s.avg_loss_pct %}
+              <tr class="text-xs text-zinc-500">
+                <td colspan="3" class="px-3 pb-2">
+                  {% if s.avg_win_pct %}avg win +{{ "%.1f"|format(s.avg_win_pct) }}%{% endif %}
+                  {% if s.avg_win_pct and s.avg_loss_pct %} · {% endif %}
+                  {% if s.avg_loss_pct %}avg loss {{ "%.1f"|format(s.avg_loss_pct) }}%{% endif %}
+                </td>
+              </tr>
+              {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <div class="p-6 text-center text-zinc-500 text-sm">No closed trades yet.</div>
+      {% endif %}
+    </section>
+  </div>
+
+  <div class="col-span-12 lg:col-span-8 space-y-4">
+    <!-- 7-day activity summary (no LLM, just stats from local DB) -->
+    {% if activity %}
+    <section class="bg-zinc-900 border border-zinc-800 rounded-lg">
+      <div class="px-4 py-3 border-b border-zinc-800">
+        <h2 class="font-semibold">Last {{ activity.days }} days <span class="text-xs text-zinc-500 font-normal">— what the system did</span></h2>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 p-4">
+        <div class="bg-zinc-950 rounded p-3">
+          <div class="text-xs text-zinc-500">Loop fires</div>
+          <div class="text-lg mono num font-semibold">{{ activity.loop_fires }}</div>
+          <div class="text-xs text-zinc-500">{{ activity.error_runs }} errors</div>
+        </div>
+        <div class="bg-zinc-950 rounded p-3">
+          <div class="text-xs text-zinc-500">Signals → Trades</div>
+          <div class="text-lg mono num font-semibold">{{ activity.signals_generated }} → <span class="pos">{{ activity.trades_executed }}</span></div>
+          <div class="text-xs text-zinc-500">{{ activity.trades_skipped }} skipped by guards</div>
+        </div>
+        <div class="bg-zinc-950 rounded p-3">
+          <div class="text-xs text-zinc-500">Closed trades</div>
+          <div class="text-lg mono num font-semibold">
+            <span class="pos">{{ activity.wins }}W</span> / <span class="neg">{{ activity.losses }}L</span>
+          </div>
+          <div class="text-xs text-zinc-500">
+            {% if activity.win_rate is not none %}{{ "%.0f"|format(activity.win_rate) }}% win rate{% else %}no closed trades{% endif %}
+          </div>
+        </div>
+        <div class="bg-zinc-950 rounded p-3">
+          <div class="text-xs text-zinc-500">Realized P&L</div>
+          <div class="text-lg mono num font-semibold {% if activity.realized_pnl_usd > 0 %}pos{% elif activity.realized_pnl_usd < 0 %}neg{% endif %}">
+            {{ "%+.2f"|format(activity.realized_pnl_usd) }} USDT
+          </div>
+          <div class="text-xs text-zinc-500">
+            {% if activity.avg_win_pct %}avg win {{ "%+.1f"|format(activity.avg_win_pct) }}%{% endif %}
+            {% if activity.avg_loss_pct %} · avg loss {{ "%+.1f"|format(activity.avg_loss_pct) }}%{% endif %}
+          </div>
+        </div>
+      </div>
+      {% if activity.recent_closed %}
+      <div class="px-4 pb-4">
+        <div class="text-xs text-zinc-500 mb-2">Recent closes:</div>
+        <div class="space-y-1">
+        {% for sym, entry, exit, pnl_pct, pnl_usd, strat in activity.recent_closed %}
+          <div class="flex items-center gap-3 text-xs">
+            <a href="{{ url_for('crypto.coin_detail', symbol=sym) }}" class="font-semibold w-24 hover:underline">{{ sym }}</a>
+            <span class="text-zinc-500">{{ strat or '?' }}</span>
+            <span class="ml-auto mono">${{ "%.6f"|format(entry) }} → ${{ "%.6f"|format(exit) }}</span>
+            <span class="mono w-20 text-right {% if pnl_pct > 0 %}pos{% else %}neg{% endif %}">{{ "%+.2f"|format(pnl_pct) }}%</span>
+            <span class="mono w-20 text-right {% if pnl_usd > 0 %}pos{% else %}neg{% endif %}">{{ "%+.2f"|format(pnl_usd) }}</span>
+          </div>
+        {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+  </div>
+
+  <div class="col-span-12 lg:col-span-4 space-y-4">
+    <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+      <div class="text-xs text-zinc-500 uppercase mb-2">Recent runs</div>
+      {% if recent_runs %}
+        <ul class="text-sm space-y-1">
+          {% for r in recent_runs %}
+            <li class="flex justify-between">
+              <span class="text-zinc-400 mono">{{ r.started_at | dt }}</span>
+              <span>{{ r.kind }}</span>
+              <span class="{% if r.status == 'ok' %}pos{% elif r.status == 'error' %}neg{% endif %}">{{ r.status }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="text-sm text-zinc-500">No runs yet.</div>
+      {% endif %}
+    </section>
+  </div>
+</div>
+
+<script>
+  // ---- Equity curve ----
+  const equityData = {{ equity_json | safe }};
+  if (equityData.length > 0) {
+    const trace = {
+      x: equityData.map(p => p.t),
+      y: equityData.map(p => p.value),
+      type: 'scatter', mode: 'lines+markers',
+      line: { color: '#10b981', width: 2 },
+      marker: { size: 3 },
+      fill: 'tozeroy', fillcolor: 'rgba(16,185,129,0.1)',
+    };
+    const startCap = {{ account.starting_capital if account else 200 }};
+    const layout = {
+      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+      font: { color: '#a1a1aa' },
+      margin: { l: 60, r: 20, t: 10, b: 30 },
+      xaxis: { gridcolor: '#27272a', showgrid: true },
+      yaxis: { gridcolor: '#27272a', title: 'USDT', tickformat: '.2f' },
+      shapes: [{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y',
+                 y0: startCap, y1: startCap,
+                 line: { color: '#71717a', width: 1, dash: 'dot' } }],
+      annotations: [{ xref: 'paper', x: 0.01, y: startCap, yref: 'y',
+                     text: ' starting capital $' + startCap.toFixed(2),
+                     showarrow: false, font: { color: '#a1a1aa', size: 10 }, xanchor: 'left' }],
+      hovermode: 'x unified',
+    };
+    Plotly.newPlot('equity-chart', [trace], layout, { displayModeBar: false, responsive: true });
+  } else {
+    document.getElementById('equity-chart').innerHTML =
+      '<div class="text-center text-zinc-500 text-sm py-12">Building data... will populate after a few sync runs.</div>';
+  }
+
+  // ---- Lazy-load Binance-dependent data (P&L banner + position cards) ----
+  function fmtPrice(p) {
+    if (p == null) return '—';
+    if (p < 0.01) return '$' + p.toFixed(8);
+    if (p < 1) return '$' + p.toFixed(4);
+    return '$' + p.toFixed(2);
+  }
+  function pctClass(v) { return v > 0 ? 'pos' : v < 0 ? 'neg' : ''; }
+
+  function loadDashboard() {
+    // STAGE 1 — instant render from DB (no Binance call)
+    fetch('/crypto/api/dashboard/static')
+      .then(r => r.json())
+      .then(applyDashboard)
+      .catch(e => console.warn('static dashboard failed:', e));
+    // STAGE 2 — live data update (~2s, fetches account + tickers)
+    fetch('{{ url_for("crypto.api_dashboard") }}')
+      .then(r => r.json())
+      .then(applyDashboard)
+      .catch(e => {
+        console.error('dashboard live load failed:', e);
+        document.getElementById('position-cards').innerHTML =
+          '<div class="px-4 py-8 text-center text-rose-400 text-sm">Live data failed: ' + e.message + '</div>';
+      });
+  }
+
+  function applyDashboard(d) {
+    const a = d.account;
+    const isStatic = d.static === true;
+    const banner = document.getElementById('pnl-banner');
+
+    // P&L banner — render whatever we have; static call shows placeholders for live values
+    if (a) {
+      // Banner color: only update when we have today_total (live data)
+      if (a.today_total != null) {
+        banner.classList.remove('bg-zinc-900','border-zinc-700','bg-emerald-950/30','border-emerald-700','bg-rose-950/30','border-rose-700');
+        if (a.today_total > 0) banner.classList.add('bg-emerald-950/30','border-emerald-700');
+        else if (a.today_total < 0) banner.classList.add('bg-rose-950/30','border-rose-700');
+        else banner.classList.add('bg-zinc-900','border-zinc-700');
+      }
+
+      // Account value (live only)
+      const accVal = document.getElementById('pnl-account-value');
+      if (a.account_value != null) {
+        accVal.textContent = '$' + a.account_value.toFixed(2);
+        accVal.classList.remove('text-zinc-600');
+      } else if (isStatic) {
+        accVal.textContent = 'loading…';
+      }
+
+      // All-time line
+      if (a.all_time_pnl != null && a.account_value != null) {
+        const cls = a.all_time_pnl >= 0 ? 'pos' : 'neg';
+        const str = (a.all_time_pnl >= 0 ? '+' : '') + a.all_time_pnl.toFixed(2);
+        const pctStr = a.all_time_pct != null
+          ? ` (${a.all_time_pct >= 0 ? '+' : ''}${a.all_time_pct.toFixed(2)}%)` : '';
+        document.getElementById('pnl-starting').innerHTML =
+          `starting capital $${a.starting_capital.toFixed(2)} · all-time <span class="${cls}">${str}${pctStr}</span>`;
+      }
+
+      // Today's P&L
+      const today = document.getElementById('pnl-today');
+      if (a.today_total != null) {
+        let html = (a.today_total >= 0 ? '+' : '') + a.today_total.toFixed(2)
+          + ' <span class="text-2xl text-zinc-500">USDT</span>';
+        if (a.today_total_pct != null) {
+          html += ` <span class="text-2xl">(${a.today_total_pct >= 0 ? '+' : ''}${a.today_total_pct.toFixed(2)}%)</span>`;
+        }
+        today.innerHTML = html;
+        today.classList.remove('text-zinc-600','pos','neg');
+        const cls = pctClass(a.today_total);
+        if (cls) today.classList.add(cls);
+      } else {
+        // Static: show realized only (we know that from DB)
+        const realized = a.today_realized || 0;
+        let html = (realized >= 0 ? '+' : '') + realized.toFixed(2)
+          + ' <span class="text-2xl text-zinc-500">USDT</span>'
+          + ' <span class="text-sm text-zinc-600">(realized only — live coming)</span>';
+        today.innerHTML = html;
+      }
+
+      // Today's realized + unrealized detail
+      const detail = document.getElementById('pnl-today-detail');
+      if (a.today_unrealized != null) {
+        detail.innerHTML = `<span class="text-zinc-400">realized ${(a.today_realized>=0?'+':'')}${a.today_realized.toFixed(2)} · unrealized ${(a.today_unrealized>=0?'+':'')}${a.today_unrealized.toFixed(2)}</span>`;
+      } else {
+        detail.innerHTML = `<span class="text-zinc-400">realized ${(a.today_realized>=0?'+':'')}${(a.today_realized||0).toFixed(2)} · unrealized loading…</span>`;
+      }
+
+      // W/L (always known from DB)
+      const wl = document.getElementById('pnl-wl');
+      wl.classList.remove('text-zinc-600');
+      let wlHtml = `<span class="pos">${a.today_wins}W</span> / <span class="neg">${a.today_losses}L</span>`;
+      if (a.today_win_rate != null) wlHtml += `<span class="text-sm text-zinc-400 ml-2">(${a.today_win_rate.toFixed(0)}%)</span>`;
+      wl.innerHTML = wlHtml;
+
+      // Open positions count + USDT free
+      document.getElementById('pnl-open').textContent =
+        `${a.open_count} open · $${(a.usdt_free != null ? a.usdt_free : 0).toFixed(2)} free` + (a.usdt_free == null ? ' (loading)' : '');
+    }
+
+    // Position cards — render with placeholders if static, full data if live
+    const cardsDiv = document.getElementById('position-cards');
+    if (!d.position_cards || d.position_cards.length === 0) {
+      cardsDiv.className = 'px-4 py-8 text-center text-zinc-500 text-sm';
+      cardsDiv.textContent = 'No open positions. System is scanning.';
+    } else {
+      cardsDiv.className = 'grid grid-cols-1 md:grid-cols-2 gap-3 p-4';
+      cardsDiv.innerHTML = d.position_cards.map(c => {
+        const hasLive = c.pnl_pct != null;
+        const borderCls = hasLive
+          ? (c.pnl_pct > 0 ? 'border-emerald-800 bg-emerald-950/20'
+            : c.pnl_pct < 0 ? 'border-rose-800 bg-rose-950/20'
+            : 'border-zinc-800 bg-zinc-950/30')
+          : 'border-blue-700 bg-blue-950/10';
+        const barCls = hasLive ? (c.pnl_pct > 0 ? 'bg-emerald-500' : 'bg-rose-500') : 'bg-zinc-700';
+        const pnlCls = hasLive ? (c.pnl_pct > 0 ? 'pos' : 'neg') : 'text-zinc-500';
+        const currentStr = hasLive ? fmtPrice(c.current) : '<span class="text-zinc-500 italic">loading…</span>';
+        const gaugeWidth = hasLive ? Math.round(c.gauge_pct) : 0;
+        const pnlStr = hasLive
+          ? `${c.pnl_pct > 0 ? '+' : ''}${c.pnl_pct.toFixed(2)}% / $${c.pnl_usd > 0 ? '+' : ''}${c.pnl_usd.toFixed(2)}`
+          : 'P&L loading…';
+        return `<div class="border rounded-lg p-3 ${borderCls}">
+          <div class="flex items-baseline justify-between mb-2">
+            <a href="/crypto/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+            <span class="text-xs text-zinc-500">${c.strategy}</span>
+          </div>
+          <div class="flex justify-between text-sm mono">
+            <span>entry <span class="text-zinc-400">${fmtPrice(c.entry)}</span></span>
+            <span class="font-semibold">${currentStr}</span>
+          </div>
+          <div class="mt-3 mb-2">
+            <div class="relative h-2 bg-zinc-800 rounded-full">
+              <div class="h-2 rounded-full ${barCls}" style="width: ${gaugeWidth}%"></div>
+            </div>
+            <div class="flex justify-between text-xs text-zinc-500 mt-1 mono">
+              <span>stop ${fmtPrice(c.stop)} (-${c.risk_pct.toFixed(1)}%)</span>
+              <span>target ${fmtPrice(c.target)} (+${c.reward_pct.toFixed(1)}%)</span>
+            </div>
+          </div>
+          <div class="flex justify-between text-sm mt-2">
+            <span class="font-bold mono num ${pnlCls}">${pnlStr}</span>
+            <span class="text-xs text-zinc-500">held ${c.held_h.toFixed(1)}h · time-stop in ${c.time_to_stop_h.toFixed(1)}h</span>
+          </div>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  loadDashboard();
+  setInterval(loadDashboard, 30000);  // refresh live data every 30s
+
+  // ---- Soft full-page reload every 5 min (catches new equity points + activity) ----
+  setTimeout(() => location.reload(), 300000);
+
+  // ---- Browser notifications on new trades ----
+  const STORAGE_KEY = 'crypto_last_trade_id';
+  const currentLatestId = {{ latest_trade_id }};
+  const previousLatestId = parseInt(localStorage.getItem(STORAGE_KEY) || '0');
+
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+
+  if (currentLatestId > previousLatestId && previousLatestId > 0 && Notification.permission === 'granted') {
+    fetch('{{ url_for("crypto.api_recent_trades") }}?since_id=' + previousLatestId)
+      .then(r => r.json())
+      .then(trades => {
+        trades.forEach(t => {
+          const emoji = t.side === 'BUY' ? '🟢' : '🔴';
+          new Notification(`${emoji} ${t.side} ${t.symbol}`, {
+            body: `${t.qty.toFixed(2)} @ $${t.price.toFixed(8)} (${t.strategy})`,
+            tag: 'trade-' + t.id,
+          });
+        });
+      });
+  }
+  localStorage.setItem(STORAGE_KEY, currentLatestId);
+</script>
+{% endblock %}

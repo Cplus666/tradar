@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en" class="bg-zinc-950">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Stock Platform{% endblock %}</title>
+  <script src="{{ url_for('static', filename='tailwind.js') }}"></script>
+  {% block extra_head %}{% endblock %}
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .pos { color: #10b981; }
+    .neg { color: #ef4444; }
+    .num { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="text-zinc-200 min-h-screen">
+  <nav class="border-b border-zinc-800 bg-zinc-900/60 backdrop-blur sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto px-6 py-3 flex items-center gap-6">
+      <a href="{{ url_for('main.dashboard') }}" class="font-semibold text-zinc-100 flex items-center gap-2">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+        Stock Platform
+      </a>
+      <div class="flex gap-1 text-sm">
+        {% set nav = [
+          ('main.dashboard', 'Dashboard'),
+          ('main.positions_page', 'Positions'),
+          ('main.watchlist', 'Watchlist'),
+          ('main.recommendations', 'Recommendations'),
+          ('main.inbox', 'Inbox'),
+          ('main.trades', 'Trades'),
+          ('main.runs', 'Runs'),
+          ('main.settings', 'Settings'),
+        ] %}
+        {% for endpoint, label in nav %}
+          <a href="{{ url_for(endpoint) }}"
+             class="px-3 py-1.5 rounded-md hover:bg-zinc-800 transition
+                    {% if request.endpoint == endpoint %}bg-zinc-800 text-zinc-100{% else %}text-zinc-400{% endif %}">
+            {{ label }}
+          </a>
+        {% endfor %}
+      </div>
+      <div class="ml-auto flex items-center gap-2 text-xs">
+        <span class="px-2 py-1 rounded bg-emerald-900/40 text-emerald-300 font-semibold">📈 Stocks</span>
+        <a href="{{ url_for('crypto.dashboard') }}" class="px-2 py-1 rounded bg-zinc-800 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700">🪙 Crypto</a>
+      </div>
+    </div>
+  </nav>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="max-w-7xl mx-auto px-6 pt-4">
+        {% for category, msg in messages %}
+          <div class="mb-2 px-4 py-2 rounded-md text-sm
+                      {% if category == 'ok' %}bg-emerald-900/30 text-emerald-300 border border-emerald-800
+                      {% else %}bg-red-900/30 text-red-300 border border-red-800{% endif %}">
+            {{ msg }}
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <main class="max-w-7xl mx-auto px-6 py-6">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="max-w-7xl mx-auto px-6 py-8 text-xs text-zinc-500">
+    Local platform · paper-by-default · /api/health
+  </footer>
+</body>
+</html>

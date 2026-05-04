@@ -1,0 +1,95 @@
+{% extends 'crypto_base.html' %}
+{% block title %}Holdings · Tradar{% endblock %}
+
+{% block content %}
+<div class="flex items-baseline gap-3 mb-4">
+  <h1 class="text-xl font-semibold">Holdings</h1>
+  <div class="text-zinc-500 text-sm">{{ rows | length }} assets</div>
+  <div class="ml-auto text-2xl font-semibold mono num">${{ "%.2f"|format(total) }}</div>
+</div>
+
+{% if not has_keys %}
+  <div class="bg-amber-950/40 border border-amber-800 rounded-lg p-4 mb-4 text-sm text-amber-200">
+    Binance API keys not configured. Holdings will appear once you add credentials and sync.
+  </div>
+{% endif %}
+
+{% if rows %}
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="text-xs text-zinc-500 uppercase border-b border-zinc-800">
+        <tr>
+          <th class="text-left px-4 py-3">Asset</th>
+          <th class="text-right">Free</th>
+          <th class="text-right">Locked</th>
+          <th class="text-right">Last $</th>
+          <th class="text-right">Value $</th>
+          <th class="text-left px-4">Last sync</th>
+          <th class="text-left">Position</th>
+          <th class="text-right pr-4">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in rows %}
+          {% set pos = open_pos_by_asset.get(h.asset) %}
+          <tr class="border-t border-zinc-800 hover:bg-zinc-800/40 {% if pos %}bg-blue-950/10{% endif %}">
+            <td class="px-4 py-2">
+              {% if h.asset not in ('USDT','USDC','FDUSD','DAI','TUSD','USDP','BUSD') %}
+                <a href="{{ url_for('crypto.coin_detail', symbol=h.asset + 'USDT') }}" class="font-semibold hover:underline">{{ h.asset }}</a>
+              {% else %}
+                <span class="font-semibold">{{ h.asset }}</span>
+              {% endif %}
+            </td>
+            <td class="text-right mono num">{{ "%.6f"|format(h.free) }}</td>
+            <td class="text-right mono num text-zinc-500">{{ "%.6f"|format(h.locked) }}</td>
+            <td class="text-right mono num">${{ "%.4f"|format(h.last_price_usd) if h.last_price_usd else '—' }}</td>
+            <td class="text-right mono num">${{ "%.2f"|format(h.value_usd) if h.value_usd else '—' }}</td>
+            <td class="px-4 text-xs text-zinc-500 mono">{{ h.fetched_at | dt }}</td>
+            <td class="text-xs">
+              {% if pos %}
+                <span class="text-blue-300">open · {{ pos.strategy }}</span><br>
+                <span class="text-zinc-500 mono">entry ${{ "%.6f"|format(pos.entry_price) if pos.entry_price < 1 else "%.4f"|format(pos.entry_price) }}</span>
+              {% else %}
+                <span class="text-zinc-600">—</span>
+              {% endif %}
+            </td>
+            <td class="text-right pr-4">
+              {% if pos %}
+                <button onclick="manualSell({{ pos.trade_id }}, '{{ pos.symbol }}', {{ pos.entry_price }}, {{ h.last_price_usd or pos.entry_price }})"
+                        class="text-xs bg-rose-800 hover:bg-rose-700 text-rose-100 px-3 py-1.5 rounded">
+                  ✋ Sell
+                </button>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+<script>
+function manualSell(tradeId, symbol, entry, current) {
+  const pnlPct = ((current - entry) / entry * 100).toFixed(2);
+  const pnlSign = pnlPct >= 0 ? '+' : '';
+  if (!confirm(`Sell ${symbol} at market right now?\n\nEntry:   $${entry}\nCurrent: $${current}\nP&L:     ${pnlSign}${pnlPct}%\n\nThis is irreversible — places a real Binance MARKET SELL order.`)) {
+    return;
+  }
+  fetch(`/crypto/api/sell-position/${tradeId}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        alert(`✓ Sold ${symbol}\n${data.reason}`);
+        location.reload();
+      } else {
+        alert(`✗ Sell failed for ${symbol}\n${data.reason}`);
+      }
+    })
+    .catch(e => alert(`Network error: ${e.message}`));
+}
+</script>
+{% else %}
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-10 text-center text-zinc-500">
+    No holdings on file. Sync Binance to populate.
+  </div>
+{% endif %}
+{% endblock %}

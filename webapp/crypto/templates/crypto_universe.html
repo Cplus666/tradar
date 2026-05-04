@@ -1,0 +1,198 @@
+{% extends 'crypto_base.html' %}
+{% block title %}Universe · Tradar{% endblock %}
+
+{% block content %}
+<div class="flex items-baseline gap-3 mb-4">
+  <h1 class="text-xl font-semibold">Live universe</h1>
+  <div class="text-zinc-500 text-sm">top by 24h volume + movers</div>
+  <div class="ml-auto flex items-center gap-3 text-xs text-zinc-500">
+    <span id="universe-status">loading...</span>
+    <span id="universe-updated"></span>
+  </div>
+</div>
+
+<div class="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
+  <table class="w-full text-sm">
+    <thead class="text-xs text-zinc-500 uppercase border-b border-zinc-800">
+      <tr>
+        <th class="text-left px-4 py-3">Symbol</th>
+        <th class="text-right">Price</th>
+        <th class="text-right">24h %</th>
+        <th class="text-right">24h Vol</th>
+        <th class="text-right">Gap to high20</th>
+        <th class="text-right">Vol×</th>
+        <th class="text-right pr-4">RSI</th>
+        <th class="text-left px-4">Setup</th>
+        <th class="text-left">Source</th>
+        <th class="text-right pr-4">Action</th>
+      </tr>
+    </thead>
+    <tbody id="universe-rows">
+      <tr><td colspan="9" class="text-center py-12 text-zinc-500">Loading universe data…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="mt-4 text-xs text-zinc-500 leading-relaxed">
+  <strong>Reading the labels:</strong>
+  <span class="ml-2 text-emerald-300 bg-emerald-900/40 px-1.5 py-0.5 rounded">READY TO FIRE</span> = strategy will buy on next loop tick.
+  <span class="ml-2 text-amber-300 bg-amber-900/40 px-1.5 py-0.5 rounded">chase: …</span> = broke high but failed strategy filters (extension/RSI/parabola).
+  <span class="ml-2 text-sky-300 bg-sky-900/40 px-1.5 py-0.5 rounded">near breakout / volume surge</span> = building setup.
+  Auto-refreshes every 60s.
+</div>
+
+<script>
+function fmtPrice(p) {
+  if (p < 0.01) return '$' + p.toFixed(8);
+  if (p < 1) return '$' + p.toFixed(4);
+  return '$' + p.toFixed(2);
+}
+function fmtVol(v) {
+  if (v >= 1e9) return '$' + (v/1e9).toFixed(2) + 'B';
+  return '$' + (v/1e6).toFixed(0) + 'M';
+}
+function statusClass(color) {
+  if (color === 'emerald') return 'bg-emerald-900/40 text-emerald-300 font-semibold';
+  if (color === 'amber') return 'bg-amber-900/40 text-amber-300';
+  if (color === 'sky') return 'bg-sky-900/40 text-sky-300';
+  return 'bg-zinc-800 text-zinc-400';
+}
+function rowClass(color) {
+  if (color === 'emerald') return 'bg-emerald-950/20';
+  if (color === 'amber') return 'bg-amber-950/10';
+  return '';
+}
+
+function pctClass(v, neg=true) {
+  if (v == null) return '';
+  if (v > 0) return 'pos';
+  if (v < 0 && neg) return 'neg';
+  return '';
+}
+
+// ---- Stale-while-revalidate cache ----
+const CACHE_KEY = 'universe_cache_v1';
+const CACHE_TTL_MS = 30 * 60 * 1000;  // hide cache if older than 30 min (likely too stale)
+
+function renderRows(rows, isCached, cachedAt) {
+  const tbody = document.getElementById('universe-rows');
+  const status = document.getElementById('universe-status');
+  const updated = document.getElementById('universe-updated');
+
+  if (!rows || rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="text-center py-8 text-zinc-500">No data — wait for first loop fire.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const gapStr = r.gap_to_high20 == null ? '—' : (r.gap_to_high20 > 0 ? '+' : '') + r.gap_to_high20.toFixed(1) + '%';
+    const volStr = r.vol_ratio == null ? '—' : r.vol_ratio.toFixed(1) + 'x';
+    const rsiStr = r.rsi14 == null ? '—' : r.rsi14.toFixed(0);
+    const rsiCls = r.rsi14 != null ? (r.rsi14 > 70 ? 'text-amber-400' : r.rsi14 < 30 ? 'text-emerald-400' : '') : '';
+    const volRatioCls = r.vol_ratio != null ? (r.vol_ratio > 1.5 ? 'pos font-semibold' : r.vol_ratio > 1 ? 'text-amber-400' : '') : '';
+    return `<tr class="border-t border-zinc-800 hover:bg-zinc-800/40 ${rowClass(r.status_color)}">
+      <td class="px-4 py-2"><a href="/crypto/coin/${r.symbol}" class="font-semibold hover:underline">${r.symbol}</a></td>
+      <td class="text-right mono num">${fmtPrice(r.price)}</td>
+      <td class="text-right mono num font-semibold ${pctClass(r.change_24h)}">${r.change_24h > 0 ? '+' : ''}${r.change_24h.toFixed(2)}%</td>
+      <td class="text-right mono num text-zinc-400">${fmtVol(r.volume_usd)}</td>
+      <td class="text-right mono num ${pctClass(r.gap_to_high20)}">${gapStr}</td>
+      <td class="text-right mono num ${volRatioCls}">${volStr}</td>
+      <td class="text-right pr-4 mono num ${rsiCls}">${rsiStr}</td>
+      <td class="px-4"><span class="text-xs px-2 py-0.5 rounded ${statusClass(r.status_color)}">${r.status_label}</span></td>
+      <td class="text-xs text-zinc-500">${r.source}</td>
+      <td class="text-right pr-4">
+        <button onclick="manualBuy('${r.symbol}', ${r.price})"
+                class="text-xs bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-3 py-1 rounded">
+          ✋ Buy
+        </button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  if (isCached) {
+    status.innerHTML = `<span class="text-amber-400">${rows.length} coins (cached, refreshing…)</span>`;
+    if (cachedAt) {
+      const ageSec = Math.floor((Date.now() - cachedAt) / 1000);
+      const ageStr = ageSec < 60 ? `${ageSec}s ago`
+                   : ageSec < 3600 ? `${Math.floor(ageSec/60)}m ago`
+                   : `${Math.floor(ageSec/3600)}h ago`;
+      updated.textContent = `· cache from ${ageStr}`;
+    }
+  } else {
+    status.textContent = `${rows.length} coins`;
+    const t = new Date();
+    updated.textContent = '· last updated ' + t.toLocaleTimeString('en-MY', { hour12: false });
+  }
+}
+
+function loadFromCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return false;
+    const cache = JSON.parse(raw);
+    if (!cache.rows || !cache.timestamp) return false;
+    const age = Date.now() - cache.timestamp;
+    if (age > CACHE_TTL_MS) {
+      // Cache too old, don't show — would mislead user
+      localStorage.removeItem(CACHE_KEY);
+      return false;
+    }
+    renderRows(cache.rows, true, cache.timestamp);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function saveToCache(rows) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ rows, timestamp: Date.now() }));
+  } catch (e) {
+    // localStorage full or disabled — silently skip
+  }
+}
+
+function fetchFresh() {
+  fetch('{{ url_for("crypto.api_universe") }}')
+    .then(r => r.json())
+    .then(data => {
+      if (!data.rows) return;
+      renderRows(data.rows, false);
+      saveToCache(data.rows);
+    })
+    .catch(e => {
+      const status = document.getElementById('universe-status');
+      status.innerHTML = `<span class="text-rose-400">error: ${e.message}</span>`;
+    });
+}
+
+function loadUniverse() {
+  // Stage 1: render from cache instantly (if available)
+  const hadCache = loadFromCache();
+  if (!hadCache) {
+    document.getElementById('universe-status').textContent = 'loading…';
+  }
+  // Stage 2: fetch fresh, replace cache when ready
+  fetchFresh();
+}
+
+loadUniverse();
+setInterval(fetchFresh, 60000);  // background refresh every 60s
+
+function manualBuy(symbol, price) {
+  const priceStr = price < 1 ? '$' + price.toFixed(8) : '$' + price.toFixed(4);
+  if (!confirm(`Manual BUY ${symbol} at market?\n\nCurrent price: ${priceStr}\nPosition size: $50 (or your configured per-trade size)\nStop: -5% · Target: +8% · Max hold: 12h\n\nThis is irreversible — places a real Binance MARKET BUY order.`)) {
+    return;
+  }
+  fetch(`/crypto/api/manual-buy/${symbol}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        alert(`✓ Bought ${symbol}\nFilled ${data.fill_qty} @ $${data.fill_price}\n${data.reason}`);
+      } else {
+        alert(`✗ Buy refused for ${symbol}\nMode: ${data.mode}\nReason: ${data.reason}`);
+      }
+    })
+    .catch(e => alert(`Network error: ${e.message}`));
+}
+</script>
+{% endblock %}

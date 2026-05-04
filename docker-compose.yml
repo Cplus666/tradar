@@ -1,0 +1,47 @@
+# Tradar — Docker Compose for NAS deployment
+#
+# Quick start (any NAS or Linux box with Docker):
+#   1. Copy this folder to /volume1/docker/tradar (or wherever)
+#   2. cd /volume1/docker/tradar
+#   3. docker compose up -d
+#   4. Visit http://<host-ip>:5050/
+#   5. First-run: paste Binance API keys via Settings page, flip kill switch OFF
+#
+# Update later:
+#   git pull && docker compose up -d --build
+#
+# Backup the data volume (./data/) — that's where everything lives.
+
+services:
+  tradar:
+    build: .
+    image: tradar:latest
+    container_name: tradar
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    volumes:
+      # Persistent data — SQLite DB (settings, trades, runs), kline cache.
+      # Survives container rebuild + host reboot. BACK THIS UP.
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Kuala_Lumpur
+      - HOST=0.0.0.0
+      - PORT=5050
+      - STOCK_RUN_SCHEDULER=1   # legacy env-var name — enables in-process scheduler
+      - SECRET_KEY=${SECRET_KEY:-dev-only-please-set-via-env}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5050/crypto/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Resource limits — generous for a NAS, lean enough for Pi 4 / Z-Space
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          memory: 256M
