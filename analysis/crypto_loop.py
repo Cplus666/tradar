@@ -120,18 +120,22 @@ def run_fast_exit_check() -> None:
     """
     from analysis.crypto_executor import (
         _open_positions, parse_entry_notes, execute_sell, execute_partial_sell,
-        _get_setting,
+        _get_setting, _binance_client,
     )
     from analysis.crypto_strategies import _btc_trend_ok
-    from binance.client import Client
 
-    open_pos = _open_positions(is_paper=False)
+    # Iterate BOTH modes — paper positions also need their stops/targets/time-stops
+    # and partial-take auto-trigger to fire. execute_sell / execute_partial_sell
+    # already branch on position.is_paper, so the per-position behavior is correct.
+    # Hardcoding is_paper=False here used to silently strand all paper trades.
+    open_pos = _open_positions()
     if not open_pos:
         return  # nothing to check
 
-    # ONE API call gets all prices
+    # ONE API call gets all prices (with timeout — paper positions don't need
+    # auth, but live ones might; bare client is fine for the public ticker endpoint).
     try:
-        prices = {t["symbol"]: float(t["price"]) for t in Client().get_all_tickers()}
+        prices = {t["symbol"]: float(t["price"]) for t in _binance_client().get_all_tickers()}
     except Exception as e:
         log.warning("fast exit check: ticker fetch failed: %s", e)
         return
