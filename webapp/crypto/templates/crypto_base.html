@@ -78,5 +78,37 @@
   <main class="max-w-7xl mx-auto px-6 py-6">
     {% block content %}{% endblock %}
   </main>
+
+  {# === Shared freshness helpers ===
+     - window.relTime(ts) — turns a JS Date.now() millis into "Xs ago"
+     - elements with [data-ts] attribute auto-tick every 5s; on hover they
+       reveal the absolute timestamp (title attribute).
+     Pages mark a "last updated" element by setting:
+         el.dataset.ts = Date.now();
+         el.dataset.tsPrefix = 'updated ';   // optional
+         el.dataset.tsCls = 'text-zinc-500'; // optional Tailwind classes
+     Then call window.tickRelTimes() once for an immediate paint, or just
+     wait up to 5s for the next tick. #}
+  <script>
+    window.relTime = function (ts) {
+      if (!ts) { return '?'; }
+      const sec = Math.round((Date.now() - ts) / 1000);
+      if (sec < 5) { return 'just now'; }
+      if (sec < 60) { return sec + 's ago'; }
+      if (sec < 3600) { return Math.round(sec / 60) + 'm ago'; }
+      if (sec < 86400) { return Math.round(sec / 3600) + 'h ago'; }
+      return Math.round(sec / 86400) + 'd ago';
+    };
+    window.tickRelTimes = function () {
+      document.querySelectorAll('[data-ts]').forEach(el => {
+        const ts = parseInt(el.dataset.ts);
+        if (!ts) { return; }
+        const prefix = el.dataset.tsPrefix || '';
+        el.textContent = prefix + window.relTime(ts);
+        el.title = new Date(ts).toLocaleString();
+      });
+    };
+    setInterval(window.tickRelTimes, 5000);
+  </script>
 </body>
 </html>

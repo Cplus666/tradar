@@ -27,7 +27,7 @@
     <div>
       <div class="text-xs text-zinc-400 uppercase tracking-wide">Account value</div>
       <div id="pnl-account-value" class="text-4xl font-bold mono num mt-1 text-zinc-600">loading…</div>
-      <div id="pnl-starting" class="text-sm text-zinc-500 mt-1"></div>
+      <div id="pnl-updated" class="text-xs mt-1"></div>
     </div>
     <div class="text-right">
       <div class="text-xs text-zinc-400 uppercase tracking-wide">Today's P&L</div>
@@ -55,7 +55,11 @@
   <div class="col-span-12">
     <section class="bg-zinc-900 border border-zinc-800 rounded-lg">
       <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
-        <h2 class="font-semibold">Open positions <span class="text-xs text-zinc-500 font-normal">— live P&L, distance to stop/target</span></h2>
+        <div>
+          <h2 class="font-semibold inline">Open positions</h2>
+          <span class="text-xs text-zinc-500 font-normal">— live P&L, distance to stop/target</span>
+          <span id="cards-updated" class="text-xs text-zinc-600 ml-2"></span>
+        </div>
         <div class="flex gap-2">
           <form method="post" action="{{ url_for('crypto.sync_balances') }}" class="inline">
             <button class="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1.5 rounded">↻ Sync</button>
@@ -388,6 +392,29 @@
         accVal.textContent = 'loading…';
       }
 
+      // "Last updated" timestamp under the account value — auto-ticks via
+      // the shared [data-ts] mechanism in crypto_base.html so freshness stays
+      // honest if the tab is left open. Hover for absolute timestamp.
+      const updated = document.getElementById('pnl-updated');
+      if (updated) {
+        if (isStatic) {
+          delete updated.dataset.ts;
+          updated.className = 'text-xs mt-1 text-zinc-600';
+          updated.textContent = 'DB only · fetching live…';
+        } else if (d.stale === true) {
+          const ts = d.stale_since ? new Date(d.stale_since).getTime() : 0;
+          updated.dataset.ts = ts;
+          updated.dataset.tsPrefix = '⚠️ stale · last live ';
+          updated.className = 'text-xs mt-1 text-amber-400';
+          window.tickRelTimes();
+        } else {
+          updated.dataset.ts = Date.now();
+          updated.dataset.tsPrefix = 'updated ';
+          updated.className = 'text-xs mt-1 text-zinc-500';
+          window.tickRelTimes();
+        }
+      }
+
       // (All-time P&L removed — top-ups would corrupt the comparison.
       //  See "Daily realized P&L" chart below for cumulative performance.)
 
@@ -430,6 +457,28 @@
       // Open positions count + USDT free
       document.getElementById('pnl-open').textContent =
         `${a.open_count} open · $${(a.usdt_free != null ? a.usdt_free : 0).toFixed(2)} free` + (a.usdt_free == null ? ' (loading)' : '');
+    }
+
+    // Cards section "last updated" badge — same data-ts pattern as the
+    // account-value timestamp; auto-ticks via the shared helper.
+    const cardsUpdated = document.getElementById('cards-updated');
+    if (cardsUpdated) {
+      if (isStatic) {
+        delete cardsUpdated.dataset.ts;
+        cardsUpdated.textContent = '· DB only · live coming…';
+        cardsUpdated.className = 'text-xs text-zinc-600 ml-2';
+      } else if (d.stale === true) {
+        const ts = d.stale_since ? new Date(d.stale_since).getTime() : 0;
+        cardsUpdated.dataset.ts = ts;
+        cardsUpdated.dataset.tsPrefix = '· ⚠️ stale · last live ';
+        cardsUpdated.className = 'text-xs text-amber-400 ml-2';
+        window.tickRelTimes();
+      } else {
+        cardsUpdated.dataset.ts = Date.now();
+        cardsUpdated.dataset.tsPrefix = '· updated ';
+        cardsUpdated.className = 'text-xs text-zinc-500 ml-2';
+        window.tickRelTimes();
+      }
     }
 
     // Position cards — render with placeholders if static, full data if live

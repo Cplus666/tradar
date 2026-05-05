@@ -261,6 +261,7 @@ function loadJournal() {
       let totalsHtml = `<div class="text-sm text-zinc-500">Realized: <span class="mono font-semibold ${realCls}">${fmtMoney(d.realized_pnl)} USDT</span></div>`;
       if (d.open_count > 0) {
         totalsHtml += `<div class="text-sm text-zinc-500" id="journal-unrealized-line">Unrealized: <span class="mono text-zinc-500">loading…</span></div>`;
+        totalsHtml += `<div class="text-xs mt-0.5" id="journal-prices-updated"></div>`;
       }
       document.getElementById('journal-totals').innerHTML = totalsHtml;
 
@@ -306,10 +307,16 @@ function loadLivePrices(symbols) {
   fetch('/tradar/api/journal/prices')
     .then(r => r.json())
     .then(pd => {
-      if (!pd.ok) return;
+      const tsEl = document.getElementById('journal-prices-updated');
+      if (!pd.ok) {
+        if (tsEl) {
+          delete tsEl.dataset.ts;
+          tsEl.className = 'text-xs mt-0.5 text-amber-400';
+          tsEl.textContent = '⚠️ live prices unavailable';
+        }
+        return;
+      }
       let totalUnrealized = 0;
-      // Update each open entry's card with the live data. Net of estimated
-      // round-trip fees so this matches the closed-trade P&L convention.
       for (const sym of symbols) {
         const cur = pd.prices[sym];
         if (cur == null) continue;
@@ -322,14 +329,27 @@ function loadLivePrices(symbols) {
           totalUnrealized += (sellValue - buyValue - fee);
         }
       }
-      // Update unrealized total
       const line = document.getElementById('journal-unrealized-line');
       if (line) {
         const cls = pnlClass(totalUnrealized);
         line.innerHTML = `Unrealized: <span class="mono font-semibold ${cls}">${fmtMoney(totalUnrealized)} USDT</span> <span class="text-xs text-zinc-600">(live)</span>`;
       }
+      if (tsEl) {
+        tsEl.dataset.ts = Date.now();
+        tsEl.dataset.tsPrefix = 'prices ';
+        tsEl.className = 'text-xs mt-0.5 text-zinc-500';
+        window.tickRelTimes();
+      }
     })
-    .catch(e => console.warn('live prices failed:', e));
+    .catch(e => {
+      console.warn('live prices failed:', e);
+      const tsEl = document.getElementById('journal-prices-updated');
+      if (tsEl) {
+        delete tsEl.dataset.ts;
+        tsEl.className = 'text-xs mt-0.5 text-rose-400';
+        tsEl.textContent = '⚠️ price fetch failed';
+      }
+    });
 }
 
 function updateOpenEntryCard(entry, currentPrice) {

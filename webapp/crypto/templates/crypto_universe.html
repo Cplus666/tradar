@@ -108,19 +108,20 @@ function renderRows(rows, isCached, cachedAt) {
     </tr>`;
   }).join('');
 
+  // Use the shared [data-ts] mechanism so the relative time auto-ticks
+  // even when the user lingers on the page. Hover for absolute timestamp.
   if (isCached) {
     status.innerHTML = `<span class="text-amber-400">${rows.length} coins (cached, refreshing…)</span>`;
     if (cachedAt) {
-      const ageSec = Math.floor((Date.now() - cachedAt) / 1000);
-      const ageStr = ageSec < 60 ? `${ageSec}s ago`
-                   : ageSec < 3600 ? `${Math.floor(ageSec/60)}m ago`
-                   : `${Math.floor(ageSec/3600)}h ago`;
-      updated.textContent = `· cache from ${ageStr}`;
+      updated.dataset.ts = cachedAt;
+      updated.dataset.tsPrefix = '· cache from ';
+      window.tickRelTimes();
     }
   } else {
     status.textContent = `${rows.length} coins`;
-    const t = new Date();
-    updated.textContent = '· last updated ' + t.toLocaleTimeString('en-MY', { hour12: false });
+    updated.dataset.ts = Date.now();
+    updated.dataset.tsPrefix = '· updated ';
+    window.tickRelTimes();
   }
 }
 
