@@ -348,7 +348,8 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     if today_wins + today_losses > 0:
         out["today_win_rate"] = today_wins / (today_wins + today_losses) * 100
     out["all_time_pnl"] = out["account_value"] - out["starting_capital"] if out["account_value"] else 0
-    # Today's % return — base on the day's start (not start-of-day-derived guess)
+    # Today's % return — base on the day's start snapshot (not start-of-day-derived guess)
+    day_start = out.get("day_start_value", 0) or 0
     if day_start > 0:
         out["today_total_pct"] = out["today_total"] / day_start * 100
     else:
