@@ -5,7 +5,10 @@
 <div class="flex items-baseline gap-3 mb-4">
   <h1 class="text-xl font-semibold">Holdings</h1>
   <div class="text-zinc-500 text-sm">{{ rows | length }} assets</div>
-  <div class="ml-auto text-2xl font-semibold mono num">${{ "%.2f"|format(total) }}</div>
+  {% if is_paper_mode %}
+    <span class="text-xs text-emerald-400" title="Paper-mode holdings = open paper positions. Live prices update after page renders.">🧪 paper</span>
+  {% endif %}
+  <div id="holdings-total" class="ml-auto text-2xl font-semibold mono num">${{ "%.2f"|format(total) }}</div>
 </div>
 
 {% if not has_keys %}
@@ -32,7 +35,12 @@
       <tbody>
         {% for h in rows %}
           {% set pos = open_pos_by_asset.get(h.asset) %}
-          <tr class="border-t border-zinc-800 hover:bg-zinc-800/40 {% if pos %}bg-blue-950/10{% endif %}">
+          {# Paper-mode rows carry a full trading-pair symbol for the JS lazy-load
+             to look up live prices via /api/journal/prices. Live-mode rows already
+             have prices baked in by the sync, so they don't need the data-symbol. #}
+          <tr data-symbol="{{ h._symbol if h._symbol is defined else (h.asset + 'USDT') }}"
+              data-qty="{{ h.free }}"
+              class="border-t border-zinc-800 hover:bg-zinc-800/40 {% if pos %}bg-blue-950/10{% endif %}">
             <td class="px-4 py-2">
               {% if h.asset not in ('USDT','USDC','FDUSD','DAI','TUSD','USDP','BUSD') %}
                 <a href="{{ url_for('crypto.coin_detail', symbol=h.asset + 'USDT') }}" class="font-semibold hover:underline">{{ h.asset }}</a>
@@ -42,8 +50,8 @@
             </td>
             <td class="text-right mono num">{{ "%.6f"|format(h.free) }}</td>
             <td class="text-right mono num text-zinc-500">{{ "%.6f"|format(h.locked) }}</td>
-            <td class="text-right mono num">${{ "%.4f"|format(h.last_price_usd) if h.last_price_usd else '—' }}</td>
-            <td class="text-right mono num">${{ "%.2f"|format(h.value_usd) if h.value_usd else '—' }}</td>
+            <td class="text-right mono num cell-last-price">${{ "%.4f"|format(h.last_price_usd) if h.last_price_usd else '—' }}</td>
+            <td class="text-right mono num cell-value">${{ "%.2f"|format(h.value_usd) if h.value_usd else '—' }}</td>
             <td class="px-4 text-xs text-zinc-500 mono">{{ h.fetched_at | dt }}</td>
             <td class="text-xs">
               {% if pos %}
@@ -55,10 +63,18 @@
             </td>
             <td class="text-right pr-4">
               {% if pos %}
-                <button onclick="manualSell({{ pos.trade_id }}, '{{ pos.symbol }}', {{ pos.entry_price }}, {{ h.last_price_usd or pos.entry_price }})"
-                        class="text-xs bg-rose-800 hover:bg-rose-700 text-rose-100 px-3 py-1.5 rounded">
-                  ✋ Sell
-                </button>
+                <div class="flex gap-1 justify-end flex-wrap">
+                  <button onclick="manualPartialSell({{ pos.trade_id }}, '{{ pos.symbol }}', {{ pos.entry_price }}, {{ h.last_price_usd or pos.entry_price }}, {{ 'true' if pos.partial_done else 'false' }})"
+                          class="text-xs bg-amber-800 hover:bg-amber-700 text-amber-100 px-3 py-1.5 rounded"
+                          title="Sell a fraction of the remaining position. First call tightens the stop; subsequent calls are pure ladder-out.">
+                    🟡 Partial{% if pos.partial_done %} +{% endif %}
+                  </button>
+                  <button onclick="manualSell({{ pos.trade_id }}, '{{ pos.symbol }}', {{ pos.entry_price }}, {{ h.last_price_usd or pos.entry_price }})"
+                          class="text-xs bg-rose-800 hover:bg-rose-700 text-rose-100 px-3 py-1.5 rounded"
+                          title="Close the entire position at market">
+                    ✋ Sell all
+                  </button>
+                </div>
               {% endif %}
             </td>
           </tr>
@@ -74,7 +90,7 @@ function manualSell(tradeId, symbol, entry, current) {
   if (!confirm(`Sell ${symbol} at market right now?\n\nEntry:   $${entry}\nCurrent: $${current}\nP&L:     ${pnlSign}${pnlPct}%\n\nThis is irreversible — places a real Binance MARKET SELL order.`)) {
     return;
   }
-  fetch(`/crypto/api/sell-position/${tradeId}`, { method: 'POST' })
+  fetch(`/tradar/api/sell-position/${tradeId}`, { method: 'POST' })
     .then(r => r.json())
     .then(data => {
       if (data.ok) {
@@ -86,6 +102,91 @@ function manualSell(tradeId, symbol, entry, current) {
     })
     .catch(e => alert(`Network error: ${e.message}`));
 }
+
+function manualPartialSell(tradeId, symbol, entry, current, partialAlreadyDone) {
+  const pnlPct = ((current - entry) / entry * 100).toFixed(2);
+  const pnlSign = pnlPct >= 0 ? '+' : '';
+  // The fraction is applied to REMAINING qty (not original), so 50% on a
+  // post-partial position halves what's still held — true ladder-out.
+  const ladderNote = partialAlreadyDone
+    ? `\n\n(Ladder-out — partial #2+. Stop will NOT be moved again; this is a pure size reduction. ` +
+      `Fraction applies to REMAINING qty, e.g. 0.5 = sell half of what's still open.)`
+    : `\n\nFirst partial: after this fires, the stop on the remainder moves to entry + buffer% ` +
+      `(see Settings → Partial profit-take) and the auto-trigger is disabled for this position.`;
+  const raw = prompt(
+    `Partial sell of ${symbol}\n\n` +
+    `Entry:   $${entry}\nCurrent: $${current}\nP&L:     ${pnlSign}${pnlPct}%\n\n` +
+    `What fraction to sell now?\n` +
+    `(0.5 = half, 0.33 = a third, 0.75 = three quarters)` + ladderNote,
+    '0.5'
+  );
+  if (raw === null) { return; }
+  const fraction = parseFloat(raw);
+  if (isNaN(fraction) || fraction <= 0 || fraction >= 1) {
+    alert(`Invalid fraction "${raw}". Must be between 0 and 1 (e.g. 0.5 = half).`);
+    return;
+  }
+  const sellPct = (fraction * 100).toFixed(0);
+  if (!confirm(`Confirm: sell ${sellPct}% of ${symbol}'s remaining qty at market right now?\n\nThis is irreversible.`)) {
+    return;
+  }
+  fetch(`/tradar/api/partial-sell-position/${tradeId}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({fraction: fraction}),
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        const tail = partialAlreadyDone
+          ? '\n\n(Ladder-out: stop unchanged on the remainder.)'
+          : '\n\nStop on remainder has been tightened. Auto-trigger disabled for this position.';
+        alert(`✓ Partial sell of ${symbol} (${sellPct}% of remaining)\n${data.reason}` + tail);
+        location.reload();
+      } else {
+        alert(`✗ Partial sell failed for ${symbol}\n${data.reason}`);
+      }
+    })
+    .catch(e => alert(`Network error: ${e.message}`));
+}
+
+{% if is_paper_mode %}
+// Paper-mode lazy price refresh — page renders instantly with entry-price
+// placeholders, then we fetch live prices in the background and update the
+// Last $ / Value $ cells + grand total without reloading.
+function refreshPaperPrices() {
+  fetch('/tradar/api/journal/prices')
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) { return; }
+      const prices = d.prices || {};
+      let totalValue = 0;
+      document.querySelectorAll('tr[data-symbol]').forEach(tr => {
+        const sym = tr.getAttribute('data-symbol');
+        const qty = parseFloat(tr.getAttribute('data-qty') || '0');
+        const cur = prices[sym];
+        if (cur == null) {
+          // No live price for this symbol — keep entry-price fallback
+          const fallback = parseFloat((tr.querySelector('.cell-value').textContent || '$0').replace('$',''));
+          totalValue += isNaN(fallback) ? 0 : fallback;
+          return;
+        }
+        const value = cur * qty;
+        totalValue += value;
+        const fmtPrice = cur < 0.0001 ? cur.toFixed(8)
+                       : cur < 0.01   ? cur.toFixed(6)
+                       : cur < 1      ? cur.toFixed(4)
+                                      : cur.toFixed(4);
+        tr.querySelector('.cell-last-price').textContent = '$' + fmtPrice;
+        tr.querySelector('.cell-value').textContent = '$' + value.toFixed(2);
+      });
+      const totalEl = document.getElementById('holdings-total');
+      if (totalEl) { totalEl.textContent = '$' + totalValue.toFixed(2); }
+    })
+    .catch(() => { /* silently keep placeholders if Binance unreachable */ });
+}
+refreshPaperPrices();
+{% endif %}
 </script>
 {% else %}
   <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-10 text-center text-zinc-500">

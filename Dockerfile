@@ -22,7 +22,7 @@ ENV TZ=Asia/Kuala_Lumpur \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     HOST=0.0.0.0 \
-    PORT=5050 \
+    PORT=7550 \
     STOCK_RUN_SCHEDULER=1
 
 WORKDIR /app
@@ -39,10 +39,10 @@ COPY . .
 RUN mkdir -p /app/data /app/logs
 VOLUME ["/app/data", "/app/logs"]
 
-EXPOSE 5050
+EXPOSE 7550
 
 # Healthcheck: hit the dashboard every 30s — restart if it 5xx's repeatedly
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:5050/crypto/ || exit 1
+    CMD curl -f http://localhost:7550/tradar/ || exit 1
 
 CMD ["python", "run.py"]

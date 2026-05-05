@@ -4,10 +4,69 @@
 {% block content %}
 <h1 class="text-xl font-semibold mb-4">Crypto settings</h1>
 
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+{# === SYSTEM HEALTH PANEL — "is the bot alive and working?" at a glance === #}
+{% if health %}
+<section class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 mb-4">
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="font-semibold text-zinc-200">System health</h2>
+    <span class="text-xs text-zinc-500">live snapshot</span>
+  </div>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+    <div class="bg-zinc-950 rounded p-3">
+      <div class="text-zinc-500 uppercase tracking-wide mb-1">Next loop fire</div>
+      <div class="mono text-zinc-200">{{ health.next_loop_fire or '—' }}</div>
+      {% if health.next_fast_fire %}
+        <div class="text-zinc-600 mt-1">fast: <span class="mono">{{ health.next_fast_fire.split(' ')[1] if ' ' in health.next_fast_fire else health.next_fast_fire }}</span></div>
+      {% endif %}
+    </div>
+    <div class="bg-zinc-950 rounded p-3">
+      <div class="text-zinc-500 uppercase tracking-wide mb-1">Last sync</div>
+      <div class="mono text-zinc-200">{{ health.last_sync_at or 'never' }}</div>
+      {% if health.last_sync_summary %}
+        <div class="text-zinc-600 mt-1 truncate" title="{{ health.last_sync_summary }}">{{ health.last_sync_summary }}</div>
+      {% endif %}
+    </div>
+    <div class="bg-zinc-950 rounded p-3">
+      <div class="text-zinc-500 uppercase tracking-wide mb-1">
+        Today's drawdown
+        {% if not health.halt_enabled %}<span class="text-zinc-600 lowercase">(halt off)</span>{% endif %}
+      </div>
+      {% if health.day_start_value %}
+        <div class="mono text-zinc-200">start ${{ "%.2f"|format(health.day_start_value) }}</div>
+        {% if health.drawdown_pct is not none %}
+          <div class="mt-1 mono {% if health.drawdown_pct >= 15 %}text-rose-400{% elif health.drawdown_pct >= 5 %}text-amber-400{% elif health.drawdown_pct > 0 %}text-zinc-300{% else %}text-emerald-400{% endif %}">
+            {% if health.drawdown_pct >= 0 %}-{% else %}+{% endif %}{{ "%.2f"|format(health.drawdown_pct|abs) }}% today
+          </div>
+        {% endif %}
+      {% else %}
+        <div class="text-zinc-500">awaiting first sync</div>
+      {% endif %}
+    </div>
+    <div class="bg-zinc-950 rounded p-3 {% if health.last_error_at %}border border-rose-800{% endif %}">
+      <div class="text-zinc-500 uppercase tracking-wide mb-1">Last error</div>
+      {% if health.last_error_at %}
+        <div class="mono text-rose-300">{{ health.last_error_at }}</div>
+        <div class="text-zinc-400 mt-1 truncate" title="{{ health.last_error_summary }}">{{ health.last_error_summary }}</div>
+      {% else %}
+        <div class="text-emerald-400">none recorded ✓</div>
+      {% endif %}
+    </div>
+  </div>
+</section>
+{% endif %}
 
-  <!-- LEFT COLUMN: trading toggles -->
-  <form method="post" action="{{ url_for('crypto.settings') }}" class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 space-y-5">
+<div class="space-y-4">
+
+  <!-- Settings form spans full width with internal 2-col layout for balance -->
+  <form method="post" action="{{ url_for('crypto.settings') }}" class="bg-zinc-900 border border-zinc-800 rounded-lg p-6">
+    {# Marker so the POST handler knows ALL settings sections were submitted —
+       lets us detect an unchecked drawdown-halt-enabled tickbox (which would
+       otherwise be absent from form data and indistinguishable from "not in form"). #}
+    <input type="hidden" name="settings_form_present" value="1">
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-5">
+    {# === INNER LEFT COLUMN: trading state + risk guardrails === #}
+    <div class="space-y-5">
     <h3 class="font-semibold border-b border-zinc-800 pb-2">Trading controls</h3>
     <div>
       <label class="block text-sm font-semibold mb-1">Crypto kill switch</label>
@@ -51,10 +110,42 @@
     </div>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Drawdown halt (% from peak)</label>
+      <label class="flex items-center gap-2 text-xs font-semibold mb-2 cursor-pointer">
+        <input type="checkbox" name="crypto_drawdown_halt_enabled" value="on"
+               {% if drawdown_halt_enabled == 'on' %}checked{% endif %}
+               class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+        Enable daily drawdown halt
+      </label>
+      <label class="block text-xs font-semibold mb-1">Daily drawdown threshold (%)</label>
       <input type="number" step="1" min="1" max="50" name="crypto_drawdown_halt_pct" value="{{ drawdown_halt_pct }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">If portfolio drops this % from peak, halt new entries (manual unlock).</p>
+      <p class="text-xs text-zinc-500 mt-1">If today's portfolio drops this % from <strong>today's start-of-day value</strong>, the kill switch auto-flips ON. Resets every MYT midnight.</p>
+
+      {% if drawdown_notice %}
+      <div class="mt-2 bg-rose-950/40 border border-rose-700 rounded p-3 text-sm">
+        <div class="text-rose-300 font-semibold mb-1">⚠ Auto-halt fired</div>
+        <div class="text-zinc-300 text-xs mono">{{ drawdown_notice.ts }}</div>
+        <div class="text-zinc-300 mt-1">{{ drawdown_notice.msg }}</div>
+        <div class="text-xs text-zinc-500 mt-1">(This notice only shows once — also logged in the Runs page as <span class="mono">drawdown_halt</span>.)</div>
+      </div>
+      {% endif %}
+
+      <div class="mt-2 flex items-center gap-3 flex-wrap">
+        <span class="text-xs text-zinc-500">
+          Today started at <span class="mono text-zinc-300">${{ "%.2f"|format(day_start_value_usd|float) }}</span>
+          {% if day_start_date %}<span class="text-zinc-600">({{ day_start_date }})</span>{% endif %}
+        </span>
+        {# HTML5 forbids nested <form>, so we use formaction on a submit button —
+           clicking this routes the parent form's POST to /reset-drawdown-peak
+           instead of /settings. The reset endpoint ignores form fields. #}
+        <button type="submit"
+                formaction="{{ url_for('crypto.reset_drawdown_peak') }}"
+                formmethod="post"
+                onclick="return confirm('Reset today\'s start-of-day baseline? Next account-value snapshot becomes the new baseline; daily drawdown counter restarts from 0%.');"
+                class="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1 rounded">
+          🔓 Reset day-start baseline
+        </button>
+      </div>
     </div>
 
     <div>
@@ -64,8 +155,11 @@
       <p class="text-xs text-zinc-500 mt-1">Live orders refused if free USDT &lt; this.</p>
     </div>
 
-    <hr class="border-zinc-800">
-    <h4 class="text-sm font-semibold text-zinc-300">Scheduler intervals</h4>
+    </div>{# === END INNER LEFT COLUMN === #}
+
+    {# === INNER RIGHT COLUMN: scheduler + strategies === #}
+    <div class="space-y-5">
+    <h3 class="font-semibold border-b border-zinc-800 pb-2">Scheduler intervals</h3>
 
     <div>
       <label class="block text-xs font-semibold mb-1">Full scan interval (minutes)</label>
@@ -85,10 +179,77 @@
       </p>
     </div>
 
-    <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-2 rounded">Save settings</button>
+    {# === STRATEGY ENABLE/DISABLE === #}
+    <hr class="border-zinc-800">
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Strategies</h4>
+    <p class="text-xs text-zinc-500 -mt-2">
+      Disable strategies that misfire in the current regime (e.g., turn off breakouts in choppy bear markets). Disabled strategies still scan and log signals — they just don't open positions.
+    </p>
+    {# Hidden marker so the POST handler knows this section was submitted #}
+    <input type="hidden" name="strategies_form_present" value="1">
+    <div class="space-y-2">
+      {% for s in strategy_names %}
+        <label class="flex items-center gap-3 text-sm cursor-pointer">
+          <input type="checkbox" name="strategy_enabled" value="{{ s }}"
+                 {% if s not in disabled_strategies %}checked{% endif %}
+                 class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+          <span class="mono">{{ s }}</span>
+          {% if s in disabled_strategies %}
+            <span class="text-xs text-rose-400">disabled</span>
+          {% else %}
+            <span class="text-xs text-emerald-400">active</span>
+          {% endif %}
+        </label>
+      {% endfor %}
+    </div>
+
+    {# === PARTIAL PROFIT-TAKE + BREAKEVEN-MOVE === #}
+    <hr class="border-zinc-800">
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Partial profit-take</h4>
+    <p class="text-xs text-zinc-500 -mt-2">
+      Once a position runs to <strong>+trigger %</strong>, sell <strong>fraction</strong> at market and move the stop on the remainder to <strong>entry + buffer %</strong>. Locks in profit on chopped winners while letting runners go to target.
+    </p>
+
+    <label class="flex items-center gap-2 text-xs font-semibold cursor-pointer">
+      <input type="checkbox" name="crypto_partial_take_enabled" value="on"
+             {% if partial_take_enabled == 'on' %}checked{% endif %}
+             class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+      Enable partial profit-take
+    </label>
+
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <div>
+        <label class="block text-xs font-semibold mb-1">Trigger (%)</label>
+        <input type="number" step="0.5" min="1" max="20" name="crypto_partial_take_trigger_pct" value="{{ partial_take_trigger_pct }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">Fire at entry + this %</p>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Fraction</label>
+        <input type="number" step="0.05" min="0.1" max="0.9" name="crypto_partial_take_fraction" value="{{ partial_take_fraction }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">0.5 = sell half</p>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">New stop buffer (%)</label>
+        <input type="number" step="0.5" min="0" max="10" name="crypto_breakeven_buffer_pct" value="{{ breakeven_buffer_pct }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">New stop = entry + this %</p>
+      </div>
+    </div>
+
+    </div>{# === END INNER RIGHT COLUMN === #}
+    </div>{# === END inner 2-col grid === #}
+
+    <div class="flex justify-center mt-6">
+      <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-8 py-2 rounded">Save settings</button>
+    </div>
   </form>
 
-  <!-- RIGHT COLUMN: Binance API credentials -->
+  {# === Below the settings form: API credentials + Server IP in a 2-col row === #}
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+  <!-- Binance API credentials -->
   <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 space-y-4">
     <h3 class="font-semibold border-b border-zinc-800 pb-2">Binance API credentials</h3>
 
@@ -109,6 +270,12 @@
     {% else %}
       <div class="bg-amber-950/20 border border-amber-800 rounded p-3 text-sm text-amber-300">
         ⚠ No keys saved. Paste your read-only Binance API keys below.
+      </div>
+      <div class="bg-zinc-950 border border-zinc-800 rounded p-3 text-sm text-zinc-300">
+        Don't have a Binance account yet?
+        <a href="https://www.binance.com/register?ref=127569393" target="_blank" rel="noopener"
+           class="text-amber-400 hover:text-amber-300 font-semibold underline">Sign up with referral code <span class="mono">127569393</span> →</a>
+        <div class="text-xs text-zinc-500 mt-1">Both you and I get a fee discount when you use this link.</div>
       </div>
     {% endif %}
 
@@ -142,7 +309,7 @@
   </div>
 
   <!-- IP whitelist helper card (lazy-loaded on click) -->
-  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6 lg:col-span-2">
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-6">
     <div class="flex items-center justify-between border-b border-zinc-800 pb-2 mb-3 flex-wrap gap-2">
       <h3 class="font-semibold">🌐 Server IP — for Binance API whitelist</h3>
       <button onclick="revealIp()" id="ip-reveal-btn"
@@ -192,7 +359,9 @@
 
     <div id="ip-error" class="hidden text-sm text-rose-400 mt-2"></div>
   </div>
-</div>
+
+  </div>{# end API/Server 2-col row #}
+</div>{# end outer space-y-4 wrapper #}
 
 <script>
 function revealIp() {

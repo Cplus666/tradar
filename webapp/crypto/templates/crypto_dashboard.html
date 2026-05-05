@@ -8,12 +8,21 @@
 {% if not has_keys %}
 <section class="bg-amber-950/40 border border-amber-800 rounded-lg p-5 mb-4">
   <h2 class="text-amber-300 font-semibold mb-2">🔑 Binance API keys not configured</h2>
-  <a href="{{ url_for('crypto.settings') }}" class="inline-block bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm">→ Set up Binance API keys</a>
+  <div class="flex items-center gap-3 flex-wrap">
+    <a href="{{ url_for('crypto.settings') }}" class="inline-block bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm">→ Set up Binance API keys</a>
+    <span class="text-xs text-zinc-400">No Binance account yet?
+      <a href="https://www.binance.com/register?ref=127569393" target="_blank" rel="noopener"
+         class="text-amber-400 hover:text-amber-300 font-semibold underline">Sign up with referral <span class="mono">127569393</span> →</a>
+    </span>
+  </div>
 </section>
 {% endif %}
 
 {# === BIG P&L BANNER (lazy-loaded) === #}
 <section id="pnl-banner" class="rounded-xl p-5 mb-4 border-2 bg-zinc-900 border-zinc-700">
+  {# Connection status — surfaces Binance failures + stale-cache fallback so the
+     banner never silently sticks at "loading…" if the network drops. #}
+  <div id="pnl-status" class="hidden mb-2 text-xs px-2 py-1 rounded border"></div>
   <div class="flex items-center justify-between flex-wrap gap-3">
     <div>
       <div class="text-xs text-zinc-400 uppercase tracking-wide">Account value</div>
@@ -61,13 +70,17 @@
     </section>
   </div>
 
-  {# === EQUITY CURVE === #}
+  {# === DAILY TRADING ROI CHART === #}
   <div class="col-span-12 lg:col-span-8">
     <section class="bg-zinc-900 border border-zinc-800 rounded-lg">
-      <div class="px-4 py-3 border-b border-zinc-800">
-        <h2 class="font-semibold">Equity curve <span class="text-xs text-zinc-500 font-normal">— account value over last 7 days</span></h2>
+      <div class="px-4 py-3 border-b border-zinc-800 flex items-baseline justify-between flex-wrap gap-2">
+        <h2 class="font-semibold">Daily trading ROI <span class="text-xs text-zinc-500 font-normal">— last 30 days · % return per dollar traded</span></h2>
+        <span id="daily-pnl-headline" class="text-sm text-zinc-400"></span>
       </div>
-      <div id="equity-chart" style="height: 280px;" class="p-2"></div>
+      <div id="daily-pnl-chart" style="height: 280px;" class="p-2"></div>
+      <div class="px-4 pb-3 text-xs text-zinc-600">
+        % return on the capital deployed each day, not on your whole portfolio. Net of estimated fees (0.1% per side — set <span class="mono">crypto_fee_rate_per_side</span> to override). Open positions don't move bars — their P&L lands on the day you exit.
+      </div>
     </section>
   </div>
 
@@ -196,36 +209,57 @@
 </div>
 
 <script>
-  // ---- Equity curve ----
-  const equityData = {{ equity_json | safe }};
-  if (equityData.length > 0) {
+  // ---- Daily realized P&L bar chart (last 30 days) ----
+  const dailyPnl = {{ daily_pnl_json | safe }};
+  const totalPnl = dailyPnl.reduce((s, d) => s + d.pnl, 0);
+  const totalCapital = dailyPnl.reduce((s, d) => s + d.capital, 0);
+  const totalWins = dailyPnl.reduce((s, d) => s + d.wins, 0);
+  const totalLosses = dailyPnl.reduce((s, d) => s + d.losses, 0);
+  const totalTrades = totalWins + totalLosses;
+  // Period-level return on capital deployed — same metric as bar height,
+  // aggregated across all 30 days. Realistic: $10 profit on $250 deployed = +4%.
+  const periodReturnPct = totalCapital > 0 ? (totalPnl / totalCapital * 100) : 0;
+  // Avg trade %: equal-weighted mean across every closed pair (trade quality).
+  const avgTradePct = totalTrades > 0
+    ? dailyPnl.reduce((s, d) => s + d.avg_pct * (d.wins + d.losses), 0) / totalTrades
+    : 0;
+  const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(0) + '%' : '—';
+  const pnlSign = totalPnl >= 0 ? '+' : '';
+  const retSign = periodReturnPct >= 0 ? '+' : '';
+  const avgSign = avgTradePct >= 0 ? '+' : '';
+  const pnlCls = totalPnl > 0 ? 'pos' : totalPnl < 0 ? 'neg' : '';
+  const retCls = periodReturnPct > 0 ? 'pos' : periodReturnPct < 0 ? 'neg' : '';
+  const avgCls = avgTradePct > 0 ? 'pos' : avgTradePct < 0 ? 'neg' : '';
+  document.getElementById('daily-pnl-headline').innerHTML =
+    `Last 30 days: <span class="${pnlCls} font-semibold mono">${pnlSign}${totalPnl.toFixed(2)} USDT</span>` +
+    ` · return on capital <span class="${retCls} mono">${retSign}${periodReturnPct.toFixed(2)}%</span>` +
+    ` · avg trade <span class="${avgCls} mono">${avgSign}${avgTradePct.toFixed(2)}%</span>` +
+    ` · ${totalTrades} trade${totalTrades === 1 ? '' : 's'} · ${totalWins}W/${totalLosses}L · ${winRate} win rate`;
+
+  const hasAnyPnl = dailyPnl.some(d => d.pnl !== 0 || d.wins + d.losses > 0);
+  if (hasAnyPnl) {
+    const colors = dailyPnl.map(d => d.pnl > 0 ? '#10b981' : d.pnl < 0 ? '#ef4444' : '#3f3f46');
     const trace = {
-      x: equityData.map(p => p.t),
-      y: equityData.map(p => p.value),
-      type: 'scatter', mode: 'lines+markers',
-      line: { color: '#10b981', width: 2 },
-      marker: { size: 3 },
-      fill: 'tozeroy', fillcolor: 'rgba(16,185,129,0.1)',
+      x: dailyPnl.map(d => d.date),
+      y: dailyPnl.map(d => d.return_pct),
+      type: 'bar',
+      marker: { color: colors },
+      // customdata layout: [wins, losses, pnl_net, capital, avg_pct, fees]
+      customdata: dailyPnl.map(d => [d.wins, d.losses, d.pnl, d.capital, d.avg_pct, d.fees]),
+      hovertemplate: '<b>%{x}</b><br>%{y:+.2f}% on $%{customdata[3]:.2f} deployed<br>net P&L %{customdata[2]:+.2f} USDT (fees -%{customdata[5]:.2f})<br>%{customdata[0]}W/%{customdata[1]}L · avg trade %{customdata[4]:+.2f}%<extra></extra>',
     };
-    const startCap = {{ account.starting_capital if account else 200 }};
     const layout = {
       paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
       font: { color: '#a1a1aa' },
-      margin: { l: 60, r: 20, t: 10, b: 30 },
-      xaxis: { gridcolor: '#27272a', showgrid: true },
-      yaxis: { gridcolor: '#27272a', title: 'USDT', tickformat: '.2f' },
-      shapes: [{ type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y',
-                 y0: startCap, y1: startCap,
-                 line: { color: '#71717a', width: 1, dash: 'dot' } }],
-      annotations: [{ xref: 'paper', x: 0.01, y: startCap, yref: 'y',
-                     text: ' starting capital $' + startCap.toFixed(2),
-                     showarrow: false, font: { color: '#a1a1aa', size: 10 }, xanchor: 'left' }],
-      hovermode: 'x unified',
+      margin: { l: 50, r: 20, t: 10, b: 50 },
+      xaxis: { gridcolor: '#27272a', tickangle: -45, tickfont: { size: 9 }, type: 'category' },
+      yaxis: { gridcolor: '#27272a', title: 'ROI %', tickformat: '.1f', ticksuffix: '%', zerolinecolor: '#52525b' },
+      bargap: 0.25,
     };
-    Plotly.newPlot('equity-chart', [trace], layout, { displayModeBar: false, responsive: true });
+    Plotly.newPlot('daily-pnl-chart', [trace], layout, { displayModeBar: false, responsive: true });
   } else {
-    document.getElementById('equity-chart').innerHTML =
-      '<div class="text-center text-zinc-500 text-sm py-12">Building data... will populate after a few sync runs.</div>';
+    document.getElementById('daily-pnl-chart').innerHTML =
+      '<div class="text-center text-zinc-500 text-sm py-12">No closed trades in the last 30 days yet.</div>';
   }
 
   // ---- Lazy-load Binance-dependent data (P&L banner + position cards) ----
@@ -235,23 +269,99 @@
     if (p < 1) return '$' + p.toFixed(4);
     return '$' + p.toFixed(2);
   }
+  // Compact qty formatter — picks decimals based on magnitude so cards don't
+  // show "2300.000000 units" or "0.04 units" inconsistently.
+  function fmtQty(q) {
+    if (q == null) return '—';
+    if (q >= 1000) return q.toFixed(0);
+    if (q >= 1) return q.toFixed(2);
+    if (q >= 0.001) return q.toFixed(4);
+    return q.toFixed(6);
+  }
   function pctClass(v) { return v > 0 ? 'pos' : v < 0 ? 'neg' : ''; }
 
+  // Once live data has rendered at least once, subsequent refreshes silently
+  // update — we never re-show "loading…" placeholders. Previous values stay
+  // on screen until the new live response arrives.
+  let _hasRenderedLive = false;
+  let _inFlight = false;            // prevents stacking fetches when one is hung
+
+  function setStatus({kind, message}) {
+    // kind: 'ok' | 'stale' | 'error' | 'hidden'
+    const el = document.getElementById('pnl-status');
+    if (!el) { return; }
+    if (kind === 'hidden' || kind === 'ok') {
+      el.classList.add('hidden');
+      el.textContent = '';
+      return;
+    }
+    el.classList.remove('hidden', 'border-amber-700', 'bg-amber-950/40', 'text-amber-300',
+                                  'border-rose-700',  'bg-rose-950/40',  'text-rose-300');
+    if (kind === 'stale') {
+      el.classList.add('border-amber-700', 'bg-amber-950/40', 'text-amber-300');
+    } else {
+      el.classList.add('border-rose-700', 'bg-rose-950/40', 'text-rose-300');
+    }
+    el.textContent = message;
+  }
+
+  // Wrap fetch with an AbortController timeout — without this, a hung Flask
+  // worker (e.g. mid-Binance call after a network drop) keeps the browser
+  // request pending forever and the dashboard sticks at "loading…".
+  function fetchWithTimeout(url, ms) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    return fetch(url, {signal: ctrl.signal}).finally(() => clearTimeout(t));
+  }
+
   function loadDashboard() {
-    // STAGE 1 — instant render from DB (no Binance call)
-    fetch('/crypto/api/dashboard/static')
+    // Skip if an earlier fetch is still pending (avoids 6-deep request queue
+    // when Flask is wedged — old requests will eventually time out via AbortController).
+    if (_inFlight) {
+      return;
+    }
+    // STAGE 1 — only on the FIRST load: instant DB render with placeholders
+    // for live values. Skipped on subsequent refreshes to avoid flicker.
+    if (!_hasRenderedLive) {
+      fetchWithTimeout('/tradar/api/dashboard/static', 8000)
+        .then(r => r.json())
+        .then(d => { if (!_hasRenderedLive) { applyDashboard(d); } })
+        .catch(e => { console.warn('static dashboard failed:', e); });
+    }
+    // STAGE 2 — live data. 20s budget covers slow Binance calls but releases
+    // the browser slot if the backend is wedged.
+    _inFlight = true;
+    fetchWithTimeout('{{ url_for("crypto.api_dashboard") }}', 20000)
       .then(r => r.json())
-      .then(applyDashboard)
-      .catch(e => console.warn('static dashboard failed:', e));
-    // STAGE 2 — live data update (~2s, fetches account + tickers)
-    fetch('{{ url_for("crypto.api_dashboard") }}')
-      .then(r => r.json())
-      .then(applyDashboard)
+      .then(d => {
+        applyDashboard(d);
+        _hasRenderedLive = true;
+        if (d.stale === true) {
+          const since = d.stale_since ? new Date(d.stale_since).toLocaleTimeString() : '?';
+          setStatus({kind: 'stale',
+            message: `⚠️ Binance unreachable — showing last good values from ${since} MYT (auto-retry every 30s)`});
+        } else {
+          setStatus({kind: 'ok'});
+        }
+      })
       .catch(e => {
         console.error('dashboard live load failed:', e);
-        document.getElementById('position-cards').innerHTML =
-          '<div class="px-4 py-8 text-center text-rose-400 text-sm">Live data failed: ' + e.message + '</div>';
-      });
+        const reason = (e && e.name === 'AbortError') ? 'request timed out' : (e.message || e);
+        // Always show a status — even if we have stale data on screen — so
+        // the user knows refreshes are failing instead of believing it's live.
+        setStatus({kind: 'error',
+          message: `⚠️ Live update failed (${reason}). Retrying in 30s. If stuck, hard-refresh (Cmd+Shift+R).`});
+        if (!_hasRenderedLive) {
+          // First-load failure with no cache: surface explicitly so the user
+          // doesn't see a permanent "loading…" placeholder.
+          const accVal = document.getElementById('pnl-account-value');
+          if (accVal) { accVal.textContent = 'unavailable'; accVal.classList.add('text-rose-400'); }
+          document.getElementById('position-cards').innerHTML =
+            '<div class="px-4 py-8 text-center text-rose-400 text-sm">Live data failed: ' +
+            reason + '</div>';
+        }
+      })
+      .finally(() => { _inFlight = false; });
   }
 
   function applyDashboard(d) {
@@ -278,15 +388,8 @@
         accVal.textContent = 'loading…';
       }
 
-      // All-time line
-      if (a.all_time_pnl != null && a.account_value != null) {
-        const cls = a.all_time_pnl >= 0 ? 'pos' : 'neg';
-        const str = (a.all_time_pnl >= 0 ? '+' : '') + a.all_time_pnl.toFixed(2);
-        const pctStr = a.all_time_pct != null
-          ? ` (${a.all_time_pct >= 0 ? '+' : ''}${a.all_time_pct.toFixed(2)}%)` : '';
-        document.getElementById('pnl-starting').innerHTML =
-          `starting capital $${a.starting_capital.toFixed(2)} · all-time <span class="${cls}">${str}${pctStr}</span>`;
-      }
+      // (All-time P&L removed — top-ups would corrupt the comparison.
+      //  See "Daily realized P&L" chart below for cumulative performance.)
 
       // Today's P&L
       const today = document.getElementById('pnl-today');
@@ -350,15 +453,23 @@
         const pnlStr = hasLive
           ? `${c.pnl_pct > 0 ? '+' : ''}${c.pnl_pct.toFixed(2)}% / $${c.pnl_usd > 0 ? '+' : ''}${c.pnl_usd.toFixed(2)}`
           : 'P&L loading…';
+        // Capital deployed (cost basis) + current value of remaining qty.
+        // After a partial sell these diverge from max_position_usd, so the
+        // card explicitly surfaces what's actually still in the trade.
+        const valueNow = hasLive ? c.current * c.qty : null;
+        const capitalLine = `$${c.notional.toFixed(2)} cost`
+          + (valueNow != null ? ` → $${valueNow.toFixed(2)} now` : '')
+          + ` · ${fmtQty(c.qty)} units`;
         return `<div class="border rounded-lg p-3 ${borderCls}">
           <div class="flex items-baseline justify-between mb-2">
-            <a href="/crypto/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+            <a href="/tradar/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
             <span class="text-xs text-zinc-500">${c.strategy}</span>
           </div>
           <div class="flex justify-between text-sm mono">
             <span>entry <span class="text-zinc-400">${fmtPrice(c.entry)}</span></span>
             <span class="font-semibold">${currentStr}</span>
           </div>
+          <div class="text-xs text-zinc-500 mono mt-0.5">${capitalLine}</div>
           <div class="mt-3 mb-2">
             <div class="relative h-2 bg-zinc-800 rounded-full">
               <div class="h-2 rounded-full ${barCls}" style="width: ${gaugeWidth}%"></div>

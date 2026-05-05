@@ -16,9 +16,17 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+
+# APScheduler is configured with timezone="Asia/Kuala_Lumpur" below. When we hand
+# it next_run_time as a NAIVE datetime, it interprets the wall-clock as MYT — so
+# passing datetime.utcnow() gets misinterpreted as MYT and shifts the schedule
+# 8 hours into the future. Always hand APScheduler tz-AWARE datetimes localized
+# to MYT to avoid this trap.
+_TZ = pytz.timezone("Asia/Kuala_Lumpur")
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -122,12 +130,16 @@ def _next_fire_time(interval_seconds: int, last_fire_kind: str) -> datetime:
         if last_run is not None:
             elapsed = (datetime.utcnow() - last_run.started_at).total_seconds()
             if elapsed >= interval_seconds:
-                return datetime.utcnow()  # overdue → fire now
+                return datetime.now(_TZ)  # overdue → fire now (tz-aware MYT)
             else:
-                return last_run.started_at + timedelta(seconds=interval_seconds)
+                # last_run.started_at is naive UTC (DB stores datetime.utcnow()).
+                # Tag it as UTC, add the interval, then convert to MYT-aware so
+                # APScheduler reads the wall-clock correctly.
+                next_utc = pytz.utc.localize(last_run.started_at + timedelta(seconds=interval_seconds))
+                return next_utc.astimezone(_TZ)
     except Exception:
         pass
-    return datetime.utcnow()  # default: fire ASAP
+    return datetime.now(_TZ)  # default: fire ASAP (tz-aware MYT)
 
 
 def reschedule_crypto_jobs() -> dict:

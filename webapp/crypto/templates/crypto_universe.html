@@ -90,7 +90,7 @@ function renderRows(rows, isCached, cachedAt) {
     const rsiCls = r.rsi14 != null ? (r.rsi14 > 70 ? 'text-amber-400' : r.rsi14 < 30 ? 'text-emerald-400' : '') : '';
     const volRatioCls = r.vol_ratio != null ? (r.vol_ratio > 1.5 ? 'pos font-semibold' : r.vol_ratio > 1 ? 'text-amber-400' : '') : '';
     return `<tr class="border-t border-zinc-800 hover:bg-zinc-800/40 ${rowClass(r.status_color)}">
-      <td class="px-4 py-2"><a href="/crypto/coin/${r.symbol}" class="font-semibold hover:underline">${r.symbol}</a></td>
+      <td class="px-4 py-2"><a href="/tradar/coin/${r.symbol}" class="font-semibold hover:underline">${r.symbol}</a></td>
       <td class="text-right mono num">${fmtPrice(r.price)}</td>
       <td class="text-right mono num font-semibold ${pctClass(r.change_24h)}">${r.change_24h > 0 ? '+' : ''}${r.change_24h.toFixed(2)}%</td>
       <td class="text-right mono num text-zinc-400">${fmtVol(r.volume_usd)}</td>
@@ -183,7 +183,7 @@ function manualBuy(symbol, price) {
   if (!confirm(`Manual BUY ${symbol} at market?\n\nCurrent price: ${priceStr}\nPosition size: $50 (or your configured per-trade size)\nStop: -5% · Target: +8% · Max hold: 12h\n\nThis is irreversible — places a real Binance MARKET BUY order.`)) {
     return;
   }
-  fetch(`/crypto/api/manual-buy/${symbol}`, { method: 'POST' })
+  fetch(`/tradar/api/manual-buy/${symbol}`, { method: 'POST' })
     .then(r => r.json())
     .then(data => {
       if (data.ok) {

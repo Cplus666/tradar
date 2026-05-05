@@ -118,7 +118,10 @@ def run_fast_exit_check() -> None:
 
     Returns nothing; logs exits via standard logger.
     """
-    from analysis.crypto_executor import _open_positions, parse_entry_notes, execute_sell
+    from analysis.crypto_executor import (
+        _open_positions, parse_entry_notes, execute_sell, execute_partial_sell,
+        _get_setting,
+    )
     from analysis.crypto_strategies import _btc_trend_ok
     from binance.client import Client
 
@@ -162,6 +165,35 @@ def run_fast_exit_check() -> None:
                 log.info("fast exit %s [%s]: %s", pos.symbol, mode, res["reason"])
             else:
                 log.warning("fast exit %s [%s] FAILED: %s", pos.symbol, mode, res["reason"])
+            continue
+
+        # Partial-take + breakeven-move: only fires if NO full-exit triggered above.
+        # Once price reaches entry × (1 + trigger_pct/100), sell `fraction` of the
+        # position and tighten the stop on the remainder to entry × (1 + buffer_pct/100).
+        # Each position can only fire this once (tracked via partial_done flag in notes).
+        if meta.get("partial_done"):
+            continue  # already done — runner uses tightened stop
+        try:
+            partial_enabled = (_get_setting("crypto_partial_take_enabled") or "on").lower() == "on"
+        except Exception:
+            partial_enabled = True
+        if not partial_enabled:
+            continue
+        if meta["stop"] is None or meta["target"] is None:
+            continue  # need both bounds to compute breakeven move sensibly
+        try:
+            trigger_pct = float(_get_setting("crypto_partial_take_trigger_pct") or "4.0")
+            fraction    = float(_get_setting("crypto_partial_take_fraction")    or "0.5")
+        except (TypeError, ValueError):
+            trigger_pct, fraction = 4.0, 0.5
+        entry = float(pos.price)
+        if cur >= entry * (1 + trigger_pct / 100.0):
+            res = execute_partial_sell(pos, cur, fraction)
+            mode = "LIVE" if not pos.is_paper else "PAPER"
+            if res["executed"]:
+                log.info("partial take %s [%s]: sold %.0f%% @ $%.6f", pos.symbol, mode, fraction * 100, cur)
+            else:
+                log.warning("partial take %s [%s] FAILED: %s", pos.symbol, mode, res["reason"])
 
 
 def run_crypto_loop() -> None:
@@ -224,6 +256,18 @@ def run_crypto_loop() -> None:
                     f"balance sync: {sync_result.get('real_count', 0)} real, "
                     f"${sync_result.get('total_value_usd', 0):.2f}"
                 )
+                # Ratchet peak + auto-halt on drawdown breach. Runs every loop
+                # so the halt fires even when the dashboard isn't being viewed.
+                try:
+                    from analysis.crypto_executor import update_day_start_and_check_halt
+                    risk = update_day_start_and_check_halt(sync_result.get("total_value_usd", 0))
+                    if risk["halt_triggered"]:
+                        log_lines.append(
+                            f"DAILY DRAWDOWN HALT: -{risk['drawdown_pct']:.2f}% "
+                            f"from day-start ${risk['day_start']:.2f} → kill switch auto-flipped ON"
+                        )
+                except Exception as e:
+                    log_lines.append(f"drawdown check skipped: {e}")
         except Exception as e:
             log_lines.append(f"balance sync skipped: {e}")
 

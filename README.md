@@ -23,12 +23,14 @@ cd /volume1/docker/tradar
 docker compose up -d --build
 
 # 4. Open the dashboard
-#    http://<your-nas-ip>:5050/
+#    http://<your-nas-ip>:7550/
 ```
 
 ## First-time setup (5 minutes)
 
-1. Open `http://<nas-ip>:5050/`
+> Don't have a Binance account yet? [Sign up with referral code **127569393**](https://www.binance.com/register?ref=127569393) — gets you a fee discount.
+
+1. Open `http://<nas-ip>:7550/`
 2. Click **Settings** in the nav
 3. Paste your **Binance API key + secret** (under "Binance API credentials")
 4. Click **Test connection** — should show "✓ Connection OK"
@@ -59,13 +61,14 @@ Data persists across rebuilds (volume-mounted).
 |---|---|---|
 | Kill switch | **ON** | Won't trade until you opt in |
 | Mode | **paper** | Simulated trades only — no real money |
-| Max position size | $10 | Tiny — safe even if accidentally enabled live |
-| Max concurrent | 2 | Conservative |
-| Drawdown halt | 10% | Tighter than usual |
-| Loop interval | 15 min | Sweet spot for 4h candle strategies |
-| Fast exit check | 60 sec | Stops/targets react within 1 min |
+| Max position size | $50 | Comfortable above Binance min-order thresholds |
+| Max concurrent | 4 | Diversifies across strategies |
+| Drawdown halt (daily) | 5% | Tight daily halt — protects bad days fast |
+| Loop interval | 10 min | Frequent scanning, low Binance API weight |
+| Fast exit check | 30 sec | Stops/targets react within 30 seconds |
+| Paper starting capital | $10,000 | Sandbox default — realistic %ages on small trades |
 
-Adjust via `/crypto/settings` after API keys are configured.
+Adjust via `/tradar/settings` after API keys are configured.
 
 ## Required: Binance API key permissions
 

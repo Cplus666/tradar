@@ -22,6 +22,21 @@ from typing import Any
 
 log = logging.getLogger("crypto_executor")
 
+# (connect_seconds, read_seconds) — passed to every Binance HTTP call so a
+# wedged socket (lost internet, DNS hiccup, Binance outage) can't park a
+# Flask worker thread forever. Without this, python-binance defaults to NO
+# timeout and hangs indefinitely; the dashboard then sticks on "loading…"
+# until the Flask process is restarted.
+_BINANCE_TIMEOUT = (5, 10)
+_BINANCE_REQUEST_PARAMS = {"timeout": _BINANCE_TIMEOUT}
+
+
+def _binance_client(key: str | None = None, secret: str | None = None):
+    """Construct a python-binance Client with our standard request timeouts."""
+    from binance.client import Client
+    return Client(key, secret, requests_params=_BINANCE_REQUEST_PARAMS)
+
+
 DEFAULTS = {
     "crypto_kill_switch": "off",
     "crypto_trading_mode": "paper",
@@ -29,6 +44,13 @@ DEFAULTS = {
     "crypto_max_concurrent": "2",
     "crypto_drawdown_halt_pct": "15",
     "crypto_min_balance_usd": "100",
+    # Partial profit-take defaults (so missing settings don't silently → 0,
+    # which would make new_stop=entry instead of entry+buffer%)
+    "crypto_partial_take_enabled": "on",
+    "crypto_partial_take_trigger_pct": "4.0",
+    "crypto_partial_take_fraction": "0.5",
+    "crypto_breakeven_buffer_pct": "1.0",
+    "crypto_fee_rate_per_side": "0.001",
 }
 
 
@@ -45,6 +67,90 @@ def _f(key: str) -> float:
         return float(_get_setting(key))
     except (TypeError, ValueError):
         return float(DEFAULTS.get(key, "0"))
+
+
+def _set_setting(key: str, value: str) -> None:
+    from webapp.models import Setting, db
+    row = Setting.query.get(key)
+    if row:
+        row.value = value
+    else:
+        db.session.add(Setting(key=key, value=value))
+    db.session.commit()
+
+
+def update_day_start_and_check_halt(current_value: float) -> dict:
+    """Snapshot today's start-of-day account value and auto-halt on daily drawdown.
+
+    Replaces the older lifetime-peak halt. Each MYT day is its own threshold:
+    a -15% day trips, but the next morning resets the snapshot and starts fresh.
+
+    Behavior:
+      - On the first call of a new MYT day, snapshot current_value as the
+        day's "start" (stored in crypto_day_start_value_usd + crypto_day_start_date).
+      - If the user disabled it (crypto_drawdown_halt_enabled != "on"), update
+        the snapshot but never halt.
+      - If (start - current) / start * 100 >= crypto_drawdown_halt_pct AND the
+        kill switch is currently OFF, auto-flip kill switch to ON, write a
+        CryptoRun audit row (kind='drawdown_halt'), and stash a one-shot notice
+        in crypto_drawdown_notice for the Settings page to display once.
+
+    Returns: {day_start, drawdown_pct, halt_triggered, enabled}
+    """
+    if current_value is None or current_value <= 0:
+        return {"day_start": 0.0, "drawdown_pct": 0.0,
+                "halt_triggered": False, "enabled": False}
+
+    # Compute today's date in MYT (where the user lives — matches Settings UI)
+    from datetime import timezone, timedelta
+    MYT = timezone(timedelta(hours=8))
+    today_myt = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(MYT).date()
+    today_str = today_myt.isoformat()
+
+    snap_date = _get_setting("crypto_day_start_date") or ""
+    try:
+        snap_value = float(_get_setting("crypto_day_start_value_usd") or 0)
+    except (TypeError, ValueError):
+        snap_value = 0.0
+
+    # First call of the day (or first call ever) — set today's baseline.
+    if snap_date != today_str or snap_value <= 0:
+        _set_setting("crypto_day_start_date", today_str)
+        _set_setting("crypto_day_start_value_usd", f"{current_value:.4f}")
+        snap_value = current_value
+        return {"day_start": snap_value, "drawdown_pct": 0.0,
+                "halt_triggered": False, "enabled": True}
+
+    enabled = (_get_setting("crypto_drawdown_halt_enabled") or "on").lower() == "on"
+    drawdown_pct = (snap_value - current_value) / snap_value * 100.0 if snap_value > 0 else 0.0
+    halt_pct = _f("crypto_drawdown_halt_pct")
+
+    halt_triggered = False
+    if (enabled
+            and drawdown_pct >= halt_pct
+            and _get_setting("crypto_kill_switch") != "on"):
+        from webapp.models import CryptoRun, db
+        ts = datetime.utcnow()
+        msg = (
+            f"auto-halted (daily): drawdown -{drawdown_pct:.2f}% "
+            f"(day start ${snap_value:.2f} → current ${current_value:.2f}, "
+            f"threshold {halt_pct:.0f}%)"
+        )
+        _set_setting("crypto_kill_switch", "on")
+        _set_setting("crypto_drawdown_notice", f"{ts.isoformat()}|{msg}")
+        run = CryptoRun(kind="drawdown_halt", status="ok",
+                        started_at=ts, ended_at=ts, summary=msg)
+        db.session.add(run)
+        db.session.commit()
+        log.warning("DAILY DRAWDOWN HALT — kill switch auto-flipped: %s", msg)
+        halt_triggered = True
+
+    return {"day_start": snap_value, "drawdown_pct": drawdown_pct,
+            "halt_triggered": halt_triggered, "enabled": enabled}
+
+
+# Backwards-compat shim for any caller still using the old name.
+update_peak_and_check_halt = update_day_start_and_check_halt
 
 
 def _fmt_price(p: float) -> str:
@@ -97,8 +203,17 @@ def _quantity_to_step_string(qty: float, step_str: str) -> str:
 
 
 def parse_entry_notes(notes: str | None) -> dict:
-    """Parse stop/target/max_hold/exit_rule from a position's notes string."""
-    out = {"stop": None, "target": None, "max_hold": 24, "exit_rule": "stop_target_time"}
+    """Parse stop/target/max_hold/exit_rule from a position's notes string.
+
+    Also parses partial-take state (set after a partial profit-take fires):
+      partial_done   = True if partial sell already happened on this position
+      original_stop  = the stop level BEFORE the breakeven-move adjustment
+                       (preserved so dashboards can show "stop moved $X → $Y")
+    """
+    out = {
+        "stop": None, "target": None, "max_hold": 24, "exit_rule": "stop_target_time",
+        "partial_done": False, "original_stop": None,
+    }
     if not notes:
         return out
     for token in notes.split("·"):
@@ -114,6 +229,11 @@ def parse_entry_notes(notes: str | None) -> dict:
             except ValueError: pass
         elif token.startswith("exit="):
             out["exit_rule"] = token.replace("exit=", "").strip()
+        elif token == "partial_done=1":
+            out["partial_done"] = True
+        elif token.startswith("original_stop=$"):
+            try: out["original_stop"] = float(token.replace("original_stop=$", ""))
+            except ValueError: pass
     return out
 
 
@@ -151,6 +271,10 @@ def _open_positions(is_paper: bool | None = None) -> list:
         residual_value = qty * float(last_buy.price)
         if residual_value < 1.0:
             continue
+        # Attach the remaining net qty (post-partial-sells) to the BUY object
+        # so callers can compute correct unrealized P&L. last_buy.qty is the
+        # ORIGINAL buy qty; _remaining_qty is what's actually still open.
+        last_buy._remaining_qty = qty
         result.append(last_buy)
     return result
 
@@ -164,6 +288,16 @@ def _check_guardrails(intent: dict, mode: str, client=None) -> tuple[bool, str]:
     """Return (ok, reason). Any failure aborts execution."""
     if _get_setting("crypto_kill_switch") == "on":
         return False, "kill switch is ON"
+
+    # Per-strategy disable — user can switch off underperformers in current
+    # regime (e.g., turn off breakout_4h during a choppy bear market) without
+    # halting the whole bot. Stored as CSV: "breakout_4h,momentum_surge".
+    disabled_csv = _get_setting("crypto_disabled_strategies") or ""
+    if disabled_csv:
+        disabled = {s.strip() for s in disabled_csv.split(",") if s.strip()}
+        strat = intent.get("strategy", "")
+        if strat in disabled:
+            return False, f"strategy '{strat}' is disabled"
 
     max_pos_usd = _f("crypto_max_position_usd")
     if intent.get("size_usd", 0) > max_pos_usd:
@@ -224,13 +358,12 @@ def execute_intent(intent: dict) -> dict:
     client = None
     if mode == "live":
         try:
-            from binance.client import Client
             key, secret = get_binance_creds()
             if not key or not secret:
                 result["mode"] = "skipped"
                 result["reason"] = "live mode set but no API keys configured"
                 return result
-            client = Client(key, secret)
+            client = _binance_client(key, secret)
         except Exception as e:
             result["mode"] = "skipped"
             result["reason"] = f"client init failed: {e}"
@@ -320,13 +453,17 @@ def execute_intent(intent: dict) -> dict:
 #  SELL execution — closes an open position via market order
 # ============================================================================
 
-def execute_sell(position, current_price: float, exit_reason: str) -> dict:
+def execute_sell(position, current_price: float, exit_reason: str,
+                 qty_override: float | None = None) -> dict:
     """Close an open position. Mode (paper/live) inferred from the position itself.
 
     Args:
         position: a CryptoTrade row (the original BUY)
         current_price: latest market price (from cached klines)
         exit_reason: human-readable reason ('stop hit', 'target', 'time stop', etc.)
+        qty_override: if provided, sell exactly this much (used by partial sells).
+                      Otherwise: PAPER computes remaining qty from FIFO history;
+                      LIVE caps to the actual free balance reported by Binance.
 
     Returns result dict similar to execute_intent.
     """
@@ -341,8 +478,32 @@ def execute_sell(position, current_price: float, exit_reason: str) -> dict:
         "trade_id": None, "fill_price": None, "fill_qty": None,
     }
 
-    qty_to_sell = float(position.qty)
     entry_price = float(position.price)
+
+    # Determine qty to sell.
+    # PAPER: must compute net remaining (because paper has no real balance to query).
+    #        After a partial sell earlier, position.qty is stale (still shows original);
+    #        actual remaining = original − sum of partial sells already done.
+    # LIVE:  the existing min(qty_to_sell, free) below caps to actual remaining,
+    #        so we don't need to pre-compute. But if qty_override is given (partial),
+    #        we want to sell exactly that.
+    if qty_override is not None:
+        qty_to_sell = float(qty_override)
+    elif is_paper:
+        # Sum all paper SELLs of this symbol that happened AFTER this BUY
+        prior_sells = (CryptoTrade.query
+                       .filter_by(symbol=position.symbol, side="SELL", is_paper=True)
+                       .filter(CryptoTrade.executed_at > position.executed_at)
+                       .filter(CryptoTrade.strategy != "manual_liquidation")
+                       .all())
+        already_sold = sum(float(s.qty) for s in prior_sells)
+        qty_to_sell = max(0.0, float(position.qty) - already_sold)
+    else:
+        qty_to_sell = float(position.qty)  # LIVE will cap by free balance below
+
+    if qty_to_sell <= 0:
+        result["reason"] = "nothing left to sell (already fully closed)"
+        return result
 
     if is_paper:
         # Simulated fill at current price
@@ -366,12 +527,11 @@ def execute_sell(position, current_price: float, exit_reason: str) -> dict:
 
     # LIVE SELL — real Binance market order
     try:
-        from binance.client import Client
         key, secret = get_binance_creds()
         if not key or not secret:
             result["reason"] = "live exit needed but no API keys"
             return result
-        client = Client(key, secret)
+        client = _binance_client(key, secret)
 
         # Use ACTUAL free balance (fees on the buy leave us slightly short of qty bought).
         # Round DOWN to lot step using Decimal — float math produces precision garbage.
@@ -424,3 +584,109 @@ def execute_sell(position, current_price: float, exit_reason: str) -> dict:
         result["reason"] = f"live sell failed: {e}"
         log.exception("live sell failed for %s", position.symbol)
         return result
+
+
+def execute_partial_sell(position, current_price: float, fraction: float) -> dict:
+    """Sell a fraction of an open position; first call also moves the stop.
+
+    Auto-trigger fires this once (gated by `partial_done=1` in notes) when
+    price reaches `entry × (1 + crypto_partial_take_trigger_pct/100)` — locks
+    in profit and tightens the stop to entry+buffer%.
+
+    Manual button can fire this repeatedly (ladder-out). On calls AFTER the
+    first one, the sell still happens but the stop is NOT touched again —
+    the user already chose where to set the stop on partial #1; subsequent
+    discretionary partials are pure size reduction.
+
+    Sell qty = `fraction × REMAINING_qty` (NOT × original qty), so a 50%
+    ladder progressively halves the remaining position rather than trying
+    to sell 50% of the original (which would close the whole thing on call 2).
+    """
+    from webapp.models import db, CryptoTrade
+
+    if fraction <= 0 or fraction >= 1:
+        return {"executed": False, "mode": "paper" if position.is_paper else "live",
+                "reason": f"invalid partial fraction {fraction} (must be 0 < f < 1)",
+                "trade_id": None, "fill_price": None, "fill_qty": None}
+
+    # Compute REMAINING qty (post-prior-sells). Same logic for paper and live.
+    prior_sells = (CryptoTrade.query
+                   .filter_by(symbol=position.symbol, side="SELL", is_paper=position.is_paper)
+                   .filter(CryptoTrade.executed_at > position.executed_at)
+                   .filter(CryptoTrade.strategy != "manual_liquidation")
+                   .all())
+    already_sold = sum(float(s.qty) for s in prior_sells)
+    remaining = max(0.0, float(position.qty) - already_sold)
+    if remaining <= 0:
+        return {"executed": False, "mode": "paper" if position.is_paper else "live",
+                "reason": "nothing left to partial-sell (position already closed)",
+                "trade_id": None, "fill_price": None, "fill_qty": None}
+
+    qty_to_sell = remaining * fraction
+    # Use the existing meta to detect whether this is the first partial. If yes,
+    # the post-sell block tightens the stop and sets partial_done=1; if no, the
+    # sell happens but notes are left alone (auto-trigger remains gated).
+    meta_before = parse_entry_notes(position.notes)
+    is_first_partial = not meta_before["partial_done"]
+    label_n = "" if is_first_partial else f" ladder #{1 + sum(1 for s in prior_sells if 'partial profit take' in (s.notes or ''))}"
+    label = f"partial profit take ({int(fraction * 100)}%){label_n}"
+    res = execute_sell(position, current_price, label, qty_override=qty_to_sell)
+    if not res["executed"]:
+        return res  # don't update notes if the sell didn't go through
+
+    # Subsequent ladder calls: skip the stop-move / notes rewrite. Notes already
+    # carry partial_done=1 + tightened stop + preserved original_stop from call #1.
+    if not is_first_partial:
+        log.info("LADDER PARTIAL %s sold %.6f @ $%.6f (stop unchanged)",
+                 position.symbol, qty_to_sell, current_price)
+        return res
+
+    # Compute the new stop level (entry + small breakeven buffer)
+    try:
+        buffer_pct = _f("crypto_breakeven_buffer_pct") or 1.0  # 0 → use sensible default
+    except Exception:
+        buffer_pct = 1.0
+    meta = parse_entry_notes(position.notes)
+    entry = float(position.price)
+    original_stop = meta["stop"] if meta["stop"] else entry * 0.95
+    new_stop = entry * (1 + buffer_pct / 100.0)
+    target_str = _fmt_price(meta["target"]) if meta["target"] else _fmt_price(entry * 1.05)
+
+    # Preserve the ORIGINAL entry-reason text (the human-readable last token —
+    # things like "fresh breakout +4.2%, vol=1.6x, RSI=67"). The journal reads
+    # the last token of notes as the entry reason; if we rebuild without it,
+    # the journal would display "original_stop=$X" as the entry reason.
+    entry_reason_text = ""
+    if position.notes:
+        for token in position.notes.split("·"):
+            token = token.strip()
+            # Skip our own structured tokens; keep anything that doesn't look like one
+            if (token and not token.startswith(("stop=$", "target=$", "max_hold=", "exit=",
+                                                 "original_stop=$", "PARTIAL DONE", "PAPER ENTRY",
+                                                 "LIVE ENTRY"))
+                and token != "partial_done=1"):
+                entry_reason_text = token  # last matching one wins (the actual reason)
+
+    # Reconstruct the position notes with new stop + flags. Order matters:
+    # original_stop comes BEFORE the entry-reason text so the entry-reason is
+    # the last token (which is what the journal extracts).
+    parts = [
+        "PARTIAL DONE",
+        f"stop=${_fmt_price(new_stop)}",
+        f"target=${target_str}",
+        f"max_hold={meta['max_hold']}",
+        f"exit={meta['exit_rule']}",
+        "partial_done=1",
+        f"original_stop=${_fmt_price(original_stop)}",
+    ]
+    if entry_reason_text:
+        parts.append(entry_reason_text)
+    position.notes = " · ".join(parts)
+    db.session.commit()
+
+    log.info(
+        "PARTIAL SELL %s sold %.6f @ $%.6f (%s); stop moved $%.6f → $%.6f, target unchanged $%s",
+        position.symbol, qty_to_sell, current_price, label,
+        original_stop, new_stop, target_str,
+    )
+    return res

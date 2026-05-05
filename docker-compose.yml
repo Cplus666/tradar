@@ -4,7 +4,7 @@
 #   1. Copy this folder to /volume1/docker/tradar (or wherever)
 #   2. cd /volume1/docker/tradar
 #   3. docker compose up -d
-#   4. Visit http://<host-ip>:5050/
+#   4. Visit http://<host-ip>:7550/
 #   5. First-run: paste Binance API keys via Settings page, flip kill switch OFF
 #
 # Update later:
@@ -19,7 +19,7 @@ services:
     container_name: tradar
     restart: unless-stopped
     ports:
-      - "5050:5050"
+      - "7550:7550"
     volumes:
       # Persistent data — SQLite DB (settings, trades, runs), kline cache.
       # Survives container rebuild + host reboot. BACK THIS UP.
@@ -28,11 +28,11 @@ services:
     environment:
       - TZ=Asia/Kuala_Lumpur
       - HOST=0.0.0.0
-      - PORT=5050
+      - PORT=7550
       - STOCK_RUN_SCHEDULER=1   # legacy env-var name — enables in-process scheduler
       - SECRET_KEY=${SECRET_KEY:-dev-only-please-set-via-env}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5050/crypto/"]
+      test: ["CMD", "curl", "-f", "http://localhost:7550/tradar/"]
       interval: 30s
       timeout: 10s
       retries: 3
