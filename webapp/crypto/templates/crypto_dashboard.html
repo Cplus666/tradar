@@ -18,6 +18,9 @@
 </section>
 {% endif %}
 
+{# === DAILY P&L AUTO-HALT BANNER (hidden until live snapshot says a halt fired today) === #}
+<section id="halt-banner" class="hidden rounded-lg p-4 mb-4 border-2"></section>
+
 {# === BIG P&L BANNER (lazy-loaded) === #}
 <section id="pnl-banner" class="rounded-xl p-5 mb-4 border-2 bg-zinc-900 border-zinc-700">
   {# Connection status — surfaces Binance failures + stale-cache fallback so the
@@ -78,11 +81,23 @@
   <div class="col-span-12 lg:col-span-8">
     <section class="bg-zinc-900 border border-zinc-800 rounded-lg">
       <div class="px-4 py-3 border-b border-zinc-800 flex items-baseline justify-between flex-wrap gap-2">
-        <h2 class="font-semibold">Daily trading ROI <span class="text-xs text-zinc-500 font-normal">— last 30 days · % return per dollar traded</span></h2>
+        <h2 class="font-semibold">Daily trading ROI <span class="text-xs text-zinc-500 font-normal">— last 30 days</span></h2>
         <span id="daily-pnl-headline" class="text-sm text-zinc-400"></span>
       </div>
+      <div class="px-4 pt-3 flex items-center gap-2 text-xs">
+        <span class="text-zinc-500">View:</span>
+        <button id="roi-mode-portfolio" type="button"
+                class="px-2 py-1 rounded border border-zinc-700 bg-zinc-800 text-zinc-200 font-semibold">
+          % on portfolio
+        </button>
+        <button id="roi-mode-capital" type="button"
+                class="px-2 py-1 rounded border border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700">
+          % on capital deployed
+        </button>
+        <span id="roi-mode-hint" class="text-zinc-600 ml-2"></span>
+      </div>
       <div id="daily-pnl-chart" style="height: 280px;" class="p-2"></div>
-      <div class="px-4 pb-3 text-xs text-zinc-600">
+      <div id="roi-mode-help" class="px-4 pb-3 text-xs text-zinc-600">
         % return on the capital deployed each day, not on your whole portfolio. Net of estimated fees (0.1% per side — set <span class="mono">crypto_fee_rate_per_side</span> to override). Open positions don't move bars — their P&L lands on the day you exit.
       </div>
     </section>
@@ -214,43 +229,67 @@
 
 <script>
   // ---- Daily realized P&L bar chart (last 30 days) ----
-  const dailyPnl = {{ daily_pnl_json | safe }};
-  const totalPnl = dailyPnl.reduce((s, d) => s + d.pnl, 0);
-  const totalCapital = dailyPnl.reduce((s, d) => s + d.capital, 0);
-  const totalWins = dailyPnl.reduce((s, d) => s + d.wins, 0);
-  const totalLosses = dailyPnl.reduce((s, d) => s + d.losses, 0);
-  const totalTrades = totalWins + totalLosses;
-  // Period-level return on capital deployed — same metric as bar height,
-  // aggregated across all 30 days. Realistic: $10 profit on $250 deployed = +4%.
-  const periodReturnPct = totalCapital > 0 ? (totalPnl / totalCapital * 100) : 0;
-  // Avg trade %: equal-weighted mean across every closed pair (trade quality).
-  const avgTradePct = totalTrades > 0
-    ? dailyPnl.reduce((s, d) => s + d.avg_pct * (d.wins + d.losses), 0) / totalTrades
-    : 0;
-  const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(0) + '%' : '—';
-  const pnlSign = totalPnl >= 0 ? '+' : '';
-  const retSign = periodReturnPct >= 0 ? '+' : '';
-  const avgSign = avgTradePct >= 0 ? '+' : '';
-  const pnlCls = totalPnl > 0 ? 'pos' : totalPnl < 0 ? 'neg' : '';
-  const retCls = periodReturnPct > 0 ? 'pos' : periodReturnPct < 0 ? 'neg' : '';
-  const avgCls = avgTradePct > 0 ? 'pos' : avgTradePct < 0 ? 'neg' : '';
-  document.getElementById('daily-pnl-headline').innerHTML =
-    `Last 30 days: <span class="${pnlCls} font-semibold mono">${pnlSign}${totalPnl.toFixed(2)} USDT</span>` +
-    ` · return on capital <span class="${retCls} mono">${retSign}${periodReturnPct.toFixed(2)}%</span>` +
-    ` · avg trade <span class="${avgCls} mono">${avgSign}${avgTradePct.toFixed(2)}%</span>` +
-    ` · ${totalTrades} trade${totalTrades === 1 ? '' : 's'} · ${totalWins}W/${totalLosses}L · ${winRate} win rate`;
+  // State refreshes in place via /api/daily-pnl every 30s — no page reload needed.
+  const _roiState = {
+    data: {{ daily_pnl_json | safe }},
+    mode: 'portfolio',
+    plotInitialized: false,
+  };
 
-  const hasAnyPnl = dailyPnl.some(d => d.pnl !== 0 || d.wins + d.losses > 0);
-  if (hasAnyPnl) {
+  function _renderRoiHeadline() {
+    const dailyPnl = _roiState.data;
+    const totalPnl = dailyPnl.reduce((s, d) => s + d.pnl, 0);
+    const totalCapital = dailyPnl.reduce((s, d) => s + d.capital, 0);
+    const totalWins = dailyPnl.reduce((s, d) => s + d.wins, 0);
+    const totalLosses = dailyPnl.reduce((s, d) => s + d.losses, 0);
+    const totalTrades = totalWins + totalLosses;
+    const periodReturnPct = totalCapital > 0 ? (totalPnl / totalCapital * 100) : 0;
+    const avgTradePct = totalTrades > 0
+      ? dailyPnl.reduce((s, d) => s + d.avg_pct * (d.wins + d.losses), 0) / totalTrades
+      : 0;
+    const winRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(0) + '%' : '—';
+    const pnlSign = totalPnl >= 0 ? '+' : '';
+    const retSign = periodReturnPct >= 0 ? '+' : '';
+    const avgSign = avgTradePct >= 0 ? '+' : '';
+    const pnlCls = totalPnl > 0 ? 'pos' : totalPnl < 0 ? 'neg' : '';
+    const retCls = periodReturnPct > 0 ? 'pos' : periodReturnPct < 0 ? 'neg' : '';
+    const avgCls = avgTradePct > 0 ? 'pos' : avgTradePct < 0 ? 'neg' : '';
+    document.getElementById('daily-pnl-headline').innerHTML =
+      `Last 30 days: <span class="${pnlCls} font-semibold mono">${pnlSign}${totalPnl.toFixed(2)} USDT</span>` +
+      ` · return on capital <span class="${retCls} mono">${retSign}${periodReturnPct.toFixed(2)}%</span>` +
+      ` · avg trade <span class="${avgCls} mono">${avgSign}${avgTradePct.toFixed(2)}%</span>` +
+      ` · ${totalTrades} trade${totalTrades === 1 ? '' : 's'} · ${totalWins}W/${totalLosses}L · ${winRate} win rate`;
+  }
+
+  function _renderRoiChart() {
+    const dailyPnl = _roiState.data;
+    const useCapital = (_roiState.mode === 'capital');
+    const hasAnyPnl = dailyPnl.some(d => d.pnl !== 0 || d.wins + d.losses > 0);
+    if (!hasAnyPnl) {
+      document.getElementById('daily-pnl-chart').innerHTML =
+        '<div class="text-center text-zinc-500 text-sm py-12">No closed trades in the last 30 days yet.</div>';
+      _roiState.plotInitialized = false;
+      return;
+    }
     const colors = dailyPnl.map(d => d.pnl > 0 ? '#10b981' : d.pnl < 0 ? '#ef4444' : '#3f3f46');
+    const customdata = dailyPnl.map(d => [
+      d.wins, d.losses, d.pnl, d.capital, d.avg_pct, d.fees,
+      d.return_pct, d.portfolio_pct, d.day_start_value,
+    ]);
+    const baseHover =
+      '<b>%{x}</b><br>' +
+      'net P&L %{customdata[2]:+.2f} USDT (fees -%{customdata[5]:.2f})<br>' +
+      '%{customdata[0]}W/%{customdata[1]}L · avg trade %{customdata[4]:+.2f}%<br>' +
+      'capital deployed: $%{customdata[3]:.2f} → %{customdata[6]:+.2f}%<br>' +
+      'portfolio start:  $%{customdata[8]:.2f} → %{customdata[7]:+.2f}%' +
+      '<extra></extra>';
     const trace = {
       x: dailyPnl.map(d => d.date),
-      y: dailyPnl.map(d => d.return_pct),
+      y: dailyPnl.map(d => useCapital ? d.return_pct : d.portfolio_pct),
       type: 'bar',
       marker: { color: colors },
-      // customdata layout: [wins, losses, pnl_net, capital, avg_pct, fees]
-      customdata: dailyPnl.map(d => [d.wins, d.losses, d.pnl, d.capital, d.avg_pct, d.fees]),
-      hovertemplate: '<b>%{x}</b><br>%{y:+.2f}% on $%{customdata[3]:.2f} deployed<br>net P&L %{customdata[2]:+.2f} USDT (fees -%{customdata[5]:.2f})<br>%{customdata[0]}W/%{customdata[1]}L · avg trade %{customdata[4]:+.2f}%<extra></extra>',
+      customdata: customdata,
+      hovertemplate: baseHover,
     };
     const layout = {
       paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
@@ -260,11 +299,64 @@
       yaxis: { gridcolor: '#27272a', title: 'ROI %', tickformat: '.1f', ticksuffix: '%', zerolinecolor: '#52525b' },
       bargap: 0.25,
     };
-    Plotly.newPlot('daily-pnl-chart', [trace], layout, { displayModeBar: false, responsive: true });
-  } else {
-    document.getElementById('daily-pnl-chart').innerHTML =
-      '<div class="text-center text-zinc-500 text-sm py-12">No closed trades in the last 30 days yet.</div>';
+    if (_roiState.plotInitialized) {
+      Plotly.react('daily-pnl-chart', [trace], layout, { displayModeBar: false, responsive: true });
+    } else {
+      Plotly.newPlot('daily-pnl-chart', [trace], layout, { displayModeBar: false, responsive: true });
+      _roiState.plotInitialized = true;
+    }
   }
+
+  function _renderRoiToggle() {
+    const useCapital = (_roiState.mode === 'capital');
+    const btnCap = document.getElementById('roi-mode-capital');
+    const btnPort = document.getElementById('roi-mode-portfolio');
+    const helpEl = document.getElementById('roi-mode-help');
+    const hintEl = document.getElementById('roi-mode-hint');
+    if (!btnCap || !btnPort) { return; }
+    const ACTIVE = 'border-zinc-700 bg-zinc-800 text-zinc-200 font-semibold';
+    const INACTIVE = 'border-zinc-800 bg-zinc-950 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700';
+    btnCap.className = 'px-2 py-1 rounded border ' + (useCapital ? ACTIVE : INACTIVE);
+    btnPort.className = 'px-2 py-1 rounded border ' + (useCapital ? INACTIVE : ACTIVE);
+    if (useCapital) {
+      helpEl.innerHTML =
+        '% return on the capital deployed each day, not on your whole portfolio. Decoupled from portfolio size — reflects trade quality. Net of estimated fees (0.1% per side — set <span class="mono">crypto_fee_rate_per_side</span> to override). Open positions don\'t move bars — their P&L lands on the day you exit.';
+      hintEl.textContent = '— bar height = day P&L ÷ capital risked that day';
+    } else {
+      helpEl.innerHTML =
+        '% movement of your <strong>whole portfolio</strong> each day. Reflects realized-account growth velocity. Day-start = principal + Σ realized P&L from prior days, computed deterministically from trade history.';
+      hintEl.textContent = '— bar height = day P&L ÷ portfolio value at day start';
+    }
+  }
+
+  function setRoiMode(mode) {
+    _roiState.mode = mode;
+    _renderRoiToggle();
+    _renderRoiChart();
+  }
+
+  async function refreshRoi() {
+    try {
+      const res = await fetch('{{ url_for("crypto.api_daily_pnl") }}?days=30', { cache: 'no-store' });
+      if (!res.ok) { return; }
+      const newData = await res.json();
+      if (Array.isArray(newData)) {
+        _roiState.data = newData;
+        _renderRoiHeadline();
+        _renderRoiChart();
+      }
+    } catch (e) {
+      // silent — keep existing chart on transient fetch failure
+    }
+  }
+
+  _renderRoiHeadline();
+  _renderRoiChart();
+  _renderRoiToggle();
+  document.getElementById('roi-mode-capital')
+    .addEventListener('click', () => setRoiMode('capital'));
+  document.getElementById('roi-mode-portfolio')
+    .addEventListener('click', () => setRoiMode('portfolio'));
 
   // ---- Lazy-load Binance-dependent data (P&L banner + position cards) ----
   function fmtPrice(p) {
@@ -283,6 +375,34 @@
     return q.toFixed(6);
   }
   function pctClass(v) { return v > 0 ? 'pos' : v < 0 ? 'neg' : ''; }
+
+  // Manual halt override — wired to the "Resume trading today" button on the
+  // halt banner. Two-step confirm: native confirm() with the actual P&L, then
+  // POST to the override endpoint, then refresh the dashboard so the banner
+  // updates to the muted "override active" state.
+  async function overrideHalt(kind, pnlPct, threshPct) {
+    const pnlStr = (pnlPct != null) ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%' : 'unknown';
+    const warning = kind === 'loss'
+      ? `LOSS HALT OVERRIDE\n\nToday's P&L: ${pnlStr} (threshold was -${threshPct}%).\n\nIf you continue trading, the halt will NOT fire again today. Further losses are uncapped until MYT midnight.\n\nDo you accept this risk and want to resume trading?`
+      : `PROFIT HALT OVERRIDE\n\nToday's P&L: ${pnlStr} (threshold was +${threshPct}%).\n\nIf you continue trading, today's locked-in gains may give back. Halt will NOT fire again today.\n\nResume trading?`;
+    if (!window.confirm(warning)) { return; }
+    try {
+      const res = await fetch('{{ url_for("crypto.api_halts_override") }}', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: kind }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.ok !== true) {
+        alert('Override failed: ' + (data.reason || res.statusText));
+        return;
+      }
+      _hasRenderedLive = false;
+      loadDashboard();
+    } catch (e) {
+      alert('Override request failed: ' + (e && e.message ? e.message : e));
+    }
+  }
 
   // Once live data has rendered at least once, subsequent refreshes silently
   // update — we never re-show "loading…" placeholders. Previous values stay
@@ -372,6 +492,68 @@
     const a = d.account;
     const isStatic = d.static === true;
     const banner = document.getElementById('pnl-banner');
+    const haltBanner = document.getElementById('halt-banner');
+
+    // Halt banner — three states:
+    //   (a) live halt fired today → red/green banner with "Resume trading" button
+    //   (b) user overrode today's halt → muted amber banner reminding "safety net off until midnight"
+    //   (c) no halt active → hidden
+    if (haltBanner && a) {
+      const lossHalt = a.loss_halted_today === true;
+      const profitHalt = a.profit_halted_today === true;
+      const lossOverride = a.loss_halt_overridden === true;
+      const profitOverride = a.profit_halt_overridden === true;
+
+      if (lossHalt || profitHalt) {
+        // === ACTIVE HALT ===
+        haltBanner.classList.remove('hidden');
+        const isProfit = profitHalt && !lossHalt;
+        const kind = isProfit ? 'profit' : 'loss';
+        const tone = isProfit
+          ? { bg: 'bg-emerald-950/40', border: 'border-emerald-700', icon: '🎯', label: 'PROFIT HALT', heading: 'text-emerald-300', btn: 'bg-emerald-700 hover:bg-emerald-600' }
+          : { bg: 'bg-rose-950/40',    border: 'border-rose-700',    icon: '🛑', label: 'LOSS HALT',   heading: 'text-rose-300',    btn: 'bg-rose-700 hover:bg-rose-600' };
+        haltBanner.className = `rounded-lg p-4 mb-4 border-2 ${tone.bg} ${tone.border}`;
+        const pnlPct = (a.today_pnl_pct != null) ? a.today_pnl_pct.toFixed(2) : '?';
+        const threshPct = isProfit ? (a.profit_halt_pct != null ? a.profit_halt_pct.toFixed(1) : '?')
+                                   : (a.loss_halt_pct   != null ? a.loss_halt_pct.toFixed(1)   : '?');
+        const detail = isProfit
+          ? `Today's P&L hit <span class="mono">+${pnlPct}%</span> (≥ +${threshPct}% threshold). All positions closed; new entries blocked until next MYT midnight.`
+          : `Today's P&L hit <span class="mono">${pnlPct}%</span> (≤ -${threshPct}% threshold). All positions closed; new entries blocked until next MYT midnight.`;
+        haltBanner.innerHTML = `
+          <div class="flex items-start gap-3">
+            <div class="text-2xl">${tone.icon}</div>
+            <div class="flex-1">
+              <div class="${tone.heading} font-bold text-sm tracking-wide">${tone.label} — TRADING PAUSED FOR THE DAY</div>
+              <div class="text-zinc-300 text-sm mt-1">${detail}</div>
+              <div class="text-xs text-zinc-500 mt-2">Auto-resumes at MYT 00:00. Adjust thresholds in <a href="{{ url_for('crypto.settings') }}" class="underline hover:text-zinc-300">Settings</a>.</div>
+              <div class="mt-3">
+                <button type="button" onclick="overrideHalt('${kind}', ${a.today_pnl_pct != null ? a.today_pnl_pct : 'null'}, ${threshPct})"
+                        class="${tone.btn} text-white text-xs font-semibold px-3 py-1.5 rounded">
+                  ⚠️ Resume trading today (override)
+                </button>
+              </div>
+            </div>
+          </div>`;
+      } else if (lossOverride || profitOverride) {
+        // === OVERRIDE ACTIVE — softer reminder banner ===
+        haltBanner.classList.remove('hidden');
+        haltBanner.className = 'rounded-lg p-3 mb-4 border-2 bg-amber-950/30 border-amber-800';
+        const overrides = [
+          lossOverride ? 'loss' : null,
+          profitOverride ? 'profit' : null,
+        ].filter(Boolean).join(' + ');
+        haltBanner.innerHTML = `
+          <div class="flex items-start gap-2">
+            <div class="text-lg">⚠️</div>
+            <div class="flex-1 text-xs text-amber-200">
+              <span class="font-semibold">Halt override active (${overrides})</span> —
+              you've manually resumed trading. Today's halt won't fire again. Re-arms at next MYT midnight.
+            </div>
+          </div>`;
+      } else {
+        haltBanner.classList.add('hidden');
+      }
+    }
 
     // P&L banner — render whatever we have; static call shows placeholders for live values
     if (a) {
@@ -539,9 +721,9 @@
 
   loadDashboard();
   setInterval(loadDashboard, 30000);  // refresh live data every 30s
-
-  // ---- Soft full-page reload every 5 min (catches new equity points + activity) ----
-  setTimeout(() => location.reload(), 300000);
+  // ROI graph used to depend on a periodic full-page reload to pick up new
+  // closed trades. Now it has its own JSON endpoint and re-renders in place.
+  setInterval(refreshRoi, 30000);
 
   // ---- Browser notifications on new trades ----
   const STORAGE_KEY = 'crypto_last_trade_id';

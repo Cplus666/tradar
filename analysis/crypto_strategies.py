@@ -48,7 +48,10 @@ def crypto_breakout_4h(df: pd.DataFrame, symbol: str) -> dict | None:
       - But NOT more than 5% above prior high (don't chase extended moves)
       - Volume > 1.5x avg (real conviction)
       - Close > SMA50 (uptrend)
-      - RSI(14) < 75 (not already overbought)
+      - RSI(14) < 72 (not already overbought; tightened from 75 after the
+        2026-05-08 STRK trade entered at RSI=74 and immediately faded —
+        late-chase risk with no upside symmetry. Hardcoded by request, not
+        configurable via settings: this is a no-touch guardrail.)
       - 24h close-to-close < 25% (not parabolic blow-off)
     """
     if df is None or df.empty or len(df) < 60:
@@ -70,7 +73,7 @@ def crypto_breakout_4h(df: pd.DataFrame, symbol: str) -> dict | None:
         0 < gap <= 5
         and vr > 1.5
         and close > sma50
-        and rsi < 75
+        and rsi < 72
         and chg_24h < 25
     ):
         return None

@@ -6,8 +6,28 @@ import os
 from pathlib import Path
 
 from flask import Flask, redirect, url_for
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 from webapp.models import Setting, db
+
+
+# Apply WAL mode + busy_timeout to every SQLite connection. Without these,
+# the Flask request thread + APScheduler worker thread can race and one
+# gets "database is locked" — silently rolling back trades. WAL allows
+# concurrent reads while one writer holds the lock; busy_timeout makes
+# contended writes wait+retry instead of failing immediately.
+@event.listens_for(Engine, "connect")
+def _enable_sqlite_concurrency_pragmas(dbapi_connection, connection_record):
+    if "sqlite" not in str(type(dbapi_connection)).lower():
+        return
+    cur = dbapi_connection.cursor()
+    try:
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        cur.close()
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "app.db"
@@ -18,6 +38,12 @@ def create_app() -> Flask:
     app = Flask(__name__, instance_relative_config=False)
     app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "connect_args": {
+            "check_same_thread": False,
+            "timeout": 30,
+        },
+    }
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-only-please-set-SECRET_KEY-env")
 
     db.init_app(app)
@@ -65,18 +91,14 @@ def _seed_settings() -> None:
         # Position sizing
         "crypto_max_position_usd": "50",       # $50 per trade (matches Binance min-order comfort zone)
         "crypto_max_concurrent": "4",          # up to 4 simultaneous positions
-        "crypto_drawdown_halt_pct": "5",       # tight daily halt — protects bad days fast
         "crypto_min_balance_usd": "20",
         # Scheduler
         "crypto_loop_interval_min": "10",      # full scan every 10 min
         "crypto_fast_check_interval_sec": "30", # exit-checker every 30 sec — fast stop/target reactions
         # User-configurable starting capital (auto-detect if user doesn't set)
         "crypto_starting_capital_usd": "0",    # 0 = auto-detect from first sync
-        # Daily drawdown halt — auto-flips kill switch when today's portfolio
-        # drops by crypto_drawdown_halt_pct from today's start-of-day value.
-        # Resets every MYT midnight (start-of-day re-snapshots automatically).
-        # User can disable entirely via crypto_drawdown_halt_enabled.
-        "crypto_drawdown_halt_enabled": "on",  # tickbox: on | off
+        # Day-start baseline — auto-snapshotted at first call each MYT day.
+        # Used by the soft loss/profit halts in analysis/crypto_executor.py.
         "crypto_day_start_value_usd": "0",     # auto-managed: today's start
         "crypto_day_start_date": "",           # auto-managed: ISO date in MYT
         # Partial profit-take + breakeven-move — fires once per position when

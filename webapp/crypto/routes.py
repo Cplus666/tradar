@@ -164,11 +164,18 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
 
     is_paper_mode = (_setting("crypto_trading_mode", "paper") == "paper")
 
+    # `starting_capital` = initial + Σ deposits/withdrawals before today.
+    # Only includes prior-day signed deposits; today's flow in tomorrow.
+    from analysis.crypto_executor import _principal_at_day
+    from datetime import timezone as _tz_init, timedelta as _td_init
+    _init_today_iso = (datetime.utcnow().replace(tzinfo=_tz_init.utc)
+                       .astimezone(_tz_init(_td_init(hours=8))).date().isoformat())
     out = {
         "account_value": None, "usdt_free": None,
         "today_realized": 0.0, "today_unrealized": 0.0, "today_total": 0.0,
         "today_wins": 0, "today_losses": 0, "today_win_rate": None,
-        "open_count": 0, "open_value": 0.0, "starting_capital": 200.29,
+        "open_count": 0, "open_value": 0.0,
+        "starting_capital": _principal_at_day(_init_today_iso),
         "all_time_pnl": 0.0,
         "mode": "paper" if is_paper_mode else "live",
     }
@@ -319,27 +326,42 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     else:
         out["account_value"] = (out["usdt_free"] or 0.0) + open_value
 
-    # Ratchet day-start + auto-halt on daily drawdown (works for both modes).
-    # Done AFTER account_value is computed so the snapshot is meaningful.
-    try:
-        from analysis.crypto_executor import update_day_start_and_check_halt
-        risk = update_day_start_and_check_halt(out["account_value"])
-        out["day_start_value"] = risk["day_start"]
-        out["drawdown_pct"] = risk["drawdown_pct"]
-    except Exception:
-        out["day_start_value"] = 0.0
-        out["drawdown_pct"] = 0.0
+    # Halt firing has been moved out of _account_summary — it now lives only
+    # in run_crypto_loop (15min) and run_fast_exit_check (30s). Without this
+    # change a dashboard refresh could call sell_all_open_positions in the
+    # middle of building its display snapshot, leaving today_unrealized and
+    # account_value pointing at positions that just got liquidated.
+    # day_start_value is recomputed below as the synth value.
+    out["day_start_value"] = 0.0
+    out["drawdown_pct"] = 0.0
+    out["today_pnl_pct"] = 0.0
 
-    # Today's P&L — intuitive interpretation that matches what's visible on
-    # the position cards:
-    #   today_realized   = trades closed today (sum of net P&L)
+    # Halt status — read AFTER update_day_start_and_check_halt so any halt fired
+    # this tick is reflected in the flags the dashboard sees. The "_overridden"
+    # flags let the dashboard show "manually overridden today" state instead of
+    # just hiding the banner — so the user remembers the safety net is off.
+    out["loss_halted_today"] = (_setting("crypto_today_loss_halted", "0") == "1")
+    out["profit_halted_today"] = (_setting("crypto_today_profit_halted", "0") == "1")
+    out["loss_halt_overridden"] = (_setting("crypto_today_loss_overridden", "0") == "1")
+    out["profit_halt_overridden"] = (_setting("crypto_today_profit_overridden", "0") == "1")
+    try:
+        out["loss_halt_pct"] = float(_setting("crypto_loss_halt_pct", "5.0"))
+    except (TypeError, ValueError):
+        out["loss_halt_pct"] = 5.0
+    try:
+        out["profit_halt_pct"] = float(_setting("crypto_profit_halt_pct", "5.0"))
+    except (TypeError, ValueError):
+        out["profit_halt_pct"] = 5.0
+
+    # Today's P&L — designed to RECONCILE with account_value:
+    #   today_realized   = trades closed today (sum of net P&L from FIFO)
     #   today_unrealized = current unrealized on ALL open positions (vs entry)
-    #   today_total      = realized + currently_unrealized
-    # This decomposes cleanly: the unrealized number always equals the sum
-    # of P&L shown on the open-position cards. Trade-off: "today" is loose
-    # for the unrealized portion since it includes positions held over from
-    # earlier days. The day_start_value snapshot is still tracked separately
-    # in the system-health panel for users who want pure account-delta.
+    #   today_total      = realized + unrealized
+    #   day_start_value  = STARTING_CAPITAL + Σ realized P&L from closes BEFORE
+    #                      today MYT 00:00 (synthesized from trade history, not
+    #                      a snapshot of midnight account value).
+    # Reconciliation: account_value ≡ day_start_value + today_total. Always.
+    cumulative_realized_pre_today = all_realized - today_realized
     out["today_realized"] = today_realized
     out["today_unrealized"] = all_unrealized       # sum across ALL open positions
     out["today_total"] = today_realized + all_unrealized
@@ -348,10 +370,18 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     if today_wins + today_losses > 0:
         out["today_win_rate"] = today_wins / (today_wins + today_losses) * 100
     out["all_time_pnl"] = out["account_value"] - out["starting_capital"] if out["account_value"] else 0
-    # Today's % return — base on the day's start snapshot (not start-of-day-derived guess)
-    day_start = out.get("day_start_value", 0) or 0
-    if day_start > 0:
-        out["today_total_pct"] = out["today_total"] / day_start * 100
+    # Override day_start_value with synthesized version so the math reconciles.
+    # Original snapshot is still readable from crypto_day_start_value_usd setting
+    # for the halt logic.
+    synth_day_start = out["starting_capital"] + cumulative_realized_pre_today
+    out["day_start_value"] = synth_day_start
+    if synth_day_start > 0 and out["account_value"] is not None:
+        out["today_total_pct"] = out["today_total"] / synth_day_start * 100
+        # today_pnl_pct uses (account - synth) so it matches what the halt
+        # logic compares against — fast-exit-check uses the same definition.
+        today_pnl_pct = (out["account_value"] - synth_day_start) / synth_day_start * 100
+        out["today_pnl_pct"] = today_pnl_pct
+        out["drawdown_pct"] = -today_pnl_pct if today_pnl_pct < 0 else 0.0
     else:
         out["today_total_pct"] = None
     out["all_time_pct"] = (out["all_time_pnl"] / out["starting_capital"] * 100) if out["starting_capital"] else None
@@ -432,21 +462,30 @@ def _strategy_breakdown() -> list:
         by_sym.setdefault(t.symbol, []).append(t)
     by_strat: dict = {}
     for sym, ts in by_sym.items():
-        buys = []
+        # FIFO with REMAINING-QTY tracking — partial sells must consume only
+        # the qty actually sold, not the whole buy.
+        buys: list[list] = []  # [trade, remaining_qty]
         for t in ts:
             if t.side == "BUY":
-                buys.append(t)
+                buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
-                buy = buys.pop(0)
-                pnl_pct = (float(t.price) - float(buy.price)) / float(buy.price) * 100
-                pnl_usd = (float(t.price) - float(buy.price)) * float(buy.qty)
-                strat = buy.strategy or "unknown"
-                d = by_strat.setdefault(strat, {"wins": 0, "losses": 0, "win_pcts": [], "loss_pcts": [], "net_usd": 0.0})
-                d["net_usd"] += pnl_usd
-                if pnl_pct > 0:
-                    d["wins"] += 1; d["win_pcts"].append(pnl_pct)
-                else:
-                    d["losses"] += 1; d["loss_pcts"].append(pnl_pct)
+                sell_qty_remaining = float(t.qty)
+                while sell_qty_remaining > 1e-9 and buys:
+                    buy, buy_remaining = buys[0]
+                    consumed = min(buy_remaining, sell_qty_remaining)
+                    buys[0][1] -= consumed
+                    sell_qty_remaining -= consumed
+                    pnl_pct = (float(t.price) - float(buy.price)) / float(buy.price) * 100
+                    pnl_usd = (float(t.price) - float(buy.price)) * consumed
+                    strat = buy.strategy or "unknown"
+                    d = by_strat.setdefault(strat, {"wins": 0, "losses": 0, "win_pcts": [], "loss_pcts": [], "net_usd": 0.0})
+                    d["net_usd"] += pnl_usd
+                    if pnl_pct > 0:
+                        d["wins"] += 1; d["win_pcts"].append(pnl_pct)
+                    else:
+                        d["losses"] += 1; d["loss_pcts"].append(pnl_pct)
+                    if buys[0][1] <= 1e-9:
+                        buys.pop(0)
     out = []
     for strat, d in by_strat.items():
         n = d["wins"] + d["losses"]
@@ -528,63 +567,120 @@ def _daily_pnl(days: int = 30) -> list:
         fee_rate = 0.001
 
     days_data: dict = {}  # 'YYYY-MM-DD' → {pnl, capital, pct_sum, wins, losses, fees}
+    # Pre-window cumulative P&L — sum of all closes BEFORE the visible window.
+    # Used as the seed for "day-start portfolio value" so we can compute
+    # portfolio_pct (= day_pnl / portfolio_value_at_day_start * 100) for every
+    # bar in the chart, including the oldest one.
+    pre_window_pnl = 0.0
     for _sym, ts in by_sym.items():
-        buys = []
+        # FIFO with REMAINING-QTY tracking — partial sells consume only the
+        # qty actually sold. Without this, ROI graph double-counts on partials.
+        buys: list[list] = []  # [trade, remaining_qty]
         for t in ts:
             if t.side == "BUY":
-                buys.append(t)
+                buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
-                buy = buys.pop(0)
-                buy_price = float(buy.price)
-                qty = float(buy.qty)
-                capital = buy_price * qty                   # $ this pair tied up
-                gross_pnl = (float(t.price) - buy_price) * qty
-                fee = (capital + float(t.price) * qty) * fee_rate  # buy + sell sides
-                pnl = gross_pnl - fee                        # NET P&L (what you keep)
-                pnl_pct = ((pnl / capital) * 100) if capital > 0 else 0.0
+                sell_qty_remaining = float(t.qty)
+                sell_price = float(t.price)
                 day_myt = t.executed_at.replace(tzinfo=timezone.utc).astimezone(MYT).date()
-                if day_myt < cutoff_myt:
-                    continue
-                key = day_myt.isoformat()
-                d = days_data.setdefault(key, {
-                    "pnl": 0.0, "capital": 0.0, "pct_sum": 0.0,
-                    "wins": 0, "losses": 0, "fees": 0.0,
-                })
-                d["pnl"] += pnl
-                d["capital"] += capital
-                d["pct_sum"] += pnl_pct
-                d["fees"] += fee
-                if pnl > 0:
-                    d["wins"] += 1
-                else:
-                    d["losses"] += 1
+                while sell_qty_remaining > 1e-9 and buys:
+                    buy, buy_remaining = buys[0]
+                    consumed = min(buy_remaining, sell_qty_remaining)
+                    buys[0][1] -= consumed
+                    sell_qty_remaining -= consumed
+                    buy_price = float(buy.price)
+                    capital = buy_price * consumed
+                    gross_pnl = (sell_price - buy_price) * consumed
+                    fee = (capital + sell_price * consumed) * fee_rate
+                    pnl = gross_pnl - fee
+                    pnl_pct = ((pnl / capital) * 100) if capital > 0 else 0.0
+                    if buys[0][1] <= 1e-9:
+                        buys.pop(0)
+                    if day_myt < cutoff_myt:
+                        pre_window_pnl += pnl
+                        continue
+                    key = day_myt.isoformat()
+                    d = days_data.setdefault(key, {
+                        "pnl": 0.0, "capital": 0.0, "pct_sum": 0.0,
+                        "wins": 0, "losses": 0, "fees": 0.0,
+                    })
+                    d["pnl"] += pnl
+                    d["capital"] += capital
+                    d["pct_sum"] += pnl_pct
+                    d["fees"] += fee
+                    if pnl > 0:
+                        d["wins"] += 1
+                    else:
+                        d["losses"] += 1
 
-    # Densify: emit zero-bars for days with no closes so the chart doesn't lie
-    # by visually compressing dead time.
-    #   return_pct = day's pnl_usd / capital_deployed * 100 — REAL return on
-    #                the capital that actually worked that day. Used as bar
-    #                height so 5 trades at ~4% each show ~4%, not ~20%.
-    #   avg_pct    = mean per-trade % (used in headline as "avg trade quality").
+    # Read existing snapshots and self-heal stale rows. Cache writes skipped
+    # when days > 90 to avoid 365-row write storms on long-window admin queries.
+    # The displayed value is always the freshly computed synth — cache is
+    # only an optimization for repeat dashboard polls.
+    from webapp.models import CryptoDailySnapshot, db
+    cache_writes_enabled = days <= 90
+    snap_start_iso = (today_myt - timedelta(days=days - 1)).isoformat()
+    snapshots: dict = {}
+    try:
+        for s in (CryptoDailySnapshot.query
+                  .filter(CryptoDailySnapshot.date >= snap_start_iso)
+                  .all()):
+            snapshots[s.date] = s
+    except Exception:
+        snapshots = {}
+
+    # Per-day principal — each day uses principal-as-of-that-day so deposits
+    # affect ONLY new days, never historical bars.
+    from analysis.crypto_executor import _principal_at_day
+    cumulative_realized = pre_window_pnl
     points = []
+    rows_dirty = False
     for i in range(days - 1, -1, -1):
         d = today_myt - timedelta(days=i)
-        v = days_data.get(d.isoformat(), {
+        date_iso = d.isoformat()
+        v = days_data.get(date_iso, {
             "pnl": 0.0, "capital": 0.0, "pct_sum": 0.0,
             "wins": 0, "losses": 0, "fees": 0.0,
         })
         n = v["wins"] + v["losses"]
         avg_pct = (v["pct_sum"] / n) if n > 0 else 0.0
         return_pct = (v["pnl"] / v["capital"] * 100) if v["capital"] > 0 else 0.0
+        synth_day_start = _principal_at_day(date_iso) + cumulative_realized
+
+        if cache_writes_enabled:
+            snap = snapshots.get(date_iso)
+            if snap is None:
+                db.session.add(CryptoDailySnapshot(
+                    date=date_iso,
+                    total_value_usd=round(synth_day_start, 4),
+                    source="synth",
+                ))
+                rows_dirty = True
+            elif snap.source != "synth" or abs(float(snap.total_value_usd) - synth_day_start) > 0.01:
+                snap.total_value_usd = round(synth_day_start, 4)
+                snap.source = "synth"
+                rows_dirty = True
+        day_start_value = synth_day_start
+
+        portfolio_pct = (v["pnl"] / day_start_value * 100) if day_start_value > 0 else 0.0
         points.append({
-            "date": d.isoformat(),
-            "pnl": round(v["pnl"], 4),       # NET (after fees)
+            "date": date_iso,
+            "pnl": round(v["pnl"], 4),
             "capital": round(v["capital"], 2),
             "fees": round(v["fees"], 4),
             "return_pct": round(return_pct, 3),
+            "portfolio_pct": round(portfolio_pct, 3),
+            "day_start_value": round(day_start_value, 2),
             "avg_pct": round(avg_pct, 3),
             "wins": v["wins"],
             "losses": v["losses"],
         })
+        cumulative_realized += v["pnl"]
+    if rows_dirty:
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
     return points
 
 
@@ -635,22 +731,29 @@ def _activity_summary(days: int = 7) -> dict:
     for sym, ts in by_symbol.items():
         # Skip manual liquidations (XVG sell wasn't a system trade)
         ts = [t for t in ts if t.strategy != "manual_liquidation"]
-        # Walk through pairing: each BUY consumed by next SELL on same symbol
-        buys = []
+        # FIFO with REMAINING-QTY tracking for partial sells.
+        buys: list[list] = []  # [trade, remaining_qty]
         for t in ts:
             if t.side == "BUY":
-                buys.append(t)
+                buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
-                buy = buys.pop(0)
-                # Net P&L (after both buy + sell fees) — matches dashboard / journal
-                buy_value = float(buy.price) * float(buy.qty)
-                sell_value = float(t.price) * float(buy.qty)
-                gross = sell_value - buy_value
-                fee = (buy_value + sell_value) * fee_rate
-                pnl_usd = gross - fee
-                pnl_pct = (pnl_usd / buy_value * 100) if buy_value > 0 else 0.0
-                closed_trades.append((sym, float(buy.price), float(t.price), pnl_pct, pnl_usd, buy.strategy))
-        open_count += len(buys)
+                sell_qty_remaining = float(t.qty)
+                sell_price = float(t.price)
+                while sell_qty_remaining > 1e-9 and buys:
+                    buy, buy_remaining = buys[0]
+                    consumed = min(buy_remaining, sell_qty_remaining)
+                    buys[0][1] -= consumed
+                    sell_qty_remaining -= consumed
+                    buy_value = float(buy.price) * consumed
+                    sell_value = sell_price * consumed
+                    gross = sell_value - buy_value
+                    fee = (buy_value + sell_value) * fee_rate
+                    pnl_usd = gross - fee
+                    pnl_pct = (pnl_usd / buy_value * 100) if buy_value > 0 else 0.0
+                    closed_trades.append((sym, float(buy.price), float(t.price), pnl_pct, pnl_usd, buy.strategy))
+                    if buys[0][1] <= 1e-9:
+                        buys.pop(0)
+        open_count += sum(1 for b in buys if b[1] > 1e-9)
 
     wins = [c for c in closed_trades if c[3] > 0]
     losses = [c for c in closed_trades if c[3] <= 0]
@@ -819,11 +922,19 @@ def api_dashboard_static():
     Account values that need Binance (account_value, usdt_free, today_unrealized)
     return None — JS fetches /api/dashboard separately to fill them in.
     """
+    from analysis.crypto_executor import _principal_at_day
     cards = _open_position_cards(tickers=None)  # current_price=None on each
     # Build account summary from DB only (skip Binance calls)
     from datetime import timezone as _tz, timedelta as _td
     myt_now = datetime.utcnow().replace(tzinfo=_tz.utc).astimezone(_tz(_td(hours=8)))
+    today_iso_static = myt_now.date().isoformat()
     today_start_utc = (myt_now.replace(hour=0, minute=0, second=0, microsecond=0)).astimezone(_tz.utc).replace(tzinfo=None)
+    # Match LIVE endpoint NET-of-fees calc — was GROSS before, causing today_realized
+    # to briefly differ on each refresh as the live endpoint took over.
+    try:
+        fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
+    except (TypeError, ValueError):
+        fee_rate = 0.001
     trades = (CryptoTrade.query
               .filter(CryptoTrade.is_paper == _is_paper_mode())
               .order_by(CryptoTrade.executed_at).all())
@@ -835,17 +946,30 @@ def api_dashboard_static():
     today_realized = 0.0
     today_wins = today_losses = 0
     for sym, ts in by_sym.items():
-        buys = []
+        # FIFO with REMAINING-QTY tracking — partial sells consume only the
+        # qty actually sold. Without this, today_realized doubles on partials.
+        buys: list[list] = []  # [trade, remaining_qty]
         for t in ts:
             if t.side == "BUY":
-                buys.append(t)
+                buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
-                buy = buys.pop(0)
-                pnl = (float(t.price) - float(buy.price)) * float(buy.qty)
-                if t.executed_at >= today_start_utc:
-                    today_realized += pnl
-                    if pnl > 0: today_wins += 1
-                    else: today_losses += 1
+                sell_qty_remaining = float(t.qty)
+                while sell_qty_remaining > 1e-9 and buys:
+                    buy, buy_remaining = buys[0]
+                    consumed = min(buy_remaining, sell_qty_remaining)
+                    buys[0][1] -= consumed
+                    sell_qty_remaining -= consumed
+                    buy_value = float(buy.price) * consumed
+                    sell_value = float(t.price) * consumed
+                    gross = sell_value - buy_value
+                    fee = (buy_value + sell_value) * fee_rate
+                    pnl = gross - fee
+                    if t.executed_at >= today_start_utc:
+                        today_realized += pnl
+                        if pnl > 0: today_wins += 1
+                        else: today_losses += 1
+                    if buys[0][1] <= 1e-9:
+                        buys.pop(0)
     account = {
         "account_value": None, "usdt_free": None,
         "today_realized": today_realized,
@@ -854,7 +978,8 @@ def api_dashboard_static():
         "today_wins": today_wins, "today_losses": today_losses,
         "today_win_rate": (today_wins / (today_wins + today_losses) * 100) if (today_wins + today_losses) else None,
         "open_count": len(cards), "open_value": 0.0,
-        "starting_capital": 200.29, "all_time_pnl": 0.0, "all_time_pct": None,
+        "starting_capital": _principal_at_day(today_iso_static),
+        "all_time_pnl": 0.0, "all_time_pct": None,
     }
     return jsonify({"account": account, "position_cards": cards, "static": True})
 
@@ -901,6 +1026,19 @@ def api_dashboard():
     cards = _open_position_cards(tickers={})
     return jsonify({"account": account, "position_cards": cards,
                     "static": False, "stale": True, "stale_since": None})
+
+
+@bp.route("/api/daily-pnl")
+def api_daily_pnl():
+    """Daily realized P&L points for the dashboard ROI bar chart.
+    Replaces server-rendered Jinja injection so the chart can refresh in place
+    without a full page reload. Frontend polls this every 30s."""
+    try:
+        days = int(request.args.get("days", "30"))
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 365))
+    return jsonify(_daily_pnl(days=days))
 
 
 @bp.route("/api/recent-trades")
@@ -1547,7 +1685,6 @@ def settings():
     GUARDRAIL_KEYS = (
         "crypto_kill_switch", "crypto_trading_mode",
         "crypto_max_position_usd", "crypto_max_concurrent",
-        "crypto_drawdown_halt_pct", "crypto_drawdown_halt_enabled",
         "crypto_min_balance_usd",
         "crypto_loop_interval_min", "crypto_fast_check_interval_sec",
         # Partial profit-take controls
@@ -1555,16 +1692,21 @@ def settings():
         "crypto_partial_take_trigger_pct",
         "crypto_partial_take_fraction",
         "crypto_breakeven_buffer_pct",
+        "crypto_partial_lock_fraction",
+        "crypto_loss_halt_enabled", "crypto_loss_halt_pct",
+        "crypto_profit_halt_enabled", "crypto_profit_halt_pct",
     )
     if request.method == "POST":
         # Checkboxes only POST when checked. The settings form sends a hidden
         # marker so we can detect submit-but-unchecked and coerce to "off"
         # for any tickbox setting.
         if request.form.get("settings_form_present") == "1":
-            if "crypto_drawdown_halt_enabled" not in request.form:
-                _set_setting("crypto_drawdown_halt_enabled", "off")
             if "crypto_partial_take_enabled" not in request.form:
                 _set_setting("crypto_partial_take_enabled", "off")
+            if "crypto_loss_halt_enabled" not in request.form:
+                _set_setting("crypto_loss_halt_enabled", "off")
+            if "crypto_profit_halt_enabled" not in request.form:
+                _set_setting("crypto_profit_halt_enabled", "off")
         intervals_changed = False
         # Snapshot current trading mode BEFORE applying changes — used to detect transition
         current_mode = _setting("crypto_trading_mode", "paper")
@@ -1626,17 +1768,6 @@ def settings():
             flash("Crypto settings updated", "ok")
         return redirect(url_for("crypto.settings"))
     key, secret = get_binance_creds()
-    # Drawdown halt: read the one-shot notice and CLEAR it (so it shows once).
-    # Stored as "<isoformat>|<message>" by update_peak_and_check_halt.
-    drawdown_notice_raw = _setting("crypto_drawdown_notice", "")
-    drawdown_notice = None
-    if drawdown_notice_raw:
-        if "|" in drawdown_notice_raw:
-            ts, msg = drawdown_notice_raw.split("|", 1)
-        else:
-            ts, msg = "", drawdown_notice_raw
-        drawdown_notice = {"ts": ts, "msg": msg}
-        _set_setting("crypto_drawdown_notice", "")  # one-shot — clear after read
 
     # System health snapshot — single panel so user doesn't have to grep logs.
     health = _system_health()
@@ -1652,8 +1783,6 @@ def settings():
         trading_mode=_setting("crypto_trading_mode", "paper"),
         max_position_usd=_setting("crypto_max_position_usd", "50"),
         max_concurrent=_setting("crypto_max_concurrent", "2"),
-        drawdown_halt_pct=_setting("crypto_drawdown_halt_pct", "15"),
-        drawdown_halt_enabled=_setting("crypto_drawdown_halt_enabled", "on"),
         min_balance_usd=_setting("crypto_min_balance_usd", "100"),
         loop_interval_min=_setting("crypto_loop_interval_min", "15"),
         fast_check_interval_sec=_setting("crypto_fast_check_interval_sec", "60"),
@@ -1661,9 +1790,15 @@ def settings():
         partial_take_trigger_pct=_setting("crypto_partial_take_trigger_pct", "4.0"),
         partial_take_fraction=_setting("crypto_partial_take_fraction", "0.5"),
         breakeven_buffer_pct=_setting("crypto_breakeven_buffer_pct", "1.0"),
+        partial_lock_fraction=_setting("crypto_partial_lock_fraction", "0.5"),
+        loss_halt_enabled=_setting("crypto_loss_halt_enabled", "off"),
+        loss_halt_pct=_setting("crypto_loss_halt_pct", "5.0"),
+        profit_halt_enabled=_setting("crypto_profit_halt_enabled", "off"),
+        profit_halt_pct=_setting("crypto_profit_halt_pct", "5.0"),
+        today_loss_halted=_setting("crypto_today_loss_halted", "0"),
+        today_profit_halted=_setting("crypto_today_profit_halted", "0"),
         day_start_value_usd=_setting("crypto_day_start_value_usd", "0"),
         day_start_date=_setting("crypto_day_start_date", ""),
-        drawdown_notice=drawdown_notice,
         health=health,
         strategy_names=STRATEGY_NAMES,
         disabled_strategies=disabled_strategies,
@@ -1699,7 +1834,8 @@ def _system_health() -> dict:
         "last_error_summary": None,
         "day_start_value": None,
         "drawdown_pct": None,
-        "halt_enabled": (_setting("crypto_drawdown_halt_enabled", "on") == "on"),
+        "halt_enabled": (_setting("crypto_loss_halt_enabled", "off") == "on"
+                         or _setting("crypto_profit_halt_enabled", "off") == "on"),
     }
 
     # Scheduler next fires
@@ -1749,20 +1885,140 @@ def _system_health() -> dict:
     return health
 
 
+@bp.route("/api/snapshots/backfill", methods=["POST"])
+def api_snapshots_backfill():
+    """One-shot: seed crypto_daily_snapshots from historical CryptoRun summaries.
+    Returns: {"ok": True, "inserted": N, "skipped_existing": M, "scanned": K}"""
+    from datetime import timezone, timedelta
+    from webapp.models import CryptoDailySnapshot, CryptoRun, db
+    import re
+    MYT = timezone(timedelta(hours=8))
+    pattern = re.compile(r"total value \$([\d,]+\.\d+)")
+    runs = (CryptoRun.query
+            .filter(CryptoRun.kind == "sync",
+                    CryptoRun.status == "ok",
+                    CryptoRun.summary.isnot(None))
+            .order_by(CryptoRun.started_at.asc())
+            .all())
+    earliest_per_day: dict = {}
+    scanned = 0
+    for r in runs:
+        if not r.summary:
+            continue
+        scanned += 1
+        m = pattern.search(r.summary)
+        if not m:
+            continue
+        try:
+            value = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        if value <= 0:
+            continue
+        date_iso = (r.started_at.replace(tzinfo=timezone.utc)
+                    .astimezone(MYT).date().isoformat())
+        if date_iso not in earliest_per_day:
+            earliest_per_day[date_iso] = value
+    existing_dates = {s.date for s in CryptoDailySnapshot.query.all()}
+    inserted = 0
+    skipped = 0
+    for date_iso, value in earliest_per_day.items():
+        if date_iso in existing_dates:
+            skipped += 1
+            continue
+        db.session.add(CryptoDailySnapshot(
+            date=date_iso,
+            total_value_usd=value,
+            usdt_free=None,
+            open_value_usd=None,
+            deposits_during_day_usd=None,
+            source="backfill",
+        ))
+        inserted += 1
+    if inserted:
+        db.session.commit()
+    return jsonify({
+        "ok": True,
+        "scanned": scanned,
+        "inserted": inserted,
+        "skipped_existing": skipped,
+    })
+
+
+@bp.route("/api/halts/override", methods=["POST"])
+def api_halts_override():
+    """User clicked 'Resume trading today' on the halt banner.
+
+    Body: {"type": "loss" | "profit"}
+
+    Effect:
+      - Clears today_<kind>_halted to "0" (banner disappears, _check_guardrails
+        no longer blocks new entries).
+      - Sets today_<kind>_overridden to "1" so update_day_start_and_check_halt
+        won't immediately re-fire the halt this tick (drawdown is still past
+        threshold; without this flag, the next loop tick would re-trip).
+      - Logs a CryptoRun entry kind="halt_override" for audit trail.
+
+    The override flag auto-clears at next MYT midnight along with the halt
+    flag, so each kind re-arms fully tomorrow. There's no permanent setting
+    change — user has to consciously override every day they want to trade
+    past their threshold.
+    """
+    from webapp.models import CryptoRun, db
+    body = request.get_json(silent=True) or {}
+    kind = (body.get("type") or "").strip().lower()
+    if kind not in ("loss", "profit"):
+        return jsonify({"ok": False, "reason": "type must be 'loss' or 'profit'"}), 400
+    halted_key = f"crypto_today_{kind}_halted"
+    overridden_key = f"crypto_today_{kind}_overridden"
+    if _setting(halted_key, "0") != "1":
+        return jsonify({"ok": False, "reason": f"no active {kind} halt to override"}), 400
+    pnl_pct = None
+    try:
+        try:
+            day_start = float(_setting("crypto_day_start_value_usd", "0") or 0)
+        except (TypeError, ValueError):
+            day_start = 0.0
+        if day_start > 0:
+            acct = _account_summary()
+            cur = acct.get("account_value")
+            if cur is not None:
+                pnl_pct = (cur - day_start) / day_start * 100.0
+    except Exception:
+        pass
+    # ORDER MATTERS: override flag FIRST, then clear halted. Without this
+    # ordering, fast-exit-check could fire halt + sell positions during the
+    # gap between the two commits.
+    _set_setting(overridden_key, "1")
+    _set_setting(halted_key, "0")
+    ts = datetime.utcnow()
+    pnl_str = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "?"
+    summary = (f"User override: {kind.upper()} halt cleared (today P&L {pnl_str}). "
+               f"Re-arms at next MYT midnight; no further {kind} halt will fire today.")
+    try:
+        db.session.add(CryptoRun(kind="halt_override", status="ok",
+                                  started_at=ts, ended_at=ts, summary=summary))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    import logging
+    logging.getLogger("crypto").warning(summary)
+    return jsonify({"ok": True, "kind": kind, "today_pnl_pct": pnl_pct})
+
+
 @bp.route("/reset-drawdown-peak", methods=["POST"])
 def reset_drawdown_peak():
-    """Reset today's start-of-day baseline so the daily drawdown halt clears.
+    """Reset today's start-of-day baseline used by daily P&L halts.
 
-    Called after the user has acknowledged a halt and wants to resume trading
-    mid-day. Clears the day-start snapshot and the one-shot notice; the next
-    account_value read will reset the snapshot to the current value, so
-    drawdown calculation effectively restarts from now. Does NOT auto-flip the
-    kill switch off — user toggles it deliberately so there's a beat to think.
+    Used after deposits/withdrawals when the user wants halt thresholds rebased
+    to current portfolio value. The next account_value read snapshots the new
+    baseline. Note: this does NOT clear today's halt flags — those auto-clear
+    at next MYT midnight. (To resume trading after a halt fire, just wait for
+    midnight or manually flip crypto_today_loss_halted/profit_halted to "0".)
     """
     _set_setting("crypto_day_start_value_usd", "0")
     _set_setting("crypto_day_start_date", "")
-    _set_setting("crypto_drawdown_notice", "")
-    flash("Day-start baseline reset — drawdown halt cleared. Toggle the kill switch off to resume trading.", "ok")
+    flash("Day-start baseline reset — next sync sets new baseline.", "ok")
     return redirect(url_for("crypto.settings"))
 
 

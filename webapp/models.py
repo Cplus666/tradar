@@ -78,3 +78,19 @@ class CryptoRun(db.Model):
     summary = db.Column(db.Text)
     log_excerpt = db.Column(db.Text)
     error = db.Column(db.Text)
+
+
+class CryptoDailySnapshot(db.Model):
+    """Daily portfolio-value snapshot used as the day-start denominator for
+    the 'Daily trading ROI — % on portfolio' chart. One row per MYT day.
+    Populated at MYT-midnight rollover by update_day_start_and_check_halt;
+    backfillable from CryptoRun.summary strings via the snapshot-backfill
+    endpoint. See stock/webapp/models.py docstring for full field details."""
+    __tablename__ = "crypto_daily_snapshots"
+    date = db.Column(db.String(10), primary_key=True)
+    total_value_usd = db.Column(db.Float, nullable=False)
+    usdt_free = db.Column(db.Float)
+    open_value_usd = db.Column(db.Float)
+    deposits_during_day_usd = db.Column(db.Float)
+    source = db.Column(db.String(16), default="rollover", nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)

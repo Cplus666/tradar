@@ -199,6 +199,52 @@ def run_fast_exit_check() -> None:
             else:
                 log.warning("partial take %s [%s] FAILED: %s", pos.symbol, mode, res["reason"])
 
+    # === Daily P&L halt check (live mode only) ===
+    # Without this, halts only fire on the 15-min main-loop tick, leaving up to
+    # 15 min of unprotected drawdown when dashboard isn't open. Adding it here
+    # gives sub-minute halt response. Cost: 1 extra Binance balance call per
+    # fast-exit tick (~1440/day at 60s cadence — well under rate limit).
+    # Narrow exception handling so genuine bugs propagate; only swallow
+    # network/API errors. Persist last failure for health-panel visibility.
+    from binance.exceptions import BinanceAPIException, BinanceRequestException
+    from requests.exceptions import RequestException
+    from webapp.crypto.routes import get_binance_creds
+    from analysis.crypto_executor import (
+        update_day_start_and_check_halt, _set_setting,
+    )
+    try:
+        key, secret = get_binance_creds()
+        if key and secret:
+            client = _binance_client(key, secret)
+            acct = client.get_account()
+            usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
+            usdt_free = float(usdt["free"]) if usdt else 0.0
+            open_live = _open_positions(is_paper=False)
+            open_value = 0.0
+            for p in open_live:
+                cp = prices.get(p.symbol)
+                if cp is None:
+                    continue
+                qty = float(getattr(p, "_remaining_qty", p.qty))
+                open_value += cp * qty
+            total = usdt_free + open_value
+            if total > 0:
+                risk = update_day_start_and_check_halt(total)
+                if risk.get("loss_halt_fired"):
+                    log.warning("FAST LOSS HALT fired (today %+.2f%%)",
+                                risk.get("today_pnl_pct", 0))
+                elif risk.get("profit_halt_fired"):
+                    log.warning("FAST PROFIT HALT fired (today +%.2f%%)",
+                                risk.get("today_pnl_pct", 0))
+                _set_setting("crypto_last_fast_halt_error", "")
+    except (BinanceAPIException, BinanceRequestException, RequestException, ConnectionError, TimeoutError) as e:
+        log.error("fast-exit halt check network failure: %s", e)
+        try:
+            _set_setting("crypto_last_fast_halt_error",
+                         f"{datetime.utcnow().isoformat()}|{type(e).__name__}: {str(e)[:200]}")
+        except Exception:
+            pass
+
 
 def run_crypto_loop() -> None:
     """One tick of the crypto trading loop. Caller provides app context."""
@@ -265,13 +311,18 @@ def run_crypto_loop() -> None:
                 try:
                     from analysis.crypto_executor import update_day_start_and_check_halt
                     risk = update_day_start_and_check_halt(sync_result.get("total_value_usd", 0))
-                    if risk["halt_triggered"]:
+                    if risk.get("loss_halt_fired"):
                         log_lines.append(
-                            f"DAILY DRAWDOWN HALT: -{risk['drawdown_pct']:.2f}% "
-                            f"from day-start ${risk['day_start']:.2f} → kill switch auto-flipped ON"
+                            f"LOSS HALT fired: today {risk.get('today_pnl_pct', 0):+.2f}% "
+                            f"(day-start ${risk['day_start']:.2f}) — positions liquidated"
+                        )
+                    elif risk.get("profit_halt_fired"):
+                        log_lines.append(
+                            f"PROFIT HALT fired: today {risk.get('today_pnl_pct', 0):+.2f}% "
+                            f"(day-start ${risk['day_start']:.2f}) — positions liquidated"
                         )
                 except Exception as e:
-                    log_lines.append(f"drawdown check skipped: {e}")
+                    log_lines.append(f"halt check skipped: {e}")
         except Exception as e:
             log_lines.append(f"balance sync skipped: {e}")
 

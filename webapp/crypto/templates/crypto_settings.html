@@ -110,27 +110,8 @@
     </div>
 
     <div>
-      <label class="flex items-center gap-2 text-xs font-semibold mb-2 cursor-pointer">
-        <input type="checkbox" name="crypto_drawdown_halt_enabled" value="on"
-               {% if drawdown_halt_enabled == 'on' %}checked{% endif %}
-               class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
-        Enable daily drawdown halt
-      </label>
-      <label class="block text-xs font-semibold mb-1">Daily drawdown threshold (%)</label>
-      <input type="number" step="1" min="1" max="50" name="crypto_drawdown_halt_pct" value="{{ drawdown_halt_pct }}"
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">If today's portfolio drops this % from <strong>today's start-of-day value</strong>, the kill switch auto-flips ON. Resets every MYT midnight.</p>
-
-      {% if drawdown_notice %}
-      <div class="mt-2 bg-rose-950/40 border border-rose-700 rounded p-3 text-sm">
-        <div class="text-rose-300 font-semibold mb-1">⚠ Auto-halt fired</div>
-        <div class="text-zinc-300 text-xs mono">{{ drawdown_notice.ts }}</div>
-        <div class="text-zinc-300 mt-1">{{ drawdown_notice.msg }}</div>
-        <div class="text-xs text-zinc-500 mt-1">(This notice only shows once — also logged in the Runs page as <span class="mono">drawdown_halt</span>.)</div>
-      </div>
-      {% endif %}
-
-      <div class="mt-2 flex items-center gap-3 flex-wrap">
+      <label class="block text-xs font-semibold mb-1">Day-start baseline (used by daily P&amp;L halts)</label>
+      <div class="flex items-center gap-3 flex-wrap">
         <span class="text-xs text-zinc-500">
           Today started at <span class="mono text-zinc-300">${{ "%.2f"|format(day_start_value_usd|float) }}</span>
           {% if day_start_date %}<span class="text-zinc-600">({{ day_start_date }})</span>{% endif %}
@@ -141,11 +122,12 @@
         <button type="submit"
                 formaction="{{ url_for('crypto.reset_drawdown_peak') }}"
                 formmethod="post"
-                onclick="return confirm('Reset today\'s start-of-day baseline? Next account-value snapshot becomes the new baseline; daily drawdown counter restarts from 0%.');"
+                onclick="return confirm('Reset today\'s start-of-day baseline? Next account-value snapshot becomes the new baseline; today\'s P&L counter restarts from 0%.');"
                 class="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1 rounded">
           🔓 Reset day-start baseline
         </button>
       </div>
+      <p class="text-xs text-zinc-500 mt-1">Auto-rolls over at MYT midnight. Manual reset only needed if you deposit/withdraw mid-day and want the halt-thresholds rebased.</p>
     </div>
 
     <div>
@@ -153,6 +135,50 @@
       <input type="number" step="10" min="0" name="crypto_min_balance_usd" value="{{ min_balance_usd }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
       <p class="text-xs text-zinc-500 mt-1">Live orders refused if free USDT &lt; this.</p>
+    </div>
+
+    <div class="border-t border-zinc-800 pt-4">
+      <h4 class="text-xs font-semibold uppercase text-zinc-400 tracking-wide mb-3">Daily P&amp;L auto-halts (soft, auto-resume next MYT day)</h4>
+      <p class="text-xs text-zinc-500 mb-3">When today's P&amp;L crosses the threshold, the bot <strong>sells all open positions</strong> and halts new entries until next MYT midnight. Auto-resumes — no manual reset.</p>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="flex items-center gap-2 text-xs font-semibold mb-2 cursor-pointer">
+            <input type="checkbox" name="crypto_loss_halt_enabled" value="on"
+                   {% if loss_halt_enabled == 'on' %}checked{% endif %}
+                   class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+            Enable loss halt
+          </label>
+          <label class="block text-xs font-semibold mb-1">Loss threshold (%)</label>
+          <input type="number" step="0.5" min="1" max="20" name="crypto_loss_halt_pct" value="{{ loss_halt_pct }}"
+                 class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+          <p class="text-xs text-zinc-500 mt-1">If today P&amp;L ≤ −X%: sell all + halt.</p>
+        </div>
+
+        <div>
+          <label class="flex items-center gap-2 text-xs font-semibold mb-2 cursor-pointer">
+            <input type="checkbox" name="crypto_profit_halt_enabled" value="on"
+                   {% if profit_halt_enabled == 'on' %}checked{% endif %}
+                   class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+            Enable profit halt
+          </label>
+          <label class="block text-xs font-semibold mb-1">Profit threshold (%)</label>
+          <input type="number" step="0.5" min="1" max="20" name="crypto_profit_halt_pct" value="{{ profit_halt_pct }}"
+                 class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+          <p class="text-xs text-zinc-500 mt-1">If today P&amp;L ≥ +X%: sell all + halt (lock-in).</p>
+        </div>
+      </div>
+
+      {% if today_loss_halted == '1' or today_profit_halted == '1' %}
+      <div class="mt-3 bg-amber-950/40 border border-amber-700 rounded p-3 text-sm">
+        <div class="text-amber-300 font-semibold mb-1">⏸ Today's halt active</div>
+        <div class="text-zinc-300 text-xs">
+          {% if today_loss_halted == '1' %}Loss halt fired today. {% endif %}
+          {% if today_profit_halted == '1' %}Profit halt fired today. {% endif %}
+          Auto-resumes at next MYT midnight.
+        </div>
+      </div>
+      {% endif %}
     </div>
 
     </div>{# === END INNER LEFT COLUMN === #}
@@ -217,7 +243,7 @@
       Enable partial profit-take
     </label>
 
-    <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+    <div class="grid grid-cols-2 gap-3">
       <div>
         <label class="block text-xs font-semibold mb-1">Trigger (%)</label>
         <input type="number" step="0.5" min="1" max="20" name="crypto_partial_take_trigger_pct" value="{{ partial_take_trigger_pct }}"
@@ -231,10 +257,16 @@
         <p class="text-xs text-zinc-500 mt-1">0.5 = sell half</p>
       </div>
       <div>
-        <label class="block text-xs font-semibold mb-1">New stop buffer (%)</label>
+        <label class="block text-xs font-semibold mb-1">Stop buffer (%)</label>
         <input type="number" step="0.5" min="0" max="10" name="crypto_breakeven_buffer_pct" value="{{ breakeven_buffer_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">New stop = entry + this %</p>
+        <p class="text-xs text-zinc-500 mt-1">Min new stop = entry + this %</p>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Lock fraction</label>
+        <input type="number" step="0.05" min="0" max="0.95" name="crypto_partial_lock_fraction" value="{{ partial_lock_fraction }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">Lock X of partial gain. 0.5 = half. New stop = entry × (1 + max(buffer, gain × this)/100)</p>
       </div>
     </div>
 
