@@ -58,7 +58,7 @@
     <div>
       <label class="block text-sm font-semibold mb-1">Crypto kill switch</label>
       <p class="text-xs text-zinc-500 mb-2">Independent of stock kill switch. ON = no crypto trades placed.</p>
-      <select name="crypto_kill_switch" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-48">
+      <select name="crypto_kill_switch" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-64">
         <option value="off" {% if kill_switch == 'off' %}selected{% endif %}>OFF — trading allowed</option>
         <option value="on" {% if kill_switch == 'on' %}selected{% endif %}>ON — block all trades</option>
       </select>
@@ -67,7 +67,7 @@
     <div>
       <label class="block text-sm font-semibold mb-1">Trading mode</label>
       <p class="text-xs text-zinc-500 mb-2">Paper = simulated. Live = real Binance orders.</p>
-      <select name="crypto_trading_mode" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-48">
+      <select name="crypto_trading_mode" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-64">
         <option value="paper" {% if trading_mode == 'paper' %}selected{% endif %}>paper</option>
         <option value="live" {% if trading_mode == 'live' %}selected{% endif %}>LIVE — real money</option>
       </select>
