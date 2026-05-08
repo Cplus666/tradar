@@ -26,22 +26,9 @@
         <div class="text-zinc-600 mt-1 truncate" title="{{ health.last_sync_summary }}">{{ health.last_sync_summary }}</div>
       {% endif %}
     </div>
-    <div class="bg-zinc-950 rounded p-3">
-      <div class="text-zinc-500 uppercase tracking-wide mb-1">
-        Today's drawdown
-        {% if not health.halt_enabled %}<span class="text-zinc-600 lowercase">(halt off)</span>{% endif %}
-      </div>
-      {% if health.day_start_value %}
-        <div class="mono text-zinc-200">start ${{ "%.2f"|format(health.day_start_value) }}</div>
-        {% if health.drawdown_pct is not none %}
-          <div class="mt-1 mono {% if health.drawdown_pct >= 15 %}text-rose-400{% elif health.drawdown_pct >= 5 %}text-amber-400{% elif health.drawdown_pct > 0 %}text-zinc-300{% else %}text-emerald-400{% endif %}">
-            {% if health.drawdown_pct >= 0 %}-{% else %}+{% endif %}{{ "%.2f"|format(health.drawdown_pct|abs) }}% today
-          </div>
-        {% endif %}
-      {% else %}
-        <div class="text-zinc-500">awaiting first sync</div>
-      {% endif %}
-    </div>
+    {# "Today's drawdown" panel removed: derived from stale last_sync.summary
+       regex parse, disagreed with the dashboard's live banner. Live drawdown
+       is on the dashboard already. #}
     <div class="bg-zinc-950 rounded p-3 {% if health.last_error_at %}border border-rose-800{% endif %}">
       <div class="text-zinc-500 uppercase tracking-wide mb-1">Last error</div>
       {% if health.last_error_at %}
@@ -110,27 +97,6 @@
     </div>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Day-start baseline (used by daily P&amp;L halts)</label>
-      <div class="flex items-center gap-3 flex-wrap">
-        <span class="text-xs text-zinc-500">
-          Today started at <span class="mono text-zinc-300">${{ "%.2f"|format(day_start_value_usd|float) }}</span>
-          {% if day_start_date %}<span class="text-zinc-600">({{ day_start_date }})</span>{% endif %}
-        </span>
-        {# HTML5 forbids nested <form>, so we use formaction on a submit button —
-           clicking this routes the parent form's POST to /reset-drawdown-peak
-           instead of /settings. The reset endpoint ignores form fields. #}
-        <button type="submit"
-                formaction="{{ url_for('crypto.reset_drawdown_peak') }}"
-                formmethod="post"
-                onclick="return confirm('Reset today\'s start-of-day baseline? Next account-value snapshot becomes the new baseline; today\'s P&L counter restarts from 0%.');"
-                class="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1 rounded">
-          🔓 Reset day-start baseline
-        </button>
-      </div>
-      <p class="text-xs text-zinc-500 mt-1">Auto-rolls over at MYT midnight. Manual reset only needed if you deposit/withdraw mid-day and want the halt-thresholds rebased.</p>
-    </div>
-
-    <div>
       <label class="block text-xs font-semibold mb-1">Min USDT balance before live mode allowed</label>
       <input type="number" step="10" min="0" name="crypto_min_balance_usd" value="{{ min_balance_usd }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
@@ -138,7 +104,18 @@
     </div>
 
     <div class="border-t border-zinc-800 pt-4">
-      <h4 class="text-xs font-semibold uppercase text-zinc-400 tracking-wide mb-3">Daily P&amp;L auto-halts (soft, auto-resume next MYT day)</h4>
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h4 class="text-xs font-semibold uppercase text-zinc-400 tracking-wide">Daily P&amp;L auto-halts (soft, auto-resume next MYT day)</h4>
+        {% if trading_mode == 'live' %}
+        <button type="submit"
+                formaction="{{ url_for('crypto.api_deposits_refresh') }}"
+                formmethod="post"
+                onclick="return confirm('Pull today\'s USDT deposits/withdrawals from Binance and update the synth day-start?');"
+                class="text-xs bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-3 py-1 rounded">
+          ↻ Refresh deposit/withdraw
+        </button>
+        {% endif %}
+      </div>
       <p class="text-xs text-zinc-500 mb-3">When today's P&amp;L crosses the threshold, the bot <strong>sells all open positions</strong> and halts new entries until next MYT midnight. Auto-resumes — no manual reset.</p>
 
       <div class="grid grid-cols-2 gap-4">
@@ -277,6 +254,20 @@
       <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-8 py-2 rounded">Save settings</button>
     </div>
   </form>
+
+  {# === Paper deposit/withdraw — separate form so it can't nest inside settings form === #}
+  {% if trading_mode != 'live' %}
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+    <h3 class="text-sm font-semibold mb-3 text-amber-400">Paper deposit / withdraw</h3>
+    <form method="post" action="{{ url_for('crypto.api_paper_deposit') }}" class="flex items-center gap-3 flex-wrap">
+      <span class="text-xs text-zinc-500 mono">$</span>
+      <input type="number" step="0.01" name="amount" placeholder="100 or -50" required
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 w-36 mono text-zinc-200">
+      <button type="submit" class="text-xs bg-amber-700 hover:bg-amber-600 text-white px-4 py-1.5 rounded">Apply</button>
+      <span class="text-xs text-zinc-500">Positive = deposit, negative = withdrawal. Adds to today's daily total.</span>
+    </form>
+  </div>
+  {% endif %}
 
   {# === Below the settings form: API credentials + Server IP in a 2-col row === #}
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">

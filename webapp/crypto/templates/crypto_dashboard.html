@@ -691,9 +691,19 @@
         const capitalLine = `$${c.notional.toFixed(2)} cost`
           + (valueNow != null ? ` → $${valueNow.toFixed(2)} now` : '')
           + ` · ${fmtQty(c.qty)} units`;
+        // Partial-take indicator: badge + "stop was $X" line.
+        const partialBadge = c.partial_done
+          ? '<span class="ml-2 text-[10px] uppercase tracking-wide font-semibold text-emerald-400 bg-emerald-950/40 border border-emerald-800 px-1.5 py-0.5 rounded">partial</span>'
+          : '';
+        const stopWasLine = (c.partial_done && c.original_stop != null)
+          ? `<div class="text-[10px] text-zinc-500 mono mt-0.5">stop was ${fmtPrice(c.original_stop)} (locked profit on partial)</div>`
+          : '';
         return `<div class="border rounded-lg p-3 ${borderCls}">
           <div class="flex items-baseline justify-between mb-2">
-            <a href="/tradar/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+            <div>
+              <a href="/tradar/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+              ${partialBadge}
+            </div>
             <span class="text-xs text-zinc-500">${c.strategy}</span>
           </div>
           <div class="flex justify-between text-sm mono">
@@ -709,6 +719,7 @@
               <span>stop ${fmtPrice(c.stop)} (-${c.risk_pct.toFixed(1)}%)</span>
               <span>target ${fmtPrice(c.target)} (+${c.reward_pct.toFixed(1)}%)</span>
             </div>
+            ${stopWasLine}
           </div>
           <div class="flex justify-between text-sm mt-2">
             <span class="font-bold mono num ${pnlCls}">${pnlStr}</span>

@@ -47,6 +47,9 @@ DEFAULTS = {
     # flow through crypto_daily_snapshots.deposits_during_day_usd. Use
     # _principal_at_day(date) for time-aware principal.
     "crypto_starting_capital_usd": "200.29",
+    # Net USDT deposits/withdrawals during TODAY (since MYT midnight). Updated
+    # by 'Refresh deposit/withdraw' button. Reset to 0 at MYT midnight rollover.
+    "crypto_today_deposits_so_far_usd": "0",
     # Partial profit-take defaults (so missing settings don't silently → 0,
     # which would make new_stop=entry instead of entry+buffer%)
     "crypto_partial_take_enabled": "on",
@@ -118,22 +121,37 @@ def _starting_capital() -> float:
     return 200.29
 
 
+def _today_deposits_so_far() -> float:
+    """Net deposits during TODAY since MYT midnight. Updated by 'Refresh
+    deposit/withdraw' button. Reset to 0 at MYT rollover."""
+    try:
+        return float(_get_setting("crypto_today_deposits_so_far_usd") or "0")
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _principal_at_day(date_iso: str) -> float:
-    """Principal at MYT 00:00 of date_iso = initial + Σ deposits/withdrawals
-    from snapshot rows with date < date_iso. Today's own deposits don't count
-    toward today's principal — they flow in starting tomorrow."""
+    """Principal at MYT 00:00 of date_iso = initial + Σ deposits up to and
+    including the prior day + (if asking for today) today's so-far deposits.
+    Filter `<= date_iso` because row.date=X actually stores deposits during
+    day X-1 (rollover at start of X fetches past 24h)."""
     from webapp.models import CryptoDailySnapshot
     initial = _starting_capital()
     try:
         rows = (CryptoDailySnapshot.query
-                .filter(CryptoDailySnapshot.date < date_iso,
+                .filter(CryptoDailySnapshot.date <= date_iso,
                         CryptoDailySnapshot.deposits_during_day_usd.isnot(None))
                 .with_entities(CryptoDailySnapshot.deposits_during_day_usd)
                 .all())
         cum_deposits = sum(float(r[0] or 0) for r in rows)
     except Exception:
         cum_deposits = 0.0
-    return initial + cum_deposits
+    from datetime import timezone, timedelta
+    MYT_TZ = timezone(timedelta(hours=8))
+    today_iso = (datetime.utcnow().replace(tzinfo=timezone.utc)
+                 .astimezone(MYT_TZ).date().isoformat())
+    today_so_far = _today_deposits_so_far() if date_iso == today_iso else 0.0
+    return initial + cum_deposits + today_so_far
 
 
 def sell_all_open_positions(reason: str, mode_filter: bool | None = None) -> int:
@@ -171,8 +189,9 @@ def _compute_synth_day_start_today() -> float:
         fee_rate = float(_get_setting("crypto_fee_rate_per_side") or "0.001")
     except (TypeError, ValueError):
         fee_rate = 0.001
+    is_paper = _is_paper_mode_setting()
     trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == False)
+              .filter(CryptoTrade.is_paper == is_paper)
               .order_by(CryptoTrade.executed_at).all())
     by_sym: dict = {}
     for t in trades:
@@ -205,9 +224,58 @@ def _compute_synth_day_start_today() -> float:
     return _principal_at_day(today_iso) + pre_today_realized
 
 
+def _is_paper_mode_setting() -> bool:
+    """Read trading mode from settings — paper means no Binance deposit fetch."""
+    return (_get_setting("crypto_trading_mode") or "paper") == "paper"
+
+
+def _fetch_net_usdt_deposits_since_today_midnight() -> float | None:
+    """Net USDT deposits − withdrawals from MYT 00:00 today to NOW.
+    Used by 'Refresh deposit/withdraw' button. Returns None on Binance API failure.
+    In paper mode, returns 0.0 (paper deposits are user-entered via form)."""
+    if _is_paper_mode_setting():
+        return 0.0
+    try:
+        from webapp.crypto.routes import get_binance_creds
+        from datetime import timezone, timedelta
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return None
+        client = _binance_client(key, secret)
+        MYT = timezone(timedelta(hours=8))
+        today_midnight_myt = (datetime.utcnow().replace(tzinfo=timezone.utc)
+                              .astimezone(MYT)
+                              .replace(hour=0, minute=0, second=0, microsecond=0))
+        start_ms = int(today_midnight_myt.astimezone(timezone.utc).timestamp() * 1000)
+        end_ms = int(datetime.utcnow().timestamp() * 1000)
+        deposits = 0.0
+        withdrawals = 0.0
+        try:
+            for d in client.get_deposit_history(coin="USDT", startTime=start_ms, endTime=end_ms) or []:
+                if d.get("status") == 1:
+                    deposits += float(d.get("amount") or 0)
+        except Exception as e:
+            log.warning("today's deposit history fetch failed: %s", e)
+            return None
+        try:
+            for w in client.get_withdraw_history(coin="USDT", startTime=start_ms, endTime=end_ms) or []:
+                if w.get("status") == 6:
+                    withdrawals += float(w.get("amount") or 0)
+        except Exception as e:
+            log.warning("today's withdraw history fetch failed: %s", e)
+            return None
+        return deposits - withdrawals
+    except Exception as e:
+        log.warning("since-midnight deposit fetch failed: %s", e)
+        return None
+
+
 def _fetch_net_usdt_deposits_last_24h() -> float | None:
     """Net USDT deposits − withdrawals in the past 24h via Binance API.
-    Returns None if either history call fails (caller stores NULL)."""
+    Returns None if either history call fails (caller stores NULL).
+    In paper mode, returns 0.0 — paper deposits don't show on Binance."""
+    if _is_paper_mode_setting():
+        return 0.0
     try:
         from webapp.crypto.routes import get_binance_creds
         key, secret = get_binance_creds()
@@ -252,10 +320,13 @@ def _write_daily_snapshot(date_iso: str, total_value: float,
     'backfill' or stale row)."""
     from webapp.models import CryptoDailySnapshot, db
     existing = CryptoDailySnapshot.query.get(date_iso)
-    deposits_24h = _fetch_net_usdt_deposits_last_24h() if existing is None else None
     if existing is not None:
         if not overwrite:
             return
+        # Do NOT refetch deposits on overwrite — column semantics is "captured
+        # at this row's rollover for past 24h" = prior day's deposits, fixed
+        # forever once written. A mid-day refetch would corrupt the value with
+        # a sliding window. Same-day deposits flow into TOMORROW's row.
         existing.total_value_usd = float(total_value)
         existing.source = source
         if usdt_free is not None:
@@ -265,6 +336,7 @@ def _write_daily_snapshot(date_iso: str, total_value: float,
         db.session.commit()
         log.info("daily snapshot updated: %s @ $%.2f source=%s", date_iso, total_value, source)
         return
+    deposits_24h = _fetch_net_usdt_deposits_last_24h()
     row = CryptoDailySnapshot(
         date=date_iso,
         total_value_usd=float(total_value),
@@ -324,6 +396,9 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
         _set_setting("crypto_today_profit_halted", "0")
         _set_setting("crypto_today_loss_overridden", "0")
         _set_setting("crypto_today_profit_overridden", "0")
+        # Reset today's mid-day deposit counter — yesterday's deposits get
+        # finalized into today's snapshot row at this rollover.
+        _set_setting("crypto_today_deposits_so_far_usd", "0")
         # Daily snapshot table stores SYNTH value (single source of truth
         # used by halt + dashboard + ROI graph).
         try:
@@ -358,7 +433,7 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             msg = (f"LOSS HALT: today {today_pnl_pct:+.2f}% (≥ {loss_halt_pct:.1f}%) — "
                    f"closing all positions, halting until next MYT day")
             _set_setting("crypto_today_loss_halted", "1")
-            n_closed = sell_all_open_positions(f"LOSS HALT — today {today_pnl_pct:+.2f}%")
+            n_closed = sell_all_open_positions(f"LOSS HALT — today {today_pnl_pct:+.2f}%", mode_filter=_is_paper_mode_setting())
             db.session.add(CryptoRun(kind="loss_halt", status="ok",
                                       started_at=ts, ended_at=ts,
                                       summary=f"{msg} ({n_closed} positions closed)"))
@@ -378,7 +453,7 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             msg = (f"PROFIT HALT: today +{today_pnl_pct:.2f}% (≥ {profit_halt_pct:.1f}%) — "
                    f"locking gains, halting until next MYT day")
             _set_setting("crypto_today_profit_halted", "1")
-            n_closed = sell_all_open_positions(f"PROFIT HALT — today +{today_pnl_pct:.2f}%")
+            n_closed = sell_all_open_positions(f"PROFIT HALT — today +{today_pnl_pct:.2f}%", mode_filter=_is_paper_mode_setting())
             db.session.add(CryptoRun(kind="profit_halt", status="ok",
                                       started_at=ts, ended_at=ts,
                                       summary=f"{msg} ({n_closed} positions closed)"))

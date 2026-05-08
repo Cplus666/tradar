@@ -306,8 +306,8 @@ def run_crypto_loop() -> None:
                     f"balance sync: {sync_result.get('real_count', 0)} real, "
                     f"${sync_result.get('total_value_usd', 0):.2f}"
                 )
-                # Ratchet peak + auto-halt on drawdown breach. Runs every loop
-                # so the halt fires even when the dashboard isn't being viewed.
+                # Snapshot today's start + check daily P&L halt. Runs every
+                # loop so the halt fires even when the dashboard isn't open.
                 try:
                     from analysis.crypto_executor import update_day_start_and_check_halt
                     risk = update_day_start_and_check_halt(sync_result.get("total_value_usd", 0))

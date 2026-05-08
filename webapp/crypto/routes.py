@@ -444,14 +444,24 @@ def _open_position_cards(tickers: dict | None = None) -> list:
             "gauge_pct": gauge * 100,  # 0-100 for CSS width
             "risk_pct": (entry - stop) / entry * 100,
             "reward_pct": (target - entry) / entry * 100,
+            # Partial-take state — let the dashboard show a "PARTIAL" badge and
+            # the original (pre-move) stop on positions that have already booked
+            # half their size.
+            "partial_done": bool(meta.get("partial_done")),
+            "original_stop": meta.get("original_stop"),
         })
     out.sort(key=lambda x: -x["pnl_pct"])  # winners first
     return out
 
 
 def _strategy_breakdown() -> list:
-    """Per-strategy stats: trades, win rate, avg P&L, total. Mode-aware."""
+    """Per-strategy stats: trades, win rate, avg P&L, total. Mode-aware. NET
+    of fees so totals reconcile with dashboard, journal, and ROI graph."""
     from webapp.models import CryptoTrade
+    try:
+        fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
+    except (TypeError, ValueError):
+        fee_rate = 0.001
     trades = (CryptoTrade.query
               .filter(CryptoTrade.is_paper == _is_paper_mode())
               .order_by(CryptoTrade.executed_at).all())
@@ -475,8 +485,12 @@ def _strategy_breakdown() -> list:
                     consumed = min(buy_remaining, sell_qty_remaining)
                     buys[0][1] -= consumed
                     sell_qty_remaining -= consumed
-                    pnl_pct = (float(t.price) - float(buy.price)) / float(buy.price) * 100
-                    pnl_usd = (float(t.price) - float(buy.price)) * consumed
+                    buy_value = float(buy.price) * consumed
+                    sell_value = float(t.price) * consumed
+                    gross = sell_value - buy_value
+                    fee = (buy_value + sell_value) * fee_rate
+                    pnl_usd = gross - fee
+                    pnl_pct = (pnl_usd / buy_value * 100) if buy_value > 0 else 0.0
                     strat = buy.strategy or "unknown"
                     d = by_strat.setdefault(strat, {"wins": 0, "losses": 0, "win_pcts": [], "loss_pcts": [], "net_usd": 0.0})
                     d["net_usd"] += pnl_usd
@@ -970,16 +984,32 @@ def api_dashboard_static():
                         else: today_losses += 1
                     if buys[0][1] <= 1e-9:
                         buys.pop(0)
+    # Halt-banner fields populated from settings so the banner doesn't flicker
+    # off during the static-render window (JS reads === true strictly).
+    try:
+        loss_halt_pct = float(_setting("crypto_loss_halt_pct", "5.0"))
+    except (TypeError, ValueError):
+        loss_halt_pct = 5.0
+    try:
+        profit_halt_pct = float(_setting("crypto_profit_halt_pct", "5.0"))
+    except (TypeError, ValueError):
+        profit_halt_pct = 5.0
     account = {
         "account_value": None, "usdt_free": None,
         "today_realized": today_realized,
         "today_unrealized": None, "today_total": None,
-        "today_total_pct": None,
+        "today_total_pct": None, "today_pnl_pct": None,
         "today_wins": today_wins, "today_losses": today_losses,
         "today_win_rate": (today_wins / (today_wins + today_losses) * 100) if (today_wins + today_losses) else None,
         "open_count": len(cards), "open_value": 0.0,
         "starting_capital": _principal_at_day(today_iso_static),
         "all_time_pnl": 0.0, "all_time_pct": None,
+        "loss_halted_today": (_setting("crypto_today_loss_halted", "0") == "1"),
+        "profit_halted_today": (_setting("crypto_today_profit_halted", "0") == "1"),
+        "loss_halt_overridden": (_setting("crypto_today_loss_overridden", "0") == "1"),
+        "profit_halt_overridden": (_setting("crypto_today_profit_overridden", "0") == "1"),
+        "loss_halt_pct": loss_halt_pct,
+        "profit_halt_pct": profit_halt_pct,
     }
     return jsonify({"account": account, "position_cards": cards, "static": True})
 
@@ -1566,15 +1596,27 @@ def coin_detail(symbol: str):
     has_position = open_pos is not None
     position_info = None
     if open_pos:
-        # _open_positions attaches _remaining_qty (post-partial-sells); use it so
-        # the coin page matches the journal after a partial profit-take.
+        # _open_positions attaches _remaining_qty (post-partial-sells); use it
+        # so the coin page matches the journal after a partial profit-take.
+        # P&L is NET of fees — was GROSS, causing this page to differ from
+        # every other surface (dashboard card, journal, ROI graph).
+        try:
+            _coin_fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
+        except (TypeError, ValueError):
+            _coin_fee_rate = 0.001
         rem_qty = float(getattr(open_pos, "_remaining_qty", open_pos.qty))
+        entry_price = float(open_pos.price)
+        buy_value = entry_price * rem_qty
+        sell_value = last_close * rem_qty
+        gross = sell_value - buy_value
+        fee = (buy_value + sell_value) * _coin_fee_rate
+        net_pnl = gross - fee
         position_info = {
-            "entry_price": float(open_pos.price),
+            "entry_price": entry_price,
             "qty": rem_qty,
-            "value_now": rem_qty * last_close,
-            "pnl": (last_close - float(open_pos.price)) * rem_qty,
-            "pnl_pct": (last_close - float(open_pos.price)) / float(open_pos.price) * 100,
+            "value_now": sell_value,
+            "pnl": net_pnl,
+            "pnl_pct": (net_pnl / buy_value * 100) if buy_value > 0 else 0.0,
         }
 
     readout = {
@@ -2004,6 +2046,119 @@ def api_halts_override():
     import logging
     logging.getLogger("crypto").warning(summary)
     return jsonify({"ok": True, "kind": kind, "today_pnl_pct": pnl_pct})
+
+
+@bp.route("/api/paper/deposit", methods=["POST"])
+def api_paper_deposit():
+    """Paper-mode deposit/withdraw form submission.
+
+    Single text input — accepts signed numbers (+ deposit, − withdrawal).
+    Increments today's snapshot row's deposits_during_day_usd by the entered
+    amount, then recomputes synth so dashboard + halt threshold immediately
+    reflect the new principal.
+
+    Per-event detail is NOT preserved — only the aggregated daily total
+    persists. Submit twice (e.g., +$50 then +$30) and today's row reads $80.
+    Mistake recovery: enter the inverse amount (e.g., -$80) to zero it out.
+
+    Live-mode users should use the 'Refresh deposit/withdraw' button instead,
+    which queries Binance directly. This endpoint refuses in live mode to
+    avoid muddying the live deposit ledger with manually-entered values.
+    """
+    from analysis.crypto_executor import (
+        _compute_synth_day_start_today,
+        _set_setting,
+        _is_paper_mode_setting,
+    )
+    from webapp.models import CryptoDailySnapshot, db
+    from datetime import timezone, timedelta
+
+    if not _is_paper_mode_setting():
+        flash("Paper-deposit form is paper-mode only. Live users: use the 'Refresh deposit/withdraw' button.", "error")
+        return redirect(url_for("crypto.settings"))
+
+    raw = (request.form.get("amount") or "").strip()
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        flash(f"Invalid amount '{raw}' — enter a number, e.g. 100 or -50.", "error")
+        return redirect(url_for("crypto.settings"))
+    if abs(amount) < 0.01:
+        flash("Amount too small (need ≥ $0.01 absolute). Skipped.", "warn")
+        return redirect(url_for("crypto.settings"))
+
+    MYT = timezone(timedelta(hours=8))
+    today_iso = (datetime.utcnow().replace(tzinfo=timezone.utc)
+                 .astimezone(MYT).date().isoformat())
+
+    # Update today's row in the snapshot table. Increment, don't replace —
+    # so multiple submissions accumulate (e.g., user splits a $200 deposit
+    # into two $100 entries).
+    row = CryptoDailySnapshot.query.get(today_iso)
+    if row is None:
+        # No row yet today — create one. total_value_usd will be set by the
+        # synth recompute below; deposits column starts at the entered amount.
+        row = CryptoDailySnapshot(
+            date=today_iso,
+            total_value_usd=0.0,  # placeholder; synth-recompute updates below
+            deposits_during_day_usd=amount,
+            source="synth",
+        )
+        db.session.add(row)
+    else:
+        prior = float(row.deposits_during_day_usd or 0.0)
+        row.deposits_during_day_usd = prior + amount
+    db.session.commit()
+
+    # Recompute synth so the dashboard + halt threshold see the new principal
+    # on the next tick.
+    try:
+        synth = _compute_synth_day_start_today()
+        _set_setting("crypto_day_start_value_usd", f"{synth:.4f}")
+        _set_setting("crypto_day_start_format", "synth")
+        # Update today's row's total_value_usd to the new synth (keeps the
+        # snapshot row consistent with the setting).
+        row = CryptoDailySnapshot.query.get(today_iso)
+        if row is not None:
+            row.total_value_usd = float(synth)
+            db.session.commit()
+    except Exception as e:
+        flash(f"Paper deposit recorded ({amount:+.2f}) but synth recompute failed: {e}", "warn")
+        return redirect(url_for("crypto.settings"))
+
+    new_total = float(row.deposits_during_day_usd or 0.0) if row else amount
+    sign = "+" if amount >= 0 else ""
+    flash(f"Paper {('deposit' if amount > 0 else 'withdrawal')} {sign}{amount:.2f} recorded. "
+          f"Today's row total: ${new_total:+.2f}. Synth day-start: ${synth:.2f}.", "ok")
+    return redirect(url_for("crypto.settings"))
+
+
+@bp.route("/api/deposits/refresh", methods=["POST"])
+def api_deposits_refresh():
+    """Refresh today's deposits/withdrawals from Binance and re-sync synth.
+    Replaces 'Force re-synth'. Pulls since-midnight flows, updates so-far
+    counter, recomputes synth so dashboard + halt threshold reflect today's
+    contributions immediately."""
+    from analysis.crypto_executor import (
+        _fetch_net_usdt_deposits_since_today_midnight,
+        _compute_synth_day_start_today,
+        _set_setting,
+    )
+    fresh_deposits = _fetch_net_usdt_deposits_since_today_midnight()
+    if fresh_deposits is None:
+        flash("Couldn't reach Binance to fetch deposits — try again.", "error")
+        return redirect(url_for("crypto.settings"))
+    _set_setting("crypto_today_deposits_so_far_usd", f"{fresh_deposits:.4f}")
+    try:
+        synth = _compute_synth_day_start_today()
+        _set_setting("crypto_day_start_value_usd", f"{synth:.4f}")
+        _set_setting("crypto_day_start_format", "synth")
+    except Exception as e:
+        flash(f"Deposits refreshed (${fresh_deposits:+.2f}) but synth recompute failed: {e}", "warn")
+        return redirect(url_for("crypto.settings"))
+    flash(f"Deposits refreshed: net ${fresh_deposits:+.2f} today. "
+          f"Synth day-start updated to ${synth:.2f}.", "ok")
+    return redirect(url_for("crypto.settings"))
 
 
 @bp.route("/reset-drawdown-peak", methods=["POST"])
