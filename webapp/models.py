@@ -94,3 +94,39 @@ class CryptoDailySnapshot(db.Model):
     deposits_during_day_usd = db.Column(db.Float)
     source = db.Column(db.String(16), default="rollover", nullable=False)
     created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+
+class CryptoGhostPosition(db.Model):
+    """Ghost portfolio position — shadow simulation running after a halt fires."""
+    __tablename__ = "crypto_ghost_positions"
+    id             = db.Column(db.Integer, primary_key=True)
+    symbol         = db.Column(db.String(32), nullable=False, index=True)
+    qty            = db.Column(db.Float, nullable=False)
+    entry_price    = db.Column(db.Float, nullable=False)
+    stop_price     = db.Column(db.Float, nullable=False)
+    target_price   = db.Column(db.Float, nullable=False)
+    strategy       = db.Column(db.String(64))
+    entered_at     = db.Column(db.DateTime, default=utcnow, nullable=False)
+    max_hold_bars  = db.Column(db.Integer, default=12)
+    bar_interval_h = db.Column(db.Integer, default=4)
+    partial_done   = db.Column(db.Boolean, default=False, nullable=False)
+    original_stop  = db.Column(db.Float)
+    status         = db.Column(db.String(16), default="open", nullable=False, index=True)
+    closed_at      = db.Column(db.DateTime)
+    close_price    = db.Column(db.Float)
+    close_reason   = db.Column(db.String(64))
+
+
+class CryptoGhostTrade(db.Model):
+    """Audit log of ghost buy/sell events — separate from CryptoTrade."""
+    __tablename__ = "crypto_ghost_trades"
+    id           = db.Column(db.Integer, primary_key=True)
+    symbol       = db.Column(db.String(32), nullable=False, index=True)
+    side         = db.Column(db.String(16), nullable=False)
+    qty          = db.Column(db.Float, nullable=False)
+    price        = db.Column(db.Float, nullable=False)
+    executed_at  = db.Column(db.DateTime, default=utcnow, nullable=False, index=True)
+    strategy     = db.Column(db.String(64))
+    pnl          = db.Column(db.Float)
+    notes        = db.Column(db.Text)
+    quote_amount = db.Column(db.Float)

@@ -1737,6 +1737,7 @@ def settings():
         "crypto_partial_lock_fraction",
         "crypto_loss_halt_enabled", "crypto_loss_halt_pct",
         "crypto_profit_halt_enabled", "crypto_profit_halt_pct",
+        "crypto_ghost_feature_enabled",
     )
     if request.method == "POST":
         # Checkboxes only POST when checked. The settings form sends a hidden
@@ -1749,6 +1750,8 @@ def settings():
                 _set_setting("crypto_loss_halt_enabled", "off")
             if "crypto_profit_halt_enabled" not in request.form:
                 _set_setting("crypto_profit_halt_enabled", "off")
+            if "crypto_ghost_feature_enabled" not in request.form:
+                _set_setting("crypto_ghost_feature_enabled", "off")
         intervals_changed = False
         # Snapshot current trading mode BEFORE applying changes — used to detect transition
         current_mode = _setting("crypto_trading_mode", "paper")
@@ -1839,6 +1842,7 @@ def settings():
         profit_halt_pct=_setting("crypto_profit_halt_pct", "5.0"),
         today_loss_halted=_setting("crypto_today_loss_halted", "0"),
         today_profit_halted=_setting("crypto_today_profit_halted", "0"),
+        ghost_feature_enabled=_setting("crypto_ghost_feature_enabled", "on"),
         day_start_value_usd=_setting("crypto_day_start_value_usd", "0"),
         day_start_date=_setting("crypto_day_start_date", ""),
         health=health,
@@ -2048,6 +2052,34 @@ def api_halts_override():
     return jsonify({"ok": True, "kind": kind, "today_pnl_pct": pnl_pct})
 
 
+@bp.route("/simulation")
+def simulation():
+    """Ghost portfolio page — live no-halt simulation view."""
+    from analysis.crypto_ghost import ghost_summary
+    from datetime import timezone, timedelta
+    MYT = timezone(timedelta(hours=8))
+    summary = ghost_summary()
+    if summary.get("trades"):
+        from datetime import datetime
+        for t in summary["trades"]:
+            try:
+                utc = datetime.fromisoformat(t["time_utc"])
+                t["time_myt"] = utc.replace(tzinfo=timezone.utc).astimezone(MYT).strftime("%H:%M")
+            except Exception:
+                t["time_myt"] = t.get("time_utc", "")[:16]
+    return render_template("crypto_simulation.html", ghost=summary)
+
+
+@bp.route("/api/ghost/summary")
+def api_ghost_summary():
+    """JSON ghost portfolio summary for the dashboard card."""
+    try:
+        from analysis.crypto_ghost import ghost_summary
+        return jsonify(ghost_summary())
+    except Exception as e:
+        return jsonify({"enabled": False, "error": str(e)})
+
+
 @bp.route("/api/paper/deposit", methods=["POST"])
 def api_paper_deposit():
     """Paper-mode deposit/withdraw form submission.
@@ -2246,6 +2278,17 @@ def test_connection():
     except Exception as e:
         flash(f"Connection failed: {e}", "err")
     return redirect(url_for("crypto.settings"))
+
+
+@bp.route("/api/sell-all", methods=["POST"])
+def api_sell_all():
+    """Manually close all open positions at market price."""
+    try:
+        from analysis.crypto_executor import sell_all_open_positions
+        n = sell_all_open_positions("manual liquidation", mode_filter=_is_paper_mode())
+        return jsonify({"ok": True, "closed": n})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @bp.route("/sync", methods=["POST"])

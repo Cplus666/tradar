@@ -1,0 +1,247 @@
+{% extends 'crypto_base.html' %}
+{% block title %}Ghost Portfolio · Simulation{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+  <div>
+    <h1 class="text-xl font-semibold">Ghost Portfolio</h1>
+    <p class="text-xs text-zinc-500 mt-0.5">Real strategy running in parallel — what would have happened if the halt hadn't fired.</p>
+  </div>
+  <div class="flex items-center gap-3">
+    <span id="gs-updated" class="text-xs text-zinc-600"></span>
+    <a href="{{ url_for('crypto.dashboard') }}" class="text-xs text-zinc-400 hover:text-zinc-200">← Dashboard</a>
+  </div>
+</div>
+
+{# Inactive state — shown by JS when ghost is off #}
+<div id="gs-inactive" class="hidden bg-zinc-900 border border-zinc-800 rounded-lg p-8 text-center text-zinc-500">
+  <div class="text-2xl mb-2">🔵</div>
+  <div class="font-semibold text-zinc-400">Ghost not active</div>
+  <div class="text-sm mt-1">Starts automatically the next time a profit or loss halt fires (if Ghost simulation is enabled in Settings).</div>
+</div>
+
+{# Active state — populated by JS #}
+<div id="gs-active">
+
+  {# Summary cards #}
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+    <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+      <div class="text-xs text-zinc-500 uppercase tracking-wide mb-1">Ghost value</div>
+      <div id="gs-total" class="text-2xl font-bold mono text-zinc-200">—</div>
+      <div class="text-xs text-zinc-500 mt-1">Free USDT: <span id="gs-usdt" class="mono">—</span></div>
+    </div>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+      <div class="text-xs text-zinc-500 uppercase tracking-wide mb-1">Diff vs locked</div>
+      <div id="gs-diff" class="text-2xl font-bold mono text-zinc-200">—</div>
+      <div id="gs-verdict" class="text-xs text-zinc-500 mt-1">—</div>
+    </div>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+      <div class="text-xs text-zinc-500 uppercase tracking-wide mb-1">Realized P&L</div>
+      <div id="gs-realized" class="text-2xl font-bold mono text-zinc-200">—</div>
+      <div class="text-xs text-zinc-500 mt-1">from closed ghost trades</div>
+    </div>
+    <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+      <div class="text-xs text-zinc-500 uppercase tracking-wide mb-1">Open positions</div>
+      <div id="gs-nopen" class="text-2xl font-bold mono text-zinc-200">—</div>
+      <div class="text-xs text-zinc-500 mt-1">Unrealised: <span id="gs-posval" class="mono">—</span></div>
+    </div>
+  </div>
+
+  {# Open positions table #}
+  <section id="gs-pos-section" class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 mb-4">
+    <h2 class="font-semibold text-zinc-200 mb-3 text-sm">Open Ghost Positions</h2>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead>
+          <tr class="text-zinc-500 border-b border-zinc-800">
+            <th class="text-left py-1 pr-3">Symbol</th>
+            <th class="text-right pr-3">Qty</th>
+            <th class="text-right pr-3">Entry $</th>
+            <th class="text-right pr-3">Current $</th>
+            <th class="text-right pr-3">Stop $</th>
+            <th class="text-right pr-3">Target $</th>
+            <th class="text-right pr-3">Unrealised $</th>
+            <th class="text-right pr-3">%</th>
+            <th class="text-left">Strategy</th>
+          </tr>
+        </thead>
+        <tbody id="gs-pos-body">
+          <tr><td colspan="9" class="py-3 text-zinc-600 text-center">loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  {# Trade log #}
+  <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+    <h2 class="font-semibold text-zinc-200 mb-3 text-sm">Ghost Trade Log</h2>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead>
+          <tr class="text-zinc-500 border-b border-zinc-800">
+            <th class="text-left py-1 pr-3">Time (MYT)</th>
+            <th class="text-left pr-3">Symbol</th>
+            <th class="text-left pr-3">Side</th>
+            <th class="text-right pr-3">Qty</th>
+            <th class="text-right pr-3">Price $</th>
+            <th class="text-right pr-3">P&L $</th>
+            <th class="text-left pr-3">Strategy</th>
+            <th class="text-left">Note</th>
+          </tr>
+        </thead>
+        <tbody id="gs-trades-body">
+          <tr><td colspan="8" class="py-3 text-zinc-600 text-center">loading…</td></tr>
+        </tbody>
+        <tfoot>
+          <tr class="border-t border-zinc-700">
+            <td colspan="5" class="py-2 text-zinc-500">Total realized</td>
+            <td id="gs-total-realized" class="text-right pr-3 mono font-bold text-zinc-200">—</td>
+            <td colspan="2"></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+</div>
+
+<script>
+const MYT_OFFSET = 8 * 60; // UTC+8 in minutes
+
+function toMYT(isoStr) {
+  try {
+    const d = new Date(isoStr.endsWith('Z') ? isoStr : isoStr + 'Z');
+    const myt = new Date(d.getTime() + MYT_OFFSET * 60000);
+    return myt.toISOString().slice(11, 16);
+  } catch { return '—'; }
+}
+
+function fmtPrice(p) {
+  if (p === null || p === undefined) return '—';
+  return p < 1 ? p.toFixed(5) : p.toFixed(4);
+}
+
+function fmtPnl(v) {
+  if (v === null || v === undefined) return '—';
+  return (v >= 0 ? '+' : '') + v.toFixed(2);
+}
+
+function pnlClass(v) {
+  if (v === null || v === undefined) return 'text-zinc-600';
+  return v >= 0 ? 'text-emerald-400' : 'text-rose-400';
+}
+
+function sideClass(side) {
+  if (side === 'BUY')            return 'text-blue-400';
+  if (side.includes('partial'))  return 'text-amber-400';
+  return 'text-rose-400';
+}
+
+function render(g) {
+  const active   = document.getElementById('gs-active');
+  const inactive = document.getElementById('gs-inactive');
+
+  if (!g.enabled) {
+    active.classList.add('hidden');
+    inactive.classList.remove('hidden');
+    return;
+  }
+  active.classList.remove('hidden');
+  inactive.classList.add('hidden');
+
+  // Summary cards
+  const diffCls = g.diff > 0 ? 'text-emerald-400' : g.diff < 0 ? 'text-rose-400' : 'text-zinc-200';
+  document.getElementById('gs-total').textContent    = '$' + g.total.toFixed(2);
+  document.getElementById('gs-usdt').textContent     = '$' + g.ghost_usdt.toFixed(2);
+
+  const diffEl = document.getElementById('gs-diff');
+  diffEl.textContent = (g.diff >= 0 ? '+' : '') + g.diff.toFixed(2);
+  diffEl.className   = 'text-2xl font-bold mono ' + diffCls;
+
+  document.getElementById('gs-verdict').textContent  =
+    g.diff > 0 ? 'No-halt is ahead' : g.diff < 0 ? 'Halt was better' : 'Even';
+  document.getElementById('gs-verdict').className    =
+    'text-xs mt-1 ' + (g.diff > 0 ? 'text-emerald-500' : g.diff < 0 ? 'text-rose-500' : 'text-zinc-500');
+
+  const rlEl = document.getElementById('gs-realized');
+  rlEl.textContent = fmtPnl(g.realized);
+  rlEl.className   = 'text-2xl font-bold mono ' + pnlClass(g.realized);
+
+  document.getElementById('gs-nopen').textContent    = g.n_open;
+  document.getElementById('gs-posval').textContent   = '$' + (g.pos_value || 0).toFixed(2);
+
+  // Open positions table
+  const posBody = document.getElementById('gs-pos-body');
+  if (!g.positions || g.positions.length === 0) {
+    const sect = document.getElementById('gs-pos-section');
+    sect.classList.add('hidden');
+    posBody.innerHTML = '';
+  } else {
+    document.getElementById('gs-pos-section').classList.remove('hidden');
+    posBody.innerHTML = g.positions.map(p => {
+      const pnlCls = p.unr >= 0 ? 'text-emerald-400' : 'text-rose-400';
+      const pctCls = p.pct >= 0 ? 'text-emerald-400' : 'text-rose-400';
+      const sym    = p.symbol.replace('USDT','');
+      return `<tr class="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+        <td class="py-1.5 pr-3 font-bold text-zinc-200">${sym}</td>
+        <td class="text-right pr-3 mono text-zinc-400">${p.qty.toFixed(4)}</td>
+        <td class="text-right pr-3 mono text-zinc-400">${fmtPrice(p.entry)}</td>
+        <td class="text-right pr-3 mono text-zinc-200">${fmtPrice(p.current)}</td>
+        <td class="text-right pr-3 mono text-rose-400/70">${fmtPrice(p.stop)}</td>
+        <td class="text-right pr-3 mono text-emerald-400/70">${fmtPrice(p.target)}</td>
+        <td class="text-right pr-3 mono font-semibold ${pnlCls}">${fmtPnl(p.unr)}</td>
+        <td class="text-right pr-3 mono ${pctCls}">${(p.pct >= 0 ? '+' : '') + p.pct.toFixed(2)}%</td>
+        <td class="text-zinc-500">${p.strategy}${p.partial_done ? ' <span class="text-emerald-600">PARTIAL</span>' : ''}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Trade log
+  const trBody = document.getElementById('gs-trades-body');
+  if (!g.trades || g.trades.length === 0) {
+    trBody.innerHTML = '<tr><td colspan="8" class="py-3 text-zinc-600 text-center">No ghost trades yet.</td></tr>';
+  } else {
+    trBody.innerHTML = g.trades.map(t => {
+      const isBuy    = t.side === 'BUY';
+      const rowBg    = isBuy ? 'bg-blue-950/10' : (t.pnl !== null && t.pnl < 0 ? 'bg-rose-950/10' : 'bg-emerald-950/10');
+      const sym      = t.symbol.replace('USDT','');
+      const pnlStr   = t.pnl !== null ? fmtPnl(t.pnl) : '—';
+      const pnlCls   = t.pnl !== null ? pnlClass(t.pnl) : 'text-zinc-600';
+      return `<tr class="border-b border-zinc-800/40 hover:bg-zinc-800/30 ${rowBg}">
+        <td class="py-1.5 pr-3 mono text-zinc-400">${toMYT(t.time_utc)}</td>
+        <td class="pr-3 font-bold text-zinc-200">${sym}</td>
+        <td class="pr-3 font-semibold ${sideClass(t.side)}">${t.side}</td>
+        <td class="text-right pr-3 mono text-zinc-400">${t.qty.toFixed(4)}</td>
+        <td class="text-right pr-3 mono text-zinc-300">${fmtPrice(t.price)}</td>
+        <td class="text-right pr-3 mono font-semibold ${pnlCls}">${pnlStr}</td>
+        <td class="pr-3 text-zinc-500">${t.strategy}</td>
+        <td class="text-zinc-600 truncate max-w-xs">${t.notes}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Total realized in footer
+  const trEl = document.getElementById('gs-total-realized');
+  trEl.textContent = fmtPnl(g.realized);
+  trEl.className   = 'text-right pr-3 mono font-bold ' + pnlClass(g.realized);
+
+  // Last updated timestamp
+  const now = new Date();
+  const myt = new Date(now.getTime() + MYT_OFFSET * 60000);
+  document.getElementById('gs-updated').textContent =
+    'Updated ' + myt.toISOString().slice(11, 16) + ' MYT';
+}
+
+function refresh() {
+  fetch('{{ url_for("crypto.api_ghost_summary") }}')
+    .then(r => r.json())
+    .then(g => render(g))
+    .catch(() => {
+      document.getElementById('gs-updated').textContent = 'fetch failed — retrying…';
+    });
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+{% endblock %}

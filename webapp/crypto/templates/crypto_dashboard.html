@@ -21,6 +21,24 @@
 {# === DAILY P&L AUTO-HALT BANNER (hidden until live snapshot says a halt fired today) === #}
 <section id="halt-banner" class="hidden rounded-lg p-4 mb-4 border-2"></section>
 
+{# === GHOST PORTFOLIO CARD === #}
+<section id="ghost-card" class="hidden bg-zinc-900 border border-blue-900 rounded-lg p-3 mb-4">
+  <div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="flex items-center gap-3">
+      <span class="text-xs font-semibold text-blue-400 uppercase tracking-wide">Ghost Portfolio</span>
+      <span class="text-xs text-zinc-500">if halt hadn't fired</span>
+    </div>
+    <a href="{{ url_for('crypto.simulation') }}"
+       class="text-xs text-blue-400 hover:text-blue-300 font-semibold">View detail →</a>
+  </div>
+  <div class="flex items-center gap-6 mt-2 flex-wrap">
+    <div><div class="text-xs text-zinc-500">Ghost value</div><div id="ghost-total" class="text-lg font-bold mono text-zinc-200">—</div></div>
+    <div><div class="text-xs text-zinc-500">vs locked</div><div id="ghost-diff" class="text-lg font-bold mono text-zinc-200">—</div></div>
+    <div><div class="text-xs text-zinc-500">Open positions</div><div id="ghost-nopen" class="text-lg font-bold mono text-zinc-200">—</div></div>
+    <div><div class="text-xs text-zinc-500">Realized P&L</div><div id="ghost-realized" class="text-lg font-bold mono text-zinc-200">—</div></div>
+  </div>
+</section>
+
 {# === BIG P&L BANNER (lazy-loaded) === #}
 <section id="pnl-banner" class="rounded-xl p-5 mb-4 border-2 bg-zinc-900 border-zinc-700">
   {# Connection status — surfaces Binance failures + stale-cache fallback so the
@@ -71,6 +89,10 @@
             <button class="text-xs bg-blue-800 hover:bg-blue-700 text-blue-100 px-3 py-1.5 rounded">▶ Run loop</button>
           </form>
           <a href="{{ url_for('crypto.universe') }}" class="text-xs bg-amber-800 hover:bg-amber-700 text-amber-100 px-3 py-1.5 rounded">🔥 Universe</a>
+          <button onclick="sellAll()"
+                  class="text-xs bg-rose-900 hover:bg-rose-800 text-rose-200 px-3 py-1.5 rounded">
+            ✕ Sell All
+          </button>
         </div>
       </div>
       <div id="position-cards" class="p-4 text-center text-zinc-500 text-sm">Loading positions…</div>
@@ -732,6 +754,46 @@
 
   loadDashboard();
   setInterval(loadDashboard, 30000);  // refresh live data every 30s
+
+  // ---- Ghost portfolio card ----
+  function refreshGhost() {
+    fetch('{{ url_for("crypto.api_ghost_summary") }}')
+      .then(r => r.json())
+      .then(g => {
+        const card = document.getElementById('ghost-card');
+        if (!g.enabled) { card.classList.add('hidden'); return; }
+        card.classList.remove('hidden');
+        const diffCls = g.diff > 0 ? 'text-emerald-400' : g.diff < 0 ? 'text-rose-400' : 'text-zinc-200';
+        document.getElementById('ghost-total').textContent    = '$' + g.total.toFixed(2);
+        const diffEl = document.getElementById('ghost-diff');
+        diffEl.textContent = (g.diff >= 0 ? '+' : '') + g.diff.toFixed(2);
+        diffEl.className   = 'text-lg font-bold mono ' + diffCls;
+        document.getElementById('ghost-nopen').textContent    = g.n_open;
+        const rlEl = document.getElementById('ghost-realized');
+        rlEl.textContent = (g.realized >= 0 ? '+' : '') + g.realized.toFixed(2);
+        rlEl.className   = 'text-lg font-bold mono ' + (g.realized >= 0 ? 'text-emerald-400' : 'text-rose-400');
+      })
+      .catch(() => {});
+  }
+  refreshGhost();
+  setInterval(refreshGhost, 30000);
+
+  // ---- Manual sell-all ----
+  function sellAll() {
+    if (!confirm('Sell ALL open positions at market price right now?\n\nThis cannot be undone.')) return;
+    fetch('{{ url_for("crypto.api_sell_all") }}', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) {
+          alert(d.closed + ' position(s) closed.');
+          loadDashboard();
+        } else {
+          alert('Error: ' + (d.error || 'unknown'));
+        }
+      })
+      .catch(e => alert('Network error: ' + e.message));
+  }
+
   // ROI graph used to depend on a periodic full-page reload to pick up new
   // closed trades. Now it has its own JSON endpoint and re-renders in place.
   setInterval(refreshRoi, 30000);

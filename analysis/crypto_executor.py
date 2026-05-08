@@ -154,6 +154,39 @@ def _principal_at_day(date_iso: str) -> float:
     return initial + cum_deposits + today_so_far
 
 
+def _collect_ghost_init_data() -> list[dict]:
+    """Snapshot open positions + current ticker prices for ghost seeding."""
+    try:
+        is_paper = _is_paper_mode_setting()
+        positions = _open_positions(is_paper=is_paper)
+        if not positions:
+            return []
+        tickers = {t["symbol"]: float(t["price"])
+                   for t in _binance_client().get_all_tickers()}
+        result = []
+        for pos in positions:
+            meta  = parse_entry_notes(pos.notes)
+            strat = (pos.strategy or "").lower()
+            bar_h = 1 if ("1h" in strat or "momentum" in strat or "oversold" in strat) else 4
+            result.append({
+                "symbol":        pos.symbol,
+                "qty":           float(getattr(pos, "_remaining_qty", pos.qty)),
+                "price":         tickers.get(pos.symbol, float(pos.price)),
+                "stop":          meta.get("stop"),
+                "target":        meta.get("target"),
+                "strategy":      pos.strategy,
+                "entered_at":    pos.executed_at,
+                "max_hold_bars": meta.get("max_hold", 12),
+                "bar_interval_h":bar_h,
+                "partial_done":  bool(meta.get("partial_done")),
+                "original_stop": meta.get("original_stop"),
+            })
+        return result
+    except Exception as e:
+        log.warning("ghost init data collection failed (non-fatal): %s", e)
+        return []
+
+
 def sell_all_open_positions(reason: str, mode_filter: bool | None = None) -> int:
     """Close every currently-open position at market. Returns # successful sells."""
     n = 0
@@ -433,6 +466,7 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             msg = (f"LOSS HALT: today {today_pnl_pct:+.2f}% (≥ {loss_halt_pct:.1f}%) — "
                    f"closing all positions, halting until next MYT day")
             _set_setting("crypto_today_loss_halted", "1")
+            _ghost_pre = _collect_ghost_init_data()
             n_closed = sell_all_open_positions(f"LOSS HALT — today {today_pnl_pct:+.2f}%", mode_filter=_is_paper_mode_setting())
             db.session.add(CryptoRun(kind="loss_halt", status="ok",
                                       started_at=ts, ended_at=ts,
@@ -440,6 +474,11 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             db.session.commit()
             log.warning(msg)
             loss_halt_fired = True
+            try:
+                from analysis.crypto_ghost import start_ghost
+                start_ghost(_ghost_pre, current_value)
+            except Exception as _ge:
+                log.warning("ghost start failed (non-fatal): %s", _ge)
 
     # PROFIT HALT (skipped if user already overrode profit halt today)
     if (not loss_halt_fired
@@ -453,6 +492,7 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             msg = (f"PROFIT HALT: today +{today_pnl_pct:.2f}% (≥ {profit_halt_pct:.1f}%) — "
                    f"locking gains, halting until next MYT day")
             _set_setting("crypto_today_profit_halted", "1")
+            _ghost_pre = _collect_ghost_init_data()
             n_closed = sell_all_open_positions(f"PROFIT HALT — today +{today_pnl_pct:.2f}%", mode_filter=_is_paper_mode_setting())
             db.session.add(CryptoRun(kind="profit_halt", status="ok",
                                       started_at=ts, ended_at=ts,
@@ -460,6 +500,11 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             db.session.commit()
             log.warning(msg)
             profit_halt_fired = True
+            try:
+                from analysis.crypto_ghost import start_ghost
+                start_ghost(_ghost_pre, current_value)
+            except Exception as _ge:
+                log.warning("ghost start failed (non-fatal): %s", _ge)
 
     return {"day_start": snap_value, "drawdown_pct": drawdown_pct,
             "halt_triggered": halt_triggered, "enabled": enabled,

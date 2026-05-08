@@ -245,6 +245,12 @@ def run_fast_exit_check() -> None:
         except Exception:
             pass
 
+    try:
+        from analysis.crypto_ghost import run_ghost_exit_check
+        run_ghost_exit_check()
+    except Exception as _ge:
+        log.debug("ghost exit check skipped: %s", _ge)
+
 
 def run_crypto_loop() -> None:
     """One tick of the crypto trading loop. Caller provides app context."""
@@ -373,6 +379,12 @@ def run_crypto_loop() -> None:
                 log_lines.append(f"  SKIP {sig['symbol']}: {r['reason']}")
 
         summary_parts.append(f"signals={len(signals)} exec={executed} skip={skipped}")
+
+        try:
+            from analysis.crypto_ghost import run_ghost_scan
+            run_ghost_scan()
+        except Exception as _ge:
+            log.debug("ghost scan skipped: %s", _ge)
 
         run.status = "ok"
         run.summary = " · ".join(summary_parts)
