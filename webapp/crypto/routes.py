@@ -2148,6 +2148,85 @@ def api_halts_end_and_rearm():
                     "old_threshold_pct": old_pct})
 
 
+@bp.route("/api/paper/deposit", methods=["POST"])
+def api_paper_deposit():
+    """Paper-mode deposit/withdraw form submission.
+
+    Single text input — accepts signed numbers (+ deposit, − withdrawal).
+    Increments today's snapshot row's deposits_during_day_usd by the entered
+    amount, then recomputes synth so dashboard + halt threshold immediately
+    reflect the new principal.
+
+    Per-event detail is NOT preserved — only the aggregated daily total
+    persists. Submit twice (e.g., +$50 then +$30) and today's row reads $80.
+    Mistake recovery: enter the inverse amount (e.g., -$80) to zero it out.
+
+    Live-mode users should use the 'Refresh deposit/withdraw' button instead,
+    which queries Binance directly. This endpoint refuses in live mode to
+    avoid muddying the live deposit ledger with manually-entered values.
+    """
+    from analysis.crypto_executor import (
+        _compute_synth_day_start_today,
+        _set_setting,
+        _is_paper_mode_setting,
+    )
+    from webapp.models import CryptoDailySnapshot, db
+    from datetime import timezone, timedelta
+
+    if not _is_paper_mode_setting():
+        flash("Paper-deposit form is paper-mode only. Live users: use the 'Refresh deposit/withdraw' button.", "error")
+        return redirect(url_for("crypto.settings"))
+
+    raw = (request.form.get("amount") or "").strip()
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        flash(f"Invalid amount '{raw}' — enter a number, e.g. 100 or -50.", "error")
+        return redirect(url_for("crypto.settings"))
+    if abs(amount) < 0.01:
+        flash("Amount too small (need ≥ $0.01 absolute). Skipped.", "warn")
+        return redirect(url_for("crypto.settings"))
+
+    MYT = timezone(timedelta(hours=8))
+    today_iso = (datetime.utcnow().replace(tzinfo=timezone.utc)
+                 .astimezone(MYT).date().isoformat())
+
+    # Update today's row in the snapshot table. Increment, don't replace —
+    # so multiple submissions accumulate (e.g., user splits a $200 deposit
+    # into two $100 entries).
+    row = CryptoDailySnapshot.query.get(today_iso)
+    if row is None:
+        row = CryptoDailySnapshot(
+            date=today_iso,
+            total_value_usd=0.0,
+            deposits_during_day_usd=amount,
+            source="synth",
+        )
+        db.session.add(row)
+    else:
+        prior = float(row.deposits_during_day_usd or 0.0)
+        row.deposits_during_day_usd = prior + amount
+    db.session.commit()
+
+    try:
+        synth = _compute_synth_day_start_today()
+        _set_setting("crypto_day_start_value_usd", f"{synth:.4f}")
+        _set_setting("crypto_day_start_format", "synth")
+        row = CryptoDailySnapshot.query.get(today_iso)
+        if row is not None:
+            row.total_value_usd = float(synth)
+            db.session.commit()
+    except Exception as e:
+        flash(f"Paper deposit recorded ({amount:+.2f}) but synth recompute failed: {e}", "warn")
+        return redirect(url_for("crypto.settings"))
+
+    new_total = float(row.deposits_during_day_usd or 0.0) if row else amount
+    sign = "+" if amount >= 0 else ""
+    flash(f"Paper {('deposit' if amount > 0 else 'withdrawal')} {sign}{amount:.2f} recorded. "
+          f"Today's row total: ${new_total:+.2f}. Synth day-start: ${synth:.2f}.", "ok")
+    return redirect(url_for("crypto.settings"))
+
+
 @bp.route("/api/deposits/refresh", methods=["POST"])
 def api_deposits_refresh():
     """Refresh today's deposits/withdrawals from Binance and re-sync synth.

@@ -263,6 +263,20 @@
     </div>
   </form>
 
+  {# === Paper deposit/withdraw — separate form so it can't nest inside settings form === #}
+  {% if trading_mode != 'live' %}
+  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+    <h3 class="text-sm font-semibold mb-3 text-amber-400">Paper deposit / withdraw</h3>
+    <form method="post" action="{{ url_for('crypto.api_paper_deposit') }}" class="flex items-center gap-3 flex-wrap">
+      <span class="text-xs text-zinc-500 mono">$</span>
+      <input type="number" step="0.01" name="amount" placeholder="100 or -50" required
+             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 w-36 mono text-zinc-200">
+      <button type="submit" class="text-xs bg-amber-700 hover:bg-amber-600 text-white px-4 py-1.5 rounded">Apply</button>
+      <span class="text-xs text-zinc-500">Positive = deposit, negative = withdrawal. Adds to today's daily total.</span>
+    </form>
+  </div>
+  {% endif %}
+
   {# === Below the settings form: API credentials + Server IP in a 2-col row === #}
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
 

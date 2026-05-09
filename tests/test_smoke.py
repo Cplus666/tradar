@@ -302,6 +302,17 @@ def test_dashboard_doesnt_500_in_live_mode_without_keys(client, app):
     assert resp.status_code == 200
 
 
+def test_paper_deposit_endpoint_exists(app):
+    """`crypto.api_paper_deposit` was removed in commit 999a870 (the bad
+    rewrite) and restored in this session. Lock it in so it never gets
+    deleted again — the form on /tradar/settings depends on it."""
+    registered = {r.endpoint for r in app.url_map.iter_rules()}
+    assert "crypto.api_paper_deposit" in registered, (
+        "api_paper_deposit endpoint missing — paper deposit/withdraw form on "
+        "Settings page would 404 on submit"
+    )
+
+
 def test_required_endpoints_exist(app):
     """Endpoints that frontend templates reference via url_for must exist.
     This guards against typos like 'crypto.coin' (wrong) vs 'crypto.coin_detail'."""
