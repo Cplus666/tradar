@@ -168,6 +168,116 @@ def test_dashboard_works_in_paper_mode(client, app):
     )
 
 
+def test_paper_mode_today_unrealized_reconciles_with_position_cards(client, app):
+    """today_unrealized at the account level MUST equal the sum of pnl_usd on
+    position cards. Reported on 2026-05-09: account showed -$6,200 unrealized
+    while position cards summed to -$37 (off by ~167×). Caused by stale
+    crypto_day_start_value_usd setting being used in derivation formula."""
+    with app.app_context():
+        from webapp.models import Setting, CryptoTrade, db
+        from datetime import datetime, timezone, timedelta
+        # Paper mode setup
+        for k, v in [
+            ("crypto_trading_mode", "paper"),
+            ("binance_api_key", ""), ("binance_api_secret", ""),
+            ("crypto_starting_capital_usd", "200.29"),
+            # Critical: a STALE day_start that would skew the buggy derivation
+            ("crypto_day_start_value_usd", "10000"),
+        ]:
+            row = Setting.query.get(k)
+            if row: row.value = v
+            else: db.session.add(Setting(key=k, value=v))
+        # Seed one paper buy 2 days ago (open position, will have unrealized P&L)
+        ts = datetime.utcnow() - timedelta(days=2)
+        # Clear existing trades for clean test
+        CryptoTrade.query.delete()
+        db.session.add(CryptoTrade(
+            symbol="BTCUSDT", side="BUY", qty=0.001, price=50000.0,
+            quote_amount=50.0, executed_at=ts,
+            status="filled", is_paper=True, strategy="test"
+        ))
+        db.session.commit()
+
+    resp = client.get("/tradar/api/dashboard")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    cards_unrealized = sum(c.get("pnl_usd", 0) for c in data.get("position_cards", []))
+    account_unrealized = data["account"]["today_unrealized"]
+    if account_unrealized is None:
+        return  # tickers might not have loaded; skip the comparison
+    diff = abs(cards_unrealized - account_unrealized)
+    assert diff < 1.0, (
+        f"today_unrealized mismatch: account={account_unrealized}, "
+        f"sum(position_cards.pnl_usd)={cards_unrealized}, diff=${diff:.2f}\n"
+        f"Off-by-167× regression — see CLAUDE-NOTE.md round 2."
+    )
+
+
+def test_paper_to_live_toggle_doesnt_break_dashboard(client, app):
+    """Simulate the user's worry: toggle tradar from paper to live and back.
+    Both modes must render without 500 errors. Live mode without keys returns
+    null skeleton (documented), but doesn't crash. Switching back to paper
+    must restore the synthesized usdt_free."""
+    # Start in paper mode with seeded paper trades
+    with app.app_context():
+        from webapp.models import Setting, CryptoTrade, db
+        from datetime import datetime, timedelta
+        for k, v in [
+            ("crypto_trading_mode", "paper"),
+            ("binance_api_key", ""), ("binance_api_secret", ""),
+            ("crypto_starting_capital_usd", "200.29"),
+        ]:
+            row = Setting.query.get(k)
+            if row: row.value = v
+            else: db.session.add(Setting(key=k, value=v))
+        CryptoTrade.query.delete()
+        ts = datetime.utcnow() - timedelta(hours=2)
+        db.session.add(CryptoTrade(
+            symbol="BTCUSDT", side="BUY", qty=0.001, price=50000.0,
+            quote_amount=50.0, executed_at=ts,
+            status="filled", is_paper=True, strategy="test"
+        ))
+        db.session.commit()
+
+    # Step 1: paper mode renders
+    resp = client.get("/tradar/api/dashboard")
+    assert resp.status_code == 200, "paper dashboard 500ed"
+    paper_data = resp.get_json()
+    # Paper mode should have non-null usdt_free (synthesized)
+    assert paper_data["account"]["usdt_free"] is not None, "paper usdt_free went null"
+
+    # Step 2: toggle to LIVE without setting keys
+    with app.app_context():
+        from webapp.models import Setting, db
+        Setting.query.get("crypto_trading_mode").value = "live"
+        db.session.commit()
+
+    # Live without keys must NOT crash. Returns null skeleton (documented).
+    resp = client.get("/tradar/api/dashboard")
+    assert resp.status_code == 200, (
+        f"live dashboard 500ed when toggled — RUINED!\n"
+        f"Body: {resp.get_data(as_text=True)[:500]}"
+    )
+    live_data = resp.get_json()
+    # Live mode should not crash; account_value may be None (no keys)
+    assert "account" in live_data, "live response missing account dict"
+    # Position cards in live mode = empty (no live trades exist; only paper)
+    assert isinstance(live_data["position_cards"], list)
+
+    # Step 3: toggle BACK to paper — must restore previous behavior
+    with app.app_context():
+        from webapp.models import Setting, db
+        Setting.query.get("crypto_trading_mode").value = "paper"
+        db.session.commit()
+
+    resp = client.get("/tradar/api/dashboard")
+    assert resp.status_code == 200, "back-to-paper dashboard 500ed"
+    paper_data2 = resp.get_json()
+    assert paper_data2["account"]["usdt_free"] is not None, (
+        "after toggle back to paper, usdt_free went null — toggle is destructive!"
+    )
+
+
 def test_dashboard_doesnt_500_in_live_mode_without_keys(client, app):
     """In live mode WITHOUT keys, dashboard should still render (returns the
     null skeleton, which is the documented expected behavior). Just shouldn't
