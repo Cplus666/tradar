@@ -1,5 +1,5 @@
 {% extends 'crypto_base.html' %}
-{% block title %}Journal · Tradar{% endblock %}
+{% block title %}Journal · Crypto{% endblock %}
 
 {% block content %}
 <div class="flex items-baseline gap-3 mb-4 flex-wrap">
@@ -35,9 +35,13 @@
 
 <script>
 function fmtPrice(p) {
+  // Decimal precision tiered to price range (matches crypto_coin.html macro).
   if (p == null) return '—';
-  if (p < 0.01) return '$' + p.toFixed(8);
-  if (p < 1) return '$' + p.toFixed(4);
+  if (p < 0.0001) return '$' + p.toFixed(8);
+  if (p < 0.01)   return '$' + p.toFixed(6);
+  if (p < 1)      return '$' + p.toFixed(5);
+  if (p < 10)     return '$' + p.toFixed(4);
+  if (p < 1000)   return '$' + p.toFixed(3);
   return '$' + p.toFixed(2);
 }
 function fmtMoney(v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }
@@ -114,8 +118,6 @@ function renderEntry(e) {
   let gaugeBlock = '';
   if (e.stop != null && e.target != null) {
     const stop = Number(e.stop), target = Number(e.target), entry = Number(e.entry_price);
-    // For OPEN: exit_price is the live current price (set by loadLivePrices).
-    // For CLOSED: exit_price is the actual exit price.
     const cur  = e.exit_price != null ? Number(e.exit_price) : entry;
     let gaugePct = 0;
     if (target > stop) {
@@ -124,13 +126,10 @@ function renderEntry(e) {
     const barCls  = cur > entry ? 'bg-emerald-500' : cur < entry ? 'bg-rose-500' : 'bg-zinc-600';
     const riskPct   = entry > 0 ? ((entry - stop)   / entry * 100).toFixed(1) : '?';
     const rewardPct = entry > 0 ? ((target - entry) / entry * 100).toFixed(1) : '?';
-    // Closed positions show "exited at X% of range" beneath the bar instead of "live"
     const subLabel = e.is_open
       ? ''
       : `<span class="text-xs text-zinc-500 mono">exited at ${gaugePct.toFixed(0)}% of range</span>`;
-    // Stop-move history (only set when partial-take has touched this position):
-    //   stop_moved_to → on the partial-sell card: "→ moved to $X" in amber
-    //   stop_was      → on the runner card:      "(was $X before partial)" in zinc
+    // Stop-move history (only set when partial-take has touched this position).
     let stopMoveHtml = '';
     if (e.stop_moved_to != null) {
       stopMoveHtml = ` <span class="text-amber-400 ml-1" title="After this partial fired, stop on the runner half moved to here">→ moved to ${fmtPrice(e.stop_moved_to)}</span>`;
@@ -153,7 +152,7 @@ function renderEntry(e) {
   return `<div class="bg-zinc-900 border rounded-lg p-4 ${borderCls}">
     <div class="flex items-baseline justify-between flex-wrap gap-2 mb-2">
       <div class="flex items-baseline gap-2 flex-wrap">
-        <a href="/tradar/coin/${e.symbol}" class="text-lg font-bold hover:underline">${e.symbol}</a>
+        <a href="/crypto/coin/${e.symbol}" class="text-lg font-bold hover:underline">${e.symbol}</a>
         <span class="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">${e.strategy || '?'}</span>
         ${statusBadge}
       </div>
@@ -205,8 +204,6 @@ let _openEntriesIndex = {};  // symbol → array of entry objects
 let _feeRate = 0.001;        // updated from /api/journal response — used to net unrealized P&L
 
 function todayMyt() {
-  // Today's date in MYT, formatted YYYY-MM-DD. Computed in browser using UTC+8
-  // so the picker matches the server's notion of "today" (server uses MYT too).
   const now = new Date();
   const mytNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   const Y = mytNow.getUTCFullYear();
@@ -218,7 +215,6 @@ function urlDate() {
   return new URLSearchParams(location.search).get('date') || todayMyt();
 }
 function shiftDay(yyyymmdd, deltaDays) {
-  // Treat as MYT calendar date — string math (no timezone gotchas).
   const [Y, M, D] = yyyymmdd.split('-').map(Number);
   const d = new Date(Date.UTC(Y, M - 1, D));
   d.setUTCDate(d.getUTCDate() + deltaDays);
@@ -227,7 +223,7 @@ function shiftDay(yyyymmdd, deltaDays) {
 function navigateToDate(yyyymmdd) {
   const params = new URLSearchParams(location.search);
   params.set('date', yyyymmdd);
-  params.delete('page');  // reset to page 1 when day changes
+  params.delete('page');
   location.search = params.toString();
 }
 
@@ -236,22 +232,19 @@ function loadJournal() {
   const page = parseInt(params.get('page') || '1');
   const date = urlDate();
 
-  // Reflect current date in the picker on first load
   document.getElementById('date-picker').value = date;
 
   // STAGE 1 — fast: DB data only (no Binance). Renders cards immediately.
-  fetch('/tradar/api/journal?page=' + page + '&date=' + encodeURIComponent(date))
+  fetch('/crypto/api/journal?page=' + page + '&date=' + encodeURIComponent(date))
     .then(r => r.json())
     .then(d => {
       // Capture fee rate so subsequent live-price updates net the same way
       // closed-trade P&L is netted server-side. Keeps numbers consistent.
       if (typeof d.fee_rate === 'number') { _feeRate = d.fee_rate; }
-      // Date label — shows the selected day with a "(today)" suffix when applicable
+      // Date label
       const dateLabel = document.getElementById('date-label');
       if (dateLabel) {
-        dateLabel.textContent = d.is_today
-          ? `${d.selected_date} (today)`
-          : d.selected_date;
+        dateLabel.textContent = d.is_today ? `${d.selected_date} (today)` : d.selected_date;
       }
       // Counts
       document.getElementById('journal-counts').innerHTML =
@@ -304,7 +297,7 @@ function loadJournal() {
 }
 
 function loadLivePrices(symbols) {
-  fetch('/tradar/api/journal/prices')
+  fetch('/crypto/api/journal/prices')
     .then(r => r.json())
     .then(pd => {
       const tsEl = document.getElementById('journal-prices-updated');
@@ -362,10 +355,11 @@ function updateOpenEntryCard(entry, currentPrice) {
     // Verify this is the right card by matching entry timestamp
     const entryTimeText = card.querySelector('[data-entry-iso="' + entry.entry_at + '"]');
     if (!entryTimeText) continue;
-    // Compute updated values — net of estimated round-trip fees
+    // Compute updated values
     const value = currentPrice * entry.qty;
+    // Net of estimated round-trip fees
     const buyValue = entry.entry_price * entry.qty;
-    const sellValue = value;
+    const sellValue = currentPrice * entry.qty;
     const fee = (buyValue + sellValue) * _feeRate;
     const pnlUsd = sellValue - buyValue - fee;
     const pnlPct = buyValue > 0 ? (pnlUsd / buyValue * 100) : 0;

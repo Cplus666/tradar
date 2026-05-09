@@ -394,9 +394,13 @@
 
   // ---- Lazy-load Binance-dependent data (P&L banner + position cards) ----
   function fmtPrice(p) {
+    // Decimal precision tiered to price range (matches coin/journal/universe).
     if (p == null) return '—';
-    if (p < 0.01) return '$' + p.toFixed(8);
-    if (p < 1) return '$' + p.toFixed(4);
+    if (p < 0.0001) return '$' + p.toFixed(8);
+    if (p < 0.01)   return '$' + p.toFixed(6);
+    if (p < 1)      return '$' + p.toFixed(5);
+    if (p < 10)     return '$' + p.toFixed(4);
+    if (p < 1000)   return '$' + p.toFixed(3);
     return '$' + p.toFixed(2);
   }
   // Compact qty formatter — picks decimals based on magnitude so cards don't
