@@ -1,117 +1,74 @@
-# Dashboard regression — needs fix
+# Round 2 — paper-mode account valuation is wrong (after `3a39142`)
 
-## Symptom
-Dashboard at `/tradar/` shows blank account / zero PnL / empty position cards on tradar2 (port 7551).
+The fix in `3a39142 "Fix paper-mode dashboard regression"` partly worked — dashboard now renders, position cards show correct per-position PnL, today_realized matches the journal. But the account-level numbers are wrong.
 
-`GET /api/dashboard` returns:
+## Observed (paper mode, 101 trades, 3 open positions)
 
 ```json
 {
-  "account": {
-    "account_value": null,
-    "all_time_pnl": 0.0,
-    "open_count": 0,
-    "open_value": 0.0,
-    "starting_capital": 200.29,
-    "today_losses": 0,
-    "today_realized": 0.0,
-    "today_total": 0.0,
-    "today_unrealized": 0.0,
-    "today_wins": 0,
-    "today_win_rate": null,
-    "usdt_free": null
-  },
-  "position_cards": [],
-  "stale": false,
-  "static": false
+  "account_value": 3720.25,
+  "usdt_free": 0.0,
+  "open_value": 3720.25,
+  "starting_capital": 200.29,
+  "all_time_pnl": 3519.96,
+  "today_realized": -262.46,
+  "today_unrealized": -6199.79,
+  "today_total": -6462.24,
+  "day_start_value": 10182.49,
+  "drawdown_pct": 63.46
 }
 ```
 
-## What is verified
-- Database `/app/data/app.db` (bind-mount of `/home/18566299940/tradar2/data/`) **does** contain user data:
-  - `crypto_trades`: **101 rows** (all `is_paper=1`, including 5 trades from today)
-  - `crypto_runs`: 466 rows
-  - `crypto_daily_snapshots`: 31 rows
-  - `settings`: 24 rows
-  - `crypto_holdings`: **0 rows** ← empty
-- API endpoints respond 200 (not 500). Flask reads the right DB.
-- Trade rows look complete: id, symbol, side, qty, price, quote_amount, executed_at, status, is_paper, strategy, notes — all present.
-- Sample today: BUY UTKUSDT @ 09:29, SELL VANAUSDT/PENGUUSDT/LTCUSDT/DASHUSDT through the day. Multiple realized round-trips exist.
+Position cards (sum is the **truth** for unrealized):
 
-## Suspect commit
-`999a870 "update"` (May 9 21:03) — refactored `webapp/crypto/routes.py` (+459 / -506 lines, almost a full rewrite of dashboard / account-summary code paths).
+| Symbol | qty | entry | current | pnl_usd |
+|---|---|---|---|---|
+| VANAUSDT | 462.10 | 1.623 | 1.697 | +32.66 |
+| UTKUSDT | 188679.24 | 0.00795 | 0.00795 | -3.00 |
+| ICPUSDT | 399.68 | 3.753 | 3.593 | -66.88 |
+| **Sum** | | | | **-37.22** |
 
-The earlier passing build was the prior-day commit before this rewrite.
+## Two bugs
 
-## Likely cause (hypothesis)
-`_account_summary()` in `webapp/crypto/routes.py` (line ~107 in current file vs line ~152 pre-rewrite) is the function that populates `account_value`, `usdt_free`, `today_realized`, etc.
+### Bug A — `usdt_free` stuck at 0 in paper mode
+In paper mode every closed SELL should credit virtual USDT back to a synthesized cash balance. The current code returns `usdt_free: 0.0`, so `account_value = open_value` only. That's why `account_value` ($3,720.25) looks small even though all-time PnL is +$3,519 from a $200 base.
 
-`account_value` and `usdt_free` returning `null` is the giveaway:
-1. The new `_account_summary` likely **requires a live Binance API call** (balances) before it computes anything — and bails to nulls/zeros on failure or paper mode.
-2. With keys missing/invalid OR with `is_paper_mode=true`, the function returns the zero-skeleton early and **never falls back to computing realized PnL from the local `crypto_trades` table**.
-3. `position_cards` and `open_count` come from `_open_position_cards()` which probably builds from live Binance balances merged with `crypto_trades`. With no live balances → no cards.
+The correct paper cash balance is derivable purely from `crypto_trades`:
+```
+usdt_free = starting_capital
+          + Σ (sell_qty * sell_price - sell_fee)        ; cash in
+          - Σ (buy_qty  * buy_price  + buy_fee)         ; cash out
+          (over all rows where is_paper=1 and status='filled')
+```
+Or equivalently: `starting_capital + all_realized_pnl - cost_basis_of_currently_open_positions`.
 
-The pre-rewrite version (`git show 999a870^:webapp/crypto/routes.py`) had paper-mode fallbacks that synthesized account state from `crypto_trades` directly. The rewrite removed or broke that path.
+### Bug B — `today_unrealized` is computed via subtraction from a stale `day_start_value`
+Right now (suspected): `today_unrealized = today_total - today_realized`, where `today_total = account_value - day_start_value`. But `day_start_value` is `10,182.49` — that's not yesterday's end-of-day account value, it's wrong.
 
-## What the next agent should do
+`today_unrealized` should simply be the **sum of per-position `pnl_usd` from `_open_position_cards()`** (or recomputed the same way at account level). It must equal the sum across position cards (-$37.22 in this snapshot).
 
-1. **Diff the two functions** between `999a870^` and `HEAD`:
-   ```bash
-   cd /home/18566299940/tradar
-   git log --oneline -5
-   git show 999a870^:webapp/crypto/routes.py > /tmp/old_routes.py
-   diff /tmp/old_routes.py webapp/crypto/routes.py | less
-   # focus on the two suspect functions:
-   git diff 999a870^ HEAD -- webapp/crypto/routes.py
-   ```
+`today_total` should then be `today_realized + today_unrealized = -$262.46 + (-$37.22) = -$299.68`, not -$6,462.
 
-2. **Check paper-mode fallback path** in current `_account_summary()`. Confirm whether it returns early when:
-   - `_has_binance_keys()` is false, or
-   - paper mode is on, or
-   - the Binance API call raises.
-   The fix is to compute `today_realized`, `all_time_pnl`, `open_count`, `position_cards` from `crypto_trades` (FIFO) when Binance is unavailable or in paper mode — restoring the pre-rewrite behaviour.
+`day_start_value` itself: in paper mode it should be the account_value as of `start_of_today` (00:00 local) — i.e. the equity curve point from yesterday's last snapshot, *not* a sum of trade volumes or anything else.
 
-3. **`crypto_holdings` is empty** but should not need to be populated for paper mode. Open positions in paper mode should be derivable purely from `crypto_trades` — sum of unmatched BUY qty per symbol with avg entry price from FIFO matching.
-
-4. **Verify settings**: `/tradar/settings` page — confirm paper-mode setting and Binance key state. Almost certainly paper-mode is on (every trade row in DB has `is_paper=1`).
-
-## Useful diagnostic commands
+## Repro
 
 ```bash
-# row counts
-sqlite3 /home/18566299940/tradar2/data/app.db "
-SELECT 'trades', COUNT(*) FROM crypto_trades
-UNION ALL SELECT 'runs', COUNT(*) FROM crypto_runs
-UNION ALL SELECT 'holdings', COUNT(*) FROM crypto_holdings
-UNION ALL SELECT 'settings', COUNT(*) FROM settings;
-"
-
-# today's trades
-sqlite3 /home/18566299940/tradar2/data/app.db "
-SELECT id, symbol, side, qty, price, quote_amount, executed_at, is_paper
-FROM crypto_trades
-WHERE date(executed_at) = date('now')
-ORDER BY id DESC;
-"
-
-# api response (use IPv4, IPv6 has docker-proxy issue inside SSH session)
 curl -s -4 http://localhost:7551/tradar/api/dashboard | python3 -m json.tool
-
-# rebuild and restart tradar2 after edits
-cd /home/18566299940/tradar
-sudo docker compose build
-sudo docker stop tradar2 && sudo docker rm tradar2
-sudo docker run -d --name tradar2 -p 7551:7550 \
-  -v /home/18566299940/tradar2/data:/app/data \
-  -v /home/18566299940/tradar2/logs:/app/logs \
-  --restart unless-stopped \
-  -e TZ=Asia/Kuala_Lumpur -e HOST=0.0.0.0 -e PORT=7550 -e STOCK_RUN_SCHEDULER=1 \
-  tradar:latest
 ```
 
-## Don't-touch list
-- Bind mount: `/home/18566299940/tradar2/data:/app/data` — never replace with anonymous volume; data was almost lost once already.
-- The DB itself: do not `DROP TABLE` or run destructive migrations. Backup first if you need to mutate schema:
-  ```bash
-  sudo cp /home/18566299940/tradar2/data/app.db /home/18566299940/tradar2/data/app.db.bak_$(date +%s)
-  ```
+Compare `account.today_unrealized` to `sum(card.pnl_usd for card in position_cards)`.
+They should match. Currently they're off by a factor of ~167.
+
+## Fix direction
+
+In `_account_summary()` (current `webapp/crypto/routes.py` line ~107):
+1. Compute `usdt_free` from trades (formula above) instead of returning `0.0` in paper mode.
+2. Compute `today_unrealized` by **summing position-card pnl_usd**, not by subtracting from `day_start_value`.
+3. Reconcile `day_start_value` from `crypto_daily_snapshots` (yesterday's row) — it has 31 rows already.
+
+The `crypto_daily_snapshots` table is presumably what the equity curve / day_start should use. Schema unchecked — `sqlite3 .schema crypto_daily_snapshots` first.
+
+## Don't break round 1
+
+The fix from `3a39142` for paper-mode (FIFO reconstruction of positions) is correct — keep it. The bugs are downstream of it: the position cards are right, the account aggregation on top of them is wrong.
