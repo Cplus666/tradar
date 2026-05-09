@@ -118,13 +118,18 @@ function haltNow() {
   </div>
 
 <script>
+// URL templates — adapts to /crypto (stock) vs /tradar prefix.
+// `__ID__` placeholder is replaced with actual trade_id at call time.
+const SELL_POS_TPL    = "{{ url_for('crypto.api_sell_position',    trade_id=0) }}".replace(/\/0$/, '/__ID__');
+const PARTIAL_SELL_TPL = "{{ url_for('crypto.api_partial_sell_position', trade_id=0) }}".replace(/\/0$/, '/__ID__');
+
 function manualSell(tradeId, symbol, entry, current) {
   const pnlPct = ((current - entry) / entry * 100).toFixed(2);
   const pnlSign = pnlPct >= 0 ? '+' : '';
   if (!confirm(`Sell ${symbol} at market right now?\n\nEntry:   $${entry}\nCurrent: $${current}\nP&L:     ${pnlSign}${pnlPct}%\n\nThis is irreversible — places a real Binance MARKET SELL order.`)) {
     return;
   }
-  fetch(`/tradar/api/sell-position/${tradeId}`, { method: 'POST' })
+  fetch(SELL_POS_TPL.replace('__ID__', tradeId), { method: 'POST' })
     .then(r => r.json())
     .then(data => {
       if (data.ok) {
@@ -164,7 +169,7 @@ function manualPartialSell(tradeId, symbol, entry, current, partialAlreadyDone) 
   if (!confirm(`Confirm: sell ${sellPct}% of ${symbol}'s remaining qty at market right now?\n\nThis is irreversible.`)) {
     return;
   }
-  fetch(`/tradar/api/partial-sell-position/${tradeId}`, {
+  fetch(PARTIAL_SELL_TPL.replace('__ID__', tradeId), {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({fraction: fraction}),
@@ -189,7 +194,7 @@ function manualPartialSell(tradeId, symbol, entry, current, partialAlreadyDone) 
 // placeholders, then we fetch live prices in the background and update the
 // Last $ / Value $ cells + grand total without reloading.
 function refreshPaperPrices() {
-  fetch('/tradar/api/journal/prices')
+  fetch('{{ url_for("crypto.api_journal_prices") }}')
     .then(r => r.json())
     .then(d => {
       if (!d.ok) { return; }

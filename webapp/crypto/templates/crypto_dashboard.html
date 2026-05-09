@@ -256,6 +256,9 @@
 </div>
 
 <script>
+  // URL template for coin detail page — adapts to /crypto (stock) vs /tradar.
+  const COIN_URL_TPL = "{{ url_for('crypto.coin_detail', symbol='__SYM__') }}";
+
   // ---- Daily realized P&L bar chart (last 30 days) ----
   // State: data is replaceable on each refresh; mode is sticky across refreshes
   // so the user's toggle choice survives the periodic re-fetch.
@@ -546,7 +549,7 @@
       return;
     }
     if (!_hasRenderedLive) {
-      fetchWithTimeout('/crypto/api/dashboard/static', 8000)
+      fetchWithTimeout('{{ url_for("crypto.api_dashboard_static") }}', 8000)
         .then(r => r.json())
         .then(d => { if (!_hasRenderedLive) { applyDashboard(d); } })
         .catch(e => { console.warn('static dashboard failed:', e); });
@@ -813,7 +816,7 @@
         return `<div class="border rounded-lg p-3 ${borderCls}">
           <div class="flex items-baseline justify-between mb-2">
             <div>
-              <a href="/crypto/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+              <a href="${COIN_URL_TPL.replace('__SYM__', c.symbol)}" class="font-bold text-lg hover:underline">${c.symbol}</a>
               ${partialBadge}
             </div>
             <span class="text-xs text-zinc-500">${c.strategy}</span>

@@ -34,6 +34,10 @@
 <div id="journal-pagination-bottom" class="bg-zinc-900 border border-zinc-800 rounded-lg mt-3 hidden"></div>
 
 <script>
+// URL template for coin detail page — uses Jinja url_for so it adapts to
+// stock (/crypto) vs tradar (/tradar) prefix.
+const COIN_URL_TPL = "{{ url_for('crypto.coin_detail', symbol='__SYM__') }}";
+
 function fmtPrice(p) {
   // Decimal precision tiered to price range (matches crypto_coin.html macro).
   if (p == null) return '—';
@@ -152,7 +156,7 @@ function renderEntry(e) {
   return `<div class="bg-zinc-900 border rounded-lg p-4 ${borderCls}">
     <div class="flex items-baseline justify-between flex-wrap gap-2 mb-2">
       <div class="flex items-baseline gap-2 flex-wrap">
-        <a href="/crypto/coin/${e.symbol}" class="text-lg font-bold hover:underline">${e.symbol}</a>
+        <a href="${COIN_URL_TPL.replace('__SYM__', e.symbol)}" class="text-lg font-bold hover:underline">${e.symbol}</a>
         <span class="text-xs px-2 py-0.5 rounded bg-zinc-800 text-zinc-400">${e.strategy || '?'}</span>
         ${statusBadge}
       </div>
@@ -235,7 +239,7 @@ function loadJournal() {
   document.getElementById('date-picker').value = date;
 
   // STAGE 1 — fast: DB data only (no Binance). Renders cards immediately.
-  fetch('/crypto/api/journal?page=' + page + '&date=' + encodeURIComponent(date))
+  fetch('{{ url_for("crypto.api_journal") }}?page=' + page + '&date=' + encodeURIComponent(date))
     .then(r => r.json())
     .then(d => {
       // Capture fee rate so subsequent live-price updates net the same way
@@ -297,7 +301,7 @@ function loadJournal() {
 }
 
 function loadLivePrices(symbols) {
-  fetch('/crypto/api/journal/prices')
+  fetch('{{ url_for("crypto.api_journal_prices") }}')
     .then(r => r.json())
     .then(pd => {
       const tsEl = document.getElementById('journal-prices-updated');

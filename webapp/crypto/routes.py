@@ -10,7 +10,20 @@ from flask import Blueprint, abort, flash, jsonify, redirect, render_template, r
 
 from webapp.models import CryptoCoin, CryptoHolding, CryptoRun, CryptoTrade, Setting, db
 
-bp = Blueprint("crypto", __name__, url_prefix="/crypto", template_folder="templates")
+bp = Blueprint("crypto", __name__, url_prefix="/tradar", template_folder="templates")
+
+
+@bp.app_template_filter("dt")
+def fmt_dt(value):
+    """UTC datetime → 'YYYY-MM-DD HH:MM MYT' display. DB stores naive UTC."""
+    if not value:
+        return ""
+    from datetime import timezone, timedelta
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    myt = value.astimezone(timezone(timedelta(hours=8)))
+    return myt.strftime("%Y-%m-%d %H:%M MYT")
+
 
 KEY_SETTING = "binance_api_key"
 SECRET_SETTING = "binance_api_secret"
@@ -1332,11 +1345,13 @@ def holdings():
                 "strategy": p.strategy,
                 "partial_done": meta.get("partial_done", False),
             }
+    from analysis.crypto_executor import _is_paper_mode_setting
     return render_template(
         "crypto_holdings.html",
         rows=rows, total=total,
         has_keys=_has_binance_keys(),
         open_pos_by_asset=open_pos_by_asset,
+        is_paper_mode=_is_paper_mode_setting(),
     )
 
 
