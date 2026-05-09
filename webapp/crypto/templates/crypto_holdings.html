@@ -14,16 +14,31 @@
             class="text-xs bg-rose-800 hover:bg-rose-700 text-white px-3 py-1.5 rounded">
       Sell All
     </button>
+    <button onclick="haltNow()"
+            class="text-xs bg-red-700 hover:bg-red-600 text-white px-3 py-1.5 rounded">
+      ⏸ Halt Now
+    </button>
   </div>
 </div>
 
 <script>
 function sellAll() {
-  if (!confirm("Sell ALL open positions at market price now?")) { return; }
+  if (!confirm("Sell ALL open positions at market price now?\n\n(Bot will keep trading after — entries can re-fire on next loop tick.)")) { return; }
   fetch('{{ url_for("crypto.api_sell_all") }}', {method: 'POST'})
     .then(r => r.json())
     .then(d => {
       alert(d.closed + ' position(s) closed.');
+      window.location.reload();
+    })
+    .catch(e => alert('Error: ' + e));
+}
+function haltNow() {
+  if (!confirm("HALT NOW\n\n• Sell ALL open positions at market\n• Block new entries until next MYT midnight\n\nUse the halt banner's 'Resume' or 'Re-arm' buttons to undo before midnight.\n\nProceed?")) { return; }
+  fetch('{{ url_for("crypto.api_halts_halt_now") }}', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok !== true) { alert('Halt failed: ' + (d.reason || 'unknown')); return; }
+      alert(d.closed + ' position(s) closed. New entries blocked until MYT midnight.');
       window.location.reload();
     })
     .catch(e => alert('Error: ' + e));

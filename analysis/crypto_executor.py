@@ -43,12 +43,18 @@ DEFAULTS = {
     "crypto_max_position_usd": "50",
     "crypto_max_concurrent": "2",
     "crypto_min_balance_usd": "100",
-    # Initial principal at first deploy. Doesn't change on deposits — those
-    # flow through crypto_daily_snapshots.deposits_during_day_usd. Use
-    # _principal_at_day(date) for time-aware principal.
+    # Starting capital — the principal used by all synth-day-start calculations.
+    # AUTO-ADJUSTED at MYT-midnight rollover when net USDT deposits/withdrawals
+    # are detected via Binance API. User can also set manually via Settings.
+    # Default 200.29 = the original principal at first deploy. After deposits,
+    # this grows; after withdrawals, it shrinks. Result: all-time P&L cleanly
+    # separates contributions from trading P&L.
     "crypto_starting_capital_usd": "200.29",
-    # Net USDT deposits/withdrawals during TODAY (since MYT midnight). Updated
-    # by 'Refresh deposit/withdraw' button. Reset to 0 at MYT midnight rollover.
+    # Net USDT deposits/withdrawals during TODAY (since MYT midnight).
+    # Updated by the user's "Refresh deposit/withdraw" button. Reset to 0 at
+    # MYT midnight rollover — at that moment the past-24h fetch captures
+    # yesterday's finalized total into today's snapshot row, so the so-far
+    # counter starts fresh tracking new day's flows.
     "crypto_today_deposits_so_far_usd": "0",
     # Partial profit-take defaults (so missing settings don't silently → 0,
     # which would make new_stop=entry instead of entry+buffer%)
@@ -63,11 +69,14 @@ DEFAULTS = {
     "crypto_fee_rate_per_side": "0.001",
     # Daily P&L halts — both auto-resume next MYT day. Different from the
     # catastrophic kill-switch (which is permanent until manually flipped).
+    # Loss halt: at -X% from day-start, sell all open positions + block new
+    # entries until midnight. Profit halt: same but at +X%, lock in gains.
     "crypto_loss_halt_enabled": "off",
     "crypto_loss_halt_pct": "5.0",
     "crypto_profit_halt_enabled": "off",
     "crypto_profit_halt_pct": "5.0",
-    # Internal state — auto-cleared at MYT midnight rollover
+    # Internal state — auto-cleared at MYT midnight rollover. Don't surface
+    # these in Settings UI; they're managed by the halt logic.
     "crypto_today_loss_halted": "0",
     "crypto_today_profit_halted": "0",
     # Override flags — set by user "Resume trading today" button. They consume
@@ -110,8 +119,15 @@ def is_today_halted() -> bool:
 
 
 def _starting_capital() -> float:
-    """INITIAL principal — read from `crypto_starting_capital_usd` setting,
-    fallback 200.29. Use _principal_at_day(date) for time-aware principal."""
+    """Returns the INITIAL principal — the bot's first deposit, before any
+    subsequent deposits/withdrawals. Read from `crypto_starting_capital_usd`
+    setting; fallback 200.29 if missing.
+
+    NOT the "current principal." For current/historical principal at any
+    specific date use `_principal_at_day(date_iso)` — that helper sums the
+    signed deposits/withdrawals from `crypto_daily_snapshots` to give you
+    the principal as it was at the start of that day.
+    """
     try:
         v = float(_get_setting("crypto_starting_capital_usd") or "0")
         if v > 0:
@@ -122,8 +138,9 @@ def _starting_capital() -> float:
 
 
 def _today_deposits_so_far() -> float:
-    """Net deposits during TODAY since MYT midnight. Updated by 'Refresh
-    deposit/withdraw' button. Reset to 0 at MYT rollover."""
+    """Net deposits/withdrawals during TODAY (since MYT midnight). Updated by
+    the 'Refresh deposit/withdraw' button. 0 by default; reset to 0 at MYT
+    rollover."""
     try:
         return float(_get_setting("crypto_today_deposits_so_far_usd") or "0")
     except (TypeError, ValueError):
@@ -131,10 +148,22 @@ def _today_deposits_so_far() -> float:
 
 
 def _principal_at_day(date_iso: str) -> float:
-    """Principal at MYT 00:00 of date_iso = initial + Σ deposits up to and
-    including the prior day + (if asking for today) today's so-far deposits.
-    Filter `<= date_iso` because row.date=X actually stores deposits during
-    day X-1 (rollover at start of X fetches past 24h)."""
+    """Principal in effect at the moment we're computing for `date_iso`.
+
+    Three components:
+      1. initial principal (from `crypto_starting_capital_usd`)
+      2. Σ signed deposits from all snapshot rows with date <= date_iso
+         (each row's deposits_during_day_usd was captured at that row's
+          MYT-midnight rollover via past-24h fetch — so row date=X stores
+          deposits during day X-1, and `<=` correctly sums all flows up to
+          and including the prior calendar day)
+      3. IF date_iso is today, also add `crypto_today_deposits_so_far_usd`
+         — this is the user-refreshed mid-day deposit counter, so today's
+         deposits propagate immediately after the user clicks Refresh.
+
+    Without #3, today's deposits wouldn't reflect in the dashboard / synth /
+    halt threshold until the next midnight rollover.
+    """
     from webapp.models import CryptoDailySnapshot
     initial = _starting_capital()
     try:
@@ -146,6 +175,7 @@ def _principal_at_day(date_iso: str) -> float:
         cum_deposits = sum(float(r[0] or 0) for r in rows)
     except Exception:
         cum_deposits = 0.0
+    # Add today's mid-day deposits if asking about today.
     from datetime import timezone, timedelta
     MYT_TZ = timezone(timedelta(hours=8))
     today_iso = (datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -155,10 +185,11 @@ def _principal_at_day(date_iso: str) -> float:
 
 
 def _collect_ghost_init_data() -> list[dict]:
-    """Snapshot open positions + current ticker prices for ghost seeding."""
+    """Snapshot live open positions + current ticker prices for ghost seeding.
+    Called just before sell_all_open_positions so we capture prices while
+    positions are still open. Returns [] on any failure (non-fatal)."""
     try:
-        is_paper = _is_paper_mode_setting()
-        positions = _open_positions(is_paper=is_paper)
+        positions = _open_positions(is_paper=False)
         if not positions:
             return []
         tickers = {t["symbol"]: float(t["price"])
@@ -188,14 +219,20 @@ def _collect_ghost_init_data() -> list[dict]:
 
 
 def sell_all_open_positions(reason: str, mode_filter: bool | None = None) -> int:
-    """Close every currently-open position at market. Returns # successful sells."""
+    """Close every currently-open position at market. Returns # successful sells.
+
+    Used by daily-P&L halts (profit/loss). Each sell goes through execute_sell
+    with the standard exit_reason wiring so the journal/dashboard show why.
+    """
     n = 0
     for pos in _open_positions(is_paper=mode_filter):
         try:
+            # Need a current price — try ticker fetch via the bot's existing client
             try:
                 client = _binance_client()
                 cur = float(client.get_symbol_ticker(symbol=pos.symbol)["price"])
             except Exception:
+                # Fallback: use last buy price (will fill at simulated/market in execute_sell)
                 cur = float(pos.price)
             res = execute_sell(pos, cur, reason)
             if res.get("executed"):
@@ -208,55 +245,6 @@ def sell_all_open_positions(reason: str, mode_filter: bool | None = None) -> int
     return n
 
 
-def _compute_synth_day_start_today() -> float:
-    """Synthesized day-start: STARTING_CAPITAL + Σ realized P&L from closes
-    BEFORE today MYT 00:00. Used as the halt + dashboard denominator (matches
-    what the user sees on the today's-P&L card)."""
-    from webapp.models import CryptoTrade
-    from datetime import timezone, timedelta
-    MYT = timezone(timedelta(hours=8))
-    now_myt = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(MYT)
-    today_start_myt = now_myt.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_start_utc = today_start_myt.astimezone(timezone.utc).replace(tzinfo=None)
-    try:
-        fee_rate = float(_get_setting("crypto_fee_rate_per_side") or "0.001")
-    except (TypeError, ValueError):
-        fee_rate = 0.001
-    is_paper = _is_paper_mode_setting()
-    trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == is_paper)
-              .order_by(CryptoTrade.executed_at).all())
-    by_sym: dict = {}
-    for t in trades:
-        if t.strategy == "manual_liquidation":
-            continue
-        by_sym.setdefault(t.symbol, []).append(t)
-    pre_today_realized = 0.0
-    for _sym, ts in by_sym.items():
-        buys: list = []
-        for t in ts:
-            if t.side == "BUY":
-                buys.append([t, float(t.qty)])
-            elif t.side == "SELL" and buys:
-                sell_qty_remaining = float(t.qty)
-                while sell_qty_remaining > 1e-9 and buys:
-                    buy, buy_remaining = buys[0]
-                    consumed = min(buy_remaining, sell_qty_remaining)
-                    buys[0][1] -= consumed
-                    sell_qty_remaining -= consumed
-                    buy_value = float(buy.price) * consumed
-                    sell_value = float(t.price) * consumed
-                    gross = sell_value - buy_value
-                    fee = (buy_value + sell_value) * fee_rate
-                    pnl = gross - fee
-                    if buys[0][1] <= 1e-9:
-                        buys.pop(0)
-                    if t.executed_at < today_start_utc:
-                        pre_today_realized += pnl
-    today_iso = today_start_myt.date().isoformat()
-    return _principal_at_day(today_iso) + pre_today_realized
-
-
 def _is_paper_mode_setting() -> bool:
     """Read trading mode from settings — paper means no Binance deposit fetch."""
     return (_get_setting("crypto_trading_mode") or "paper") == "paper"
@@ -264,8 +252,13 @@ def _is_paper_mode_setting() -> bool:
 
 def _fetch_net_usdt_deposits_since_today_midnight() -> float | None:
     """Net USDT deposits − withdrawals from MYT 00:00 today to NOW.
-    Used by 'Refresh deposit/withdraw' button. Returns None on Binance API failure.
-    In paper mode, returns 0.0 (paper deposits are user-entered via form)."""
+
+    Used by the user's 'Refresh deposit/withdraw' button to update
+    `crypto_today_deposits_so_far_usd` so today's same-day flows propagate
+    into the synth/dashboard immediately. Returns None if either Binance
+    API call fails (caller should not update the setting on None — keep
+    the previous value). In paper mode, returns 0.0 — paper deposits don't
+    show up on Binance."""
     if _is_paper_mode_setting():
         return 0.0
     try:
@@ -284,29 +277,80 @@ def _fetch_net_usdt_deposits_since_today_midnight() -> float | None:
         deposits = 0.0
         withdrawals = 0.0
         try:
-            for d in client.get_deposit_history(coin="USDT", startTime=start_ms, endTime=end_ms) or []:
+            for d in client.get_deposit_history(coin="USDT",
+                                                startTime=start_ms,
+                                                endTime=end_ms) or []:
                 if d.get("status") == 1:
                     deposits += float(d.get("amount") or 0)
         except Exception as e:
             log.warning("today's deposit history fetch failed: %s", e)
             return None
         try:
-            for w in client.get_withdraw_history(coin="USDT", startTime=start_ms, endTime=end_ms) or []:
+            for w in client.get_withdraw_history(coin="USDT",
+                                                 startTime=start_ms,
+                                                 endTime=end_ms) or []:
                 if w.get("status") == 6:
                     withdrawals += float(w.get("amount") or 0)
         except Exception as e:
             log.warning("today's withdraw history fetch failed: %s", e)
             return None
+        # Add P2P (C2C) inflow/outflow — invisible to standard deposit API
+        p2p = _fetch_net_usdt_p2p(client, start_ms, end_ms)
+        if p2p is not None:
+            deposits += p2p[0]
+            withdrawals += p2p[1]
+        # If P2P fetch failed: don't error — just miss P2P this tick (caller
+        # treats absence of news as zero, which is the existing behavior).
         return deposits - withdrawals
     except Exception as e:
         log.warning("since-midnight deposit fetch failed: %s", e)
         return None
 
 
+def _fetch_net_usdt_p2p(client, start_ms: int, end_ms: int) -> tuple[float, float] | None:
+    """Fetch P2P (C2C) USDT activity in [start_ms, end_ms].
+
+    P2P moves USDT between Binance internal accounts (P2P wallet ↔ Spot wallet)
+    without an on-chain transaction, so it's invisible to get_deposit_history.
+    But from a Spot-wallet perspective, BUY = USDT inflow (deposit-equivalent)
+    and SELL = USDT outflow (withdrawal-equivalent).
+
+    Returns (p2p_in_usdt, p2p_out_usdt), or None on API failure.
+    Both values are zero (not None) if no P2P trades exist — that's a valid
+    state, not a failure.
+    """
+    p2p_in = 0.0
+    p2p_out = 0.0
+    for trade_type, accumulator_key in [("BUY", "in"), ("SELL", "out")]:
+        try:
+            res = client.get_c2c_trade_history(
+                tradeType=trade_type,
+                startTimestamp=start_ms,
+                endTimestamp=end_ms,
+            ) or {}
+        except Exception as e:
+            log.warning("C2C %s history fetch failed: %s", trade_type, e)
+            return None
+        for t in (res.get("data") or []):
+            if (t.get("asset") == "USDT"
+                    and t.get("orderStatus") == "COMPLETED"):
+                amt = float(t.get("amount") or 0)
+                if accumulator_key == "in":
+                    p2p_in += amt
+                else:
+                    p2p_out += amt
+    return p2p_in, p2p_out
+
+
 def _fetch_net_usdt_deposits_last_24h() -> float | None:
-    """Net USDT deposits − withdrawals in the past 24h via Binance API.
-    Returns None if either history call fails (caller stores NULL).
-    In paper mode, returns 0.0 — paper deposits don't show on Binance."""
+    """Net USDT deposits − withdrawals in the past 24h, via Binance API.
+
+    Returns the float net amount, or None if the API call failed (caller
+    should treat None as 'unknown' — store NULL in the snapshot, not 0.0).
+    Only counts USDT directly; non-USDT deposits would need price conversion
+    that's not worth the complexity for this use case. In paper mode,
+    returns 0.0 — paper deposits don't show on Binance.
+    """
     if _is_paper_mode_setting():
         return 0.0
     try:
@@ -323,6 +367,7 @@ def _fetch_net_usdt_deposits_last_24h() -> float | None:
             for d in client.get_deposit_history(coin="USDT",
                                                 startTime=start_ms,
                                                 endTime=end_ms) or []:
+                # status: 1 = success (deposit credited)
                 if d.get("status") == 1:
                     deposits += float(d.get("amount") or 0)
         except Exception as e:
@@ -332,11 +377,20 @@ def _fetch_net_usdt_deposits_last_24h() -> float | None:
             for w in client.get_withdraw_history(coin="USDT",
                                                  startTime=start_ms,
                                                  endTime=end_ms) or []:
+                # status: 6 = completed (withdrawal sent successfully)
                 if w.get("status") == 6:
                     withdrawals += float(w.get("amount") or 0)
         except Exception as e:
             log.warning("withdraw history fetch failed: %s", e)
+            # Got deposits but not withdrawals — still better than nothing,
+            # but mark as unknown to avoid storing a misleading "deposits-only"
+            # net figure.
             return None
+        # Add P2P (C2C) — same logic as the since-midnight function
+        p2p = _fetch_net_usdt_p2p(client, start_ms, end_ms)
+        if p2p is not None:
+            deposits += p2p[0]
+            withdrawals += p2p[1]
         return deposits - withdrawals
     except Exception as e:
         log.warning("net deposit fetch failed: %s", e)
@@ -348,18 +402,27 @@ def _write_daily_snapshot(date_iso: str, total_value: float,
                           open_value: float | None = None,
                           source: str = "synth",
                           overwrite: bool = False) -> None:
-    """Insert/update CryptoDailySnapshot row. With overwrite=True, updates
-    existing row (used by rollover so the synth value replaces any prior
-    'backfill' or stale row)."""
+    """Insert/update a CryptoDailySnapshot row.
+
+    Default behavior is INSERT-IF-MISSING (idempotent on date PK). Pass
+    `overwrite=True` to update an existing row — used by the rollover code
+    so today's row reflects the synth value even if a prior 'backfill' or
+    older-format row was already there.
+
+    `source` should be "synth" for rollover/recompute writes (the value is
+    the synthesized day-start). Other sources ("backfill") are legacy.
+    """
     from webapp.models import CryptoDailySnapshot, db
     existing = CryptoDailySnapshot.query.get(date_iso)
     if existing is not None:
         if not overwrite:
-            return
-        # Do NOT refetch deposits on overwrite — column semantics is "captured
-        # at this row's rollover for past 24h" = prior day's deposits, fixed
-        # forever once written. A mid-day refetch would corrupt the value with
-        # a sliding window. Same-day deposits flow into TOMORROW's row.
+            return  # idempotent — keep existing row
+        # On overwrite, do NOT refetch deposits. The deposits column has a
+        # specific semantics ("captured at this row's rollover for past 24h
+        # = the prior calendar day's deposits"). Refetching mid-day would
+        # overwrite that with a time-shifted past-24h window, losing the
+        # canonical value. Today's deposits will be captured at TOMORROW's
+        # rollover and stored in tomorrow's row — that's by design.
         existing.total_value_usd = float(total_value)
         existing.source = source
         if usdt_free is not None:
@@ -380,18 +443,90 @@ def _write_daily_snapshot(date_iso: str, total_value: float,
     )
     db.session.add(row)
     db.session.commit()
-    log.info("daily snapshot saved: %s @ $%.2f source=%s", date_iso, total_value, source)
+    log.info("daily snapshot saved: %s @ $%.2f (deposits24h=%s)",
+             date_iso, total_value,
+             f"${deposits_24h:.2f}" if deposits_24h is not None else "?")
+
+
+def _compute_synth_day_start_today() -> float:
+    """Compute the synthesized day-start value for today (MYT).
+
+    Formula: principal_at_today + Σ (FIFO net P&L from closes BEFORE today MYT 00:00).
+      where principal_at_today = initial + Σ deposits/withdrawals before today.
+
+    Same denominator as dashboard today's-P&L card and daily ROI graph, so
+    halt threshold matches what the user sees. Deposits/withdrawals propagate
+    via _principal_at_day which sums the signed `deposits_during_day_usd`
+    column from the snapshot table.
+
+    Walks crypto_trades via FIFO with REMAINING-QTY tracking — handles partial
+    sells correctly. Cheap (a few hundred trade rows, <50ms typically).
+    """
+    from webapp.models import CryptoTrade
+    from datetime import timezone, timedelta
+    MYT = timezone(timedelta(hours=8))
+    now_myt = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(MYT)
+    today_start_myt = now_myt.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_myt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    try:
+        fee_rate = float(_get_setting("crypto_fee_rate_per_side") or "0.001")
+    except (TypeError, ValueError):
+        fee_rate = 0.001
+
+    trades = (CryptoTrade.query
+              .filter(CryptoTrade.is_paper == False)
+              .order_by(CryptoTrade.executed_at)
+              .all())
+    by_sym: dict = {}
+    for t in trades:
+        if t.strategy == "manual_liquidation":
+            continue
+        by_sym.setdefault(t.symbol, []).append(t)
+
+    pre_today_realized = 0.0
+    for _sym, ts in by_sym.items():
+        buys: list = []  # [trade, remaining_qty]
+        for t in ts:
+            if t.side == "BUY":
+                buys.append([t, float(t.qty)])
+            elif t.side == "SELL" and buys:
+                sell_qty_remaining = float(t.qty)
+                while sell_qty_remaining > 1e-9 and buys:
+                    buy, buy_remaining = buys[0]
+                    consumed = min(buy_remaining, sell_qty_remaining)
+                    buys[0][1] -= consumed
+                    sell_qty_remaining -= consumed
+                    _bq = float(buy.qty) or 1
+                    _sq = float(t.qty) or 1
+                    buy_value = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq)
+                    sell_value = float(t.quote_amount or float(t.price) * float(t.qty)) * (consumed / _sq)
+                    gross = sell_value - buy_value
+                    fee = (buy_value + sell_value) * fee_rate
+                    pnl = gross - fee
+                    if buys[0][1] <= 1e-9:
+                        buys.pop(0)
+                    if t.executed_at < today_start_utc:
+                        pre_today_realized += pnl
+
+    today_iso = today_start_myt.date().isoformat()
+    return _principal_at_day(today_iso) + pre_today_realized
 
 
 def update_day_start_and_check_halt(current_value: float) -> dict:
-    """Snapshot today's start-of-day account value and fire daily P&L halts.
+    """Snapshot today's start-of-day value and fire BOTH loss and profit halts.
 
-    Two halts (separate, can stack):
-      1. crypto_loss_halt_pct: soft auto-resume. At -X%, sell all + halt.
-      2. crypto_profit_halt_pct: mirror, locks gains at +X%.
-    Both auto-clear at next MYT midnight. The legacy "drawdown_halt" was
-    removed (its only function over loss_halt was requiring manual reset).
-    crypto_kill_switch is still respected for manual emergency stops.
+    Each MYT day is its own threshold; flags auto-clear at midnight rollover.
+
+    Two halt mechanisms (separate, can stack):
+      1. crypto_loss_halt_pct: soft auto-resume. At -X% from day-start, sell all
+         positions + block new entries until next MYT midnight.
+      2. crypto_profit_halt_pct: mirror of #1 at +X%, locks in gains.
+
+    The catastrophic "drawdown_halt" was removed — its only function over
+    crypto_loss_halt_pct was requiring a manual kill-switch reset, which
+    contradicted the user's autonomous-operation goal. crypto_kill_switch
+    is still respected for manual emergency-stop scenarios.
 
     Returns: {day_start, drawdown_pct, halt_triggered, enabled,
               today_pnl_pct, loss_halt_fired, profit_halt_fired}
@@ -410,35 +545,36 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
         snap_value = float(_get_setting("crypto_day_start_value_usd") or 0)
     except (TypeError, ValueError):
         snap_value = 0.0
+    # Format marker: snap_value is "synth" (= principal + Σ realized pre-today)
+    # since the dashboard-halt-reconciliation switchover. Missing/old marker →
+    # snap_value still has old "midnight account value" semantics → force a
+    # re-rollover NOW so the halt threshold matches what the dashboard shows
+    # (instead of waiting until next MYT midnight to re-sync).
     snap_format = _get_setting("crypto_day_start_format") or ""
 
-    # New MYT day OR stale-format snap → re-snapshot + auto-clear halt/override
-    # flags. snap_format must be "synth" so halt threshold matches dashboard.
-    if snap_date != today_str or snap_value <= 0 or snap_format != "synth":
+    # New MYT day → re-snapshot with ACTUAL account value + clear halt flags.
+    # Using current_value (live Binance balance) avoids synth-formula drift.
+    # day_start is set ONCE at midnight and never changed during the day —
+    # halts are trading gates only, not P&L resets.
+    if snap_date != today_str or snap_value <= 0:
         _set_setting("crypto_day_start_date", today_str)
-        # Synthesized day-start: principal + Σ realized P&L pre-today.
-        # Same denominator as dashboard today's-P&L card and ROI graph.
-        try:
-            synth_day_start = _compute_synth_day_start_today()
-        except Exception as e:
-            log.warning("synth day-start compute failed, using current_value: %s", e)
-            synth_day_start = current_value
-        _set_setting("crypto_day_start_value_usd", f"{synth_day_start:.4f}")
-        _set_setting("crypto_day_start_format", "synth")
+        _set_setting("crypto_day_start_value_usd", f"{current_value:.4f}")
+        _set_setting("crypto_day_start_format", "live")
         _set_setting("crypto_today_loss_halted", "0")
         _set_setting("crypto_today_profit_halted", "0")
         _set_setting("crypto_today_loss_overridden", "0")
         _set_setting("crypto_today_profit_overridden", "0")
-        # Reset today's mid-day deposit counter — yesterday's deposits get
-        # finalized into today's snapshot row at this rollover.
+        # Reset today's mid-day deposit counter — yesterday's flows have
+        # been finalized into today's snapshot row via past-24h fetch in
+        # _write_daily_snapshot, so the so-far counter starts fresh.
         _set_setting("crypto_today_deposits_so_far_usd", "0")
-        # Daily snapshot table stores SYNTH value (single source of truth
-        # used by halt + dashboard + ROI graph).
+        # Daily snapshot table stores SYNTH value (same number used by the
+        # halt + dashboard + ROI graph). Single source of truth.
         try:
-            _write_daily_snapshot(today_str, synth_day_start, source="synth", overwrite=True)
+            _write_daily_snapshot(today_str, current_value, source="live", overwrite=True)
         except Exception as e:
             log.warning("daily snapshot write failed (non-fatal): %s", e)
-        snap_value = synth_day_start
+        snap_value = current_value
         return {"day_start": snap_value, "drawdown_pct": 0.0,
                 "halt_triggered": False, "enabled": True,
                 "today_pnl_pct": 0.0, "loss_halt_fired": False, "profit_halt_fired": False}
@@ -446,31 +582,50 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
     today_pnl_pct = (current_value - snap_value) / snap_value * 100.0 if snap_value > 0 else 0.0
     drawdown_pct = -today_pnl_pct if today_pnl_pct < 0 else 0.0
 
-    # NOTE: legacy "drawdown_halt_pct" was removed in favor of the soft halts
-    # below. crypto_kill_switch is still respected for manual emergency stops.
+    # NOTE: legacy "drawdown_halt_pct" was removed in favor of the new soft
+    # halts below. crypto_kill_switch is still respected for manual emergency
+    # stops, but no auto-flip on drawdown anymore.
     enabled = False  # kept for return-shape backward compat
     halt_triggered = False  # ditto
 
-    # === Soft auto-resume halts (loss + profit) ===
+    # === NEW soft auto-resume halts (loss + profit, sell positions, resume tomorrow) ===
     loss_halt_fired = False
     profit_halt_fired = False
 
-    # LOSS HALT (skipped if user already overrode today)
+    # MIN P&L HALT — fires when today P&L drops to/below the floor (signed).
+    # Floor = -5  → halts if P&L ≤ -5% (loss protection)
+    # Floor = +6  → halts if P&L ≤ +6% (locks in gains above 6%)
+    # One-shot migration: legacy values were stored positive (5 = "halt at -5%").
+    # If we detect that pattern AND no migration flag, flip the sign in-place.
+    if _get_setting("crypto_halt_pct_signed_v1") != "1":
+        try:
+            _legacy = float(_get_setting("crypto_loss_halt_pct") or "0")
+            if _legacy > 0:
+                _set_setting("crypto_loss_halt_pct", f"{-_legacy:.4f}")
+                log.info("migrated crypto_loss_halt_pct: %.2f → %.2f (signed semantic)",
+                         _legacy, -_legacy)
+        except (TypeError, ValueError):
+            pass
+        _set_setting("crypto_halt_pct_signed_v1", "1")
+
     if (_get_setting("crypto_loss_halt_enabled") == "on"
             and _get_setting("crypto_today_loss_halted") != "1"
             and _get_setting("crypto_today_loss_overridden") != "1"):
-        loss_halt_pct = _f("crypto_loss_halt_pct")
-        if drawdown_pct >= loss_halt_pct:
+        min_pnl_pct = _f("crypto_loss_halt_pct")  # signed; default migrated above
+        if today_pnl_pct <= min_pnl_pct:
             from webapp.models import CryptoRun, db
             ts = datetime.utcnow()
-            msg = (f"LOSS HALT: today {today_pnl_pct:+.2f}% (≥ {loss_halt_pct:.1f}%) — "
-                   f"closing all positions, halting until next MYT day")
+            msg = (
+                f"MIN HALT: today P&L {today_pnl_pct:+.2f}% (≤ floor {min_pnl_pct:+.2f}%) — "
+                f"closing all positions, halting until next MYT day"
+            )
             _set_setting("crypto_today_loss_halted", "1")
             _ghost_pre = _collect_ghost_init_data()
-            n_closed = sell_all_open_positions(f"LOSS HALT — today {today_pnl_pct:+.2f}%", mode_filter=_is_paper_mode_setting())
-            db.session.add(CryptoRun(kind="loss_halt", status="ok",
-                                      started_at=ts, ended_at=ts,
-                                      summary=f"{msg} ({n_closed} positions closed)"))
+            n_closed = sell_all_open_positions(f"MIN HALT — today {today_pnl_pct:+.2f}%")
+            run = CryptoRun(kind="loss_halt", status="ok",
+                            started_at=ts, ended_at=ts,
+                            summary=f"{msg} ({n_closed} positions closed)")
+            db.session.add(run)
             db.session.commit()
             log.warning(msg)
             loss_halt_fired = True
@@ -480,7 +635,8 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             except Exception as _ge:
                 log.warning("ghost start failed (non-fatal): %s", _ge)
 
-    # PROFIT HALT (skipped if user already overrode profit halt today)
+    # MAX P&L HALT — fires when today P&L rises to/above the ceiling.
+    # Ceiling stays positive-only (no use case for negative ceiling).
     if (not loss_halt_fired
             and _get_setting("crypto_profit_halt_enabled") == "on"
             and _get_setting("crypto_today_profit_halted") != "1"
@@ -489,14 +645,17 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
         if today_pnl_pct >= profit_halt_pct:
             from webapp.models import CryptoRun, db
             ts = datetime.utcnow()
-            msg = (f"PROFIT HALT: today +{today_pnl_pct:.2f}% (≥ {profit_halt_pct:.1f}%) — "
-                   f"locking gains, halting until next MYT day")
+            msg = (
+                f"MAX HALT: today P&L {today_pnl_pct:+.2f}% (≥ ceiling +{profit_halt_pct:.2f}%) — "
+                f"locking in gains, halting until next MYT day"
+            )
             _set_setting("crypto_today_profit_halted", "1")
             _ghost_pre = _collect_ghost_init_data()
-            n_closed = sell_all_open_positions(f"PROFIT HALT — today +{today_pnl_pct:.2f}%", mode_filter=_is_paper_mode_setting())
-            db.session.add(CryptoRun(kind="profit_halt", status="ok",
-                                      started_at=ts, ended_at=ts,
-                                      summary=f"{msg} ({n_closed} positions closed)"))
+            n_closed = sell_all_open_positions(f"MAX HALT — today {today_pnl_pct:+.2f}%")
+            run = CryptoRun(kind="profit_halt", status="ok",
+                            started_at=ts, ended_at=ts,
+                            summary=f"{msg} ({n_closed} positions closed)")
+            db.session.add(run)
             db.session.commit()
             log.warning(msg)
             profit_halt_fired = True
@@ -511,10 +670,6 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             "today_pnl_pct": today_pnl_pct,
             "loss_halt_fired": loss_halt_fired,
             "profit_halt_fired": profit_halt_fired}
-
-
-# Backwards-compat shim for any caller still using the old name.
-update_peak_and_check_halt = update_day_start_and_check_halt
 
 
 def _fmt_price(p: float) -> str:
@@ -572,7 +727,6 @@ def parse_entry_notes(notes: str | None) -> dict:
     Also parses partial-take state (set after a partial profit-take fires):
       partial_done   = True if partial sell already happened on this position
       original_stop  = the stop level BEFORE the breakeven-move adjustment
-                       (preserved so dashboards can show "stop moved $X → $Y")
     """
     out = {
         "stop": None, "target": None, "max_hold": 24, "exit_rule": "stop_target_time",
@@ -635,9 +789,9 @@ def _open_positions(is_paper: bool | None = None) -> list:
         residual_value = qty * float(last_buy.price)
         if residual_value < 1.0:
             continue
-        # Attach the remaining net qty (post-partial-sells) to the BUY object
-        # so callers can compute correct unrealized P&L. last_buy.qty is the
-        # ORIGINAL buy qty; _remaining_qty is what's actually still open.
+        # Attach the remaining net qty (post-partial-sells) so callers can
+        # compute correct unrealized P&L. last_buy.qty is the ORIGINAL buy
+        # qty; _remaining_qty is what's actually still open.
         last_buy._remaining_qty = qty
         result.append(last_buy)
     return result
@@ -851,17 +1005,11 @@ def execute_sell(position, current_price: float, exit_reason: str,
 
     entry_price = float(position.price)
 
-    # Determine qty to sell.
-    # PAPER: must compute net remaining (because paper has no real balance to query).
-    #        After a partial sell earlier, position.qty is stale (still shows original);
-    #        actual remaining = original − sum of partial sells already done.
-    # LIVE:  the existing min(qty_to_sell, free) below caps to actual remaining,
-    #        so we don't need to pre-compute. But if qty_override is given (partial),
-    #        we want to sell exactly that.
+    # Determine qty to sell. PAPER must compute net remaining (no balance to query);
+    # LIVE caps via min(qty, free) below. qty_override (partial sells) trumps both.
     if qty_override is not None:
         qty_to_sell = float(qty_override)
     elif is_paper:
-        # Sum all paper SELLs of this symbol that happened AFTER this BUY
         prior_sells = (CryptoTrade.query
                        .filter_by(symbol=position.symbol, side="SELL", is_paper=True)
                        .filter(CryptoTrade.executed_at > position.executed_at)
@@ -870,7 +1018,7 @@ def execute_sell(position, current_price: float, exit_reason: str,
         already_sold = sum(float(s.qty) for s in prior_sells)
         qty_to_sell = max(0.0, float(position.qty) - already_sold)
     else:
-        qty_to_sell = float(position.qty)  # LIVE will cap by free balance below
+        qty_to_sell = float(position.qty)
 
     if qty_to_sell <= 0:
         result["reason"] = "nothing left to sell (already fully closed)"
@@ -994,37 +1142,36 @@ def execute_partial_sell(position, current_price: float, fraction: float) -> dic
                 "trade_id": None, "fill_price": None, "fill_qty": None}
 
     qty_to_sell = remaining * fraction
-    # Use the existing meta to detect whether this is the first partial. If yes,
-    # the post-sell block tightens the stop and sets partial_done=1; if no, the
-    # sell happens but notes are left alone (auto-trigger remains gated).
     meta_before = parse_entry_notes(position.notes)
     is_first_partial = not meta_before["partial_done"]
     label_n = "" if is_first_partial else f" ladder #{1 + sum(1 for s in prior_sells if 'partial profit take' in (s.notes or ''))}"
     label = f"partial profit take ({int(fraction * 100)}%){label_n}"
     res = execute_sell(position, current_price, label, qty_override=qty_to_sell)
     if not res["executed"]:
-        return res  # don't update notes if the sell didn't go through
+        return res
 
-    # Subsequent ladder calls: skip the stop-move / notes rewrite. Notes already
-    # carry partial_done=1 + tightened stop + preserved original_stop from call #1.
     if not is_first_partial:
         log.info("LADDER PARTIAL %s sold %.6f @ $%.6f (stop unchanged)",
                  position.symbol, qty_to_sell, current_price)
         return res
 
-    # Compute the new stop level. Two-component formula:
-    #   buffer (static minimum, e.g. +1% above entry)
-    #   lock-fraction × partial-gain (lock in part of what was captured)
-    # New stop = entry × (1 + max(buffer, gain × LF) / 100)
-    # Old behavior: just entry × (1 + buffer/100) — too tight when partial
-    # fired far above entry. NOTUSDT 2026-05-07 case: partial at +3.6% but
-    # stop only +1%, runner stopped giving back ~80% of partial's gain.
-    # `_f()` already falls back to DEFAULTS, so no `or X` fallback (which would
-    # silently coerce a legitimate 0.0 — the static-buffer-only escape hatch).
+    # `_f()` already falls back to DEFAULTS when a setting is missing, so we
+    # don't need an `or X.X` fallback (which would silently coerce a legitimate
+    # 0.0 — the documented "static buffer-only" escape hatch — to the default).
     try:
         buffer_pct = _f("crypto_breakeven_buffer_pct")
     except Exception:
         buffer_pct = 1.0
+    # NEW: lock in a fraction of the partial's gain on the runner.
+    # Old behavior: stop moved to entry+buffer% (a static "breakeven+1%").
+    #   Problem: if partial fired at +5%, runner's stop was still +1% → giving
+    #   back 4 of the 5pp captured by partial. NOTUSDT 2026-05-07 case was
+    #   partial at +3.6%, stop at +1%, runner stopped at +0.46% → kept only
+    #   1pp of the 3.6pp move on the runner half.
+    # New behavior: stop = entry × (1 + max(buffer, gain × lock_fraction)/100)
+    #   So if partial fired at +5% with lock_fraction=0.5, stop = +2.5%.
+    #   crypto_partial_lock_fraction=0 disables the lock and reverts to the
+    #   static buffer (so the `or` fallback below would silently break that).
     try:
         lock_fraction = _f("crypto_partial_lock_fraction")
     except Exception:
@@ -1045,16 +1192,12 @@ def execute_partial_sell(position, current_price: float, fraction: float) -> dic
     if position.notes:
         for token in position.notes.split("·"):
             token = token.strip()
-            # Skip our own structured tokens; keep anything that doesn't look like one
             if (token and not token.startswith(("stop=$", "target=$", "max_hold=", "exit=",
                                                  "original_stop=$", "PARTIAL DONE", "PAPER ENTRY",
                                                  "LIVE ENTRY"))
                 and token != "partial_done=1"):
-                entry_reason_text = token  # last matching one wins (the actual reason)
+                entry_reason_text = token
 
-    # Reconstruct the position notes with new stop + flags. Order matters:
-    # original_stop comes BEFORE the entry-reason text so the entry-reason is
-    # the last token (which is what the journal extracts).
     parts = [
         "PARTIAL DONE",
         f"stop=${_fmt_price(new_stop)}",

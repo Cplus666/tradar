@@ -1,5 +1,5 @@
 {% extends 'crypto_base.html' %}
-{% block title %}Settings · Tradar{% endblock %}
+{% block title %}Crypto Settings{% endblock %}
 
 {% block content %}
 <h1 class="text-xl font-semibold mb-4">Crypto settings</h1>
@@ -26,9 +26,10 @@
         <div class="text-zinc-600 mt-1 truncate" title="{{ health.last_sync_summary }}">{{ health.last_sync_summary }}</div>
       {% endif %}
     </div>
-    {# "Today's drawdown" panel removed: derived from stale last_sync.summary
-       regex parse, disagreed with the dashboard's live banner. Live drawdown
-       is on the dashboard already. #}
+    {# "Today's drawdown" panel removed: it derived `current_val` from a regex
+       parse of last_sync.summary which was minutes-to-hours stale, so the
+       number disagreed with the dashboard's live banner. Live drawdown is on
+       the dashboard already. #}
     <div class="bg-zinc-950 rounded p-3 {% if health.last_error_at %}border border-rose-800{% endif %}">
       <div class="text-zinc-500 uppercase tracking-wide mb-1">Last error</div>
       {% if health.last_error_at %}
@@ -56,11 +57,11 @@
     <div class="space-y-5">
     <h3 class="font-semibold border-b border-zinc-800 pb-2">Trading controls</h3>
     <div>
-      <label class="block text-sm font-semibold mb-1">Crypto kill switch</label>
-      <p class="text-xs text-zinc-500 mb-2">Independent of stock kill switch. ON = no crypto trades placed.</p>
+      <label class="block text-sm font-semibold mb-1">Pause new buys</label>
+      <p class="text-xs text-zinc-500 mb-2">ON = no new positions opened. Existing positions still managed (stops, targets, partial takes, manual sell all all still work). Use this to drain down without slamming exit.</p>
       <select name="crypto_kill_switch" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-64">
-        <option value="off" {% if kill_switch == 'off' %}selected{% endif %}>OFF — trading allowed</option>
-        <option value="on" {% if kill_switch == 'on' %}selected{% endif %}>ON — block all trades</option>
+        <option value="off" {% if kill_switch == 'off' %}selected{% endif %}>OFF — new buys allowed</option>
+        <option value="on" {% if kill_switch == 'on' %}selected{% endif %}>ON — block new buys (drain mode)</option>
       </select>
     </div>
 
@@ -106,7 +107,12 @@
     <div class="border-t border-zinc-800 pt-4">
       <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h4 class="text-xs font-semibold uppercase text-zinc-400 tracking-wide">Daily P&amp;L auto-halts (soft, auto-resume next MYT day)</h4>
-        {% if trading_mode == 'live' %}
+        <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+          <input type="checkbox" name="crypto_ghost_feature_enabled" value="on"
+                 {% if ghost_feature_enabled == 'on' %}checked{% endif %}
+                 class="w-3.5 h-3.5 rounded bg-zinc-950 border-zinc-700">
+          Ghost simulation
+        </label>
         <button type="submit"
                 formaction="{{ url_for('crypto.api_deposits_refresh') }}"
                 formmethod="post"
@@ -114,13 +120,6 @@
                 class="text-xs bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-3 py-1 rounded">
           ↻ Refresh deposit/withdraw
         </button>
-        {% endif %}
-        <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
-          <input type="checkbox" name="crypto_ghost_feature_enabled" value="on"
-                 {% if ghost_feature_enabled == 'on' %}checked{% endif %}
-                 class="w-3.5 h-3.5 rounded bg-zinc-950 border-zinc-700">
-          Ghost simulation
-        </label>
       </div>
       <p class="text-xs text-zinc-500 mb-3">When today's P&amp;L crosses the threshold, the bot <strong>sells all open positions</strong> and halts new entries until next MYT midnight. Auto-resumes — no manual reset.</p>
 
@@ -130,12 +129,15 @@
             <input type="checkbox" name="crypto_loss_halt_enabled" value="on"
                    {% if loss_halt_enabled == 'on' %}checked{% endif %}
                    class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
-            Enable loss halt
+            Enable min P&amp;L halt (floor)
           </label>
-          <label class="block text-xs font-semibold mb-1">Loss threshold (%)</label>
-          <input type="number" step="0.5" min="1" max="20" name="crypto_loss_halt_pct" value="{{ loss_halt_pct }}"
+          <label class="block text-xs font-semibold mb-1">Min P&amp;L (%) — signed</label>
+          <input type="number" step="0.05" min="-50" max="50" name="crypto_loss_halt_pct" value="{{ loss_halt_pct }}"
                  class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-          <p class="text-xs text-zinc-500 mt-1">If today P&amp;L ≤ −X%: sell all + halt.</p>
+          <p class="text-xs text-zinc-500 mt-1">
+            If today P&amp;L ≤ this: sell all + halt.<br>
+            <span class="text-zinc-600">e.g. <span class="mono">-5</span> = halt at −5% (loss protection); <span class="mono">+6</span> = halt at +6% (lock gains above 6%).</span>
+          </p>
         </div>
 
         <div>
@@ -143,12 +145,12 @@
             <input type="checkbox" name="crypto_profit_halt_enabled" value="on"
                    {% if profit_halt_enabled == 'on' %}checked{% endif %}
                    class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
-            Enable profit halt
+            Enable max P&amp;L halt (ceiling)
           </label>
-          <label class="block text-xs font-semibold mb-1">Profit threshold (%)</label>
-          <input type="number" step="0.5" min="1" max="20" name="crypto_profit_halt_pct" value="{{ profit_halt_pct }}"
+          <label class="block text-xs font-semibold mb-1">Max P&amp;L (%) — positive</label>
+          <input type="number" step="0.05" min="0.5" max="50" name="crypto_profit_halt_pct" value="{{ profit_halt_pct }}"
                  class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-          <p class="text-xs text-zinc-500 mt-1">If today P&amp;L ≥ +X%: sell all + halt (lock-in).</p>
+          <p class="text-xs text-zinc-500 mt-1">If today P&amp;L ≥ +X%: sell all + halt (take profit).</p>
         </div>
       </div>
 
@@ -158,7 +160,7 @@
         <div class="text-zinc-300 text-xs">
           {% if today_loss_halted == '1' %}Loss halt fired today. {% endif %}
           {% if today_profit_halted == '1' %}Profit halt fired today. {% endif %}
-          Auto-resumes at next MYT midnight.
+          Auto-resumes at next MYT midnight. (No manual action needed.)
         </div>
       </div>
       {% endif %}
@@ -229,7 +231,7 @@
     <div class="grid grid-cols-2 gap-3">
       <div>
         <label class="block text-xs font-semibold mb-1">Trigger (%)</label>
-        <input type="number" step="0.5" min="1" max="20" name="crypto_partial_take_trigger_pct" value="{{ partial_take_trigger_pct }}"
+        <input type="number" step="0.05" min="1" max="20" name="crypto_partial_take_trigger_pct" value="{{ partial_take_trigger_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
         <p class="text-xs text-zinc-500 mt-1">Fire at entry + this %</p>
       </div>
@@ -241,7 +243,7 @@
       </div>
       <div>
         <label class="block text-xs font-semibold mb-1">Stop buffer (%)</label>
-        <input type="number" step="0.5" min="0" max="10" name="crypto_breakeven_buffer_pct" value="{{ breakeven_buffer_pct }}"
+        <input type="number" step="0.05" min="0" max="10" name="crypto_breakeven_buffer_pct" value="{{ breakeven_buffer_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
         <p class="text-xs text-zinc-500 mt-1">Min new stop = entry + this %</p>
       </div>
@@ -260,20 +262,6 @@
       <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-8 py-2 rounded">Save settings</button>
     </div>
   </form>
-
-  {# === Paper deposit/withdraw — separate form so it can't nest inside settings form === #}
-  {% if trading_mode != 'live' %}
-  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-    <h3 class="text-sm font-semibold mb-3 text-amber-400">Paper deposit / withdraw</h3>
-    <form method="post" action="{{ url_for('crypto.api_paper_deposit') }}" class="flex items-center gap-3 flex-wrap">
-      <span class="text-xs text-zinc-500 mono">$</span>
-      <input type="number" step="0.01" name="amount" placeholder="100 or -50" required
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 w-36 mono text-zinc-200">
-      <button type="submit" class="text-xs bg-amber-700 hover:bg-amber-600 text-white px-4 py-1.5 rounded">Apply</button>
-      <span class="text-xs text-zinc-500">Positive = deposit, negative = withdrawal. Adds to today's daily total.</span>
-    </form>
-  </div>
-  {% endif %}
 
   {# === Below the settings form: API credentials + Server IP in a 2-col row === #}
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -299,12 +287,6 @@
     {% else %}
       <div class="bg-amber-950/20 border border-amber-800 rounded p-3 text-sm text-amber-300">
         ⚠ No keys saved. Paste your read-only Binance API keys below.
-      </div>
-      <div class="bg-zinc-950 border border-zinc-800 rounded p-3 text-sm text-zinc-300">
-        Don't have a Binance account yet?
-        <a href="https://www.binance.com/register?ref=127569393" target="_blank" rel="noopener"
-           class="text-amber-400 hover:text-amber-300 font-semibold underline">Sign up with referral code <span class="mono">127569393</span> →</a>
-        <div class="text-xs text-zinc-500 mt-1">Both you and I get a fee discount when you use this link.</div>
       </div>
     {% endif %}
 
@@ -366,11 +348,20 @@
       </div>
 
       <div class="mt-4 bg-amber-950/30 border border-amber-800 rounded p-3 text-xs text-amber-200 leading-relaxed">
-        <strong>⚠ VPN warning:</strong> If you're on a VPN, the IP can rotate between adjacent addresses (e.g. .11/.12/.13).
+        <strong>⚠ VPN warning:</strong> If you're on a VPN, the IP can rotate within the same /24 subnet.
         When that happens, your API calls fail with -2015 and trades stop firing.
         <br><br>
-        <strong>Recommendation:</strong> Add a small range to the Binance whitelist instead of just one IP. Suggested range:
-        <pre id="ip-range" class="mt-2 bg-zinc-950 p-2 rounded mono text-zinc-300 inline-block"></pre>
+        <strong>Binance limit:</strong> ~50 IPs per API key. Pick a range size that covers your VPN's rotation but fits the limit:
+        <div class="mt-2 flex items-center gap-2 flex-wrap">
+          <button onclick="setIpRange(5)"  class="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-2 py-1 rounded text-xs">±5 (11 IPs)</button>
+          <button onclick="setIpRange(20)" class="bg-amber-700 hover:bg-amber-600 text-white px-2 py-1 rounded text-xs">±20 (41 IPs) — recommended</button>
+          <button onclick="setIpRange(50)" class="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-2 py-1 rounded text-xs">±50 (101 IPs)</button>
+          <button onclick="copyIpRange()"  class="ml-auto bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-1 rounded text-xs">📋 Copy</button>
+          <span id="ip-range-copied" class="text-emerald-400 text-xs hidden">✓ Copied — paste into Binance whitelist field</span>
+        </div>
+        <textarea id="ip-range" readonly
+                  class="mt-2 bg-zinc-950 p-2 rounded mono text-zinc-300 w-full text-[10px] leading-tight"
+                  rows="4" placeholder="(populates after you reveal the IP)"></textarea>
       </div>
 
       <details class="text-xs text-zinc-500 mt-3">
@@ -414,14 +405,9 @@ function revealIp() {
       btn.disabled = false;
       btn.onclick = hideIp;
 
-      // Build range suggestion
-      const octets = data.ip.split('.');
-      if (octets.length === 4) {
-        const last = parseInt(octets[3]);
-        const base = octets.slice(0,3).join('.');
-        const range = [-2,-1,0,1,2].map(d => `${base}.${last + d}`).join('\n');
-        document.getElementById('ip-range').textContent = range;
-      }
+      // Default to ±20 (recommended)
+      window._lastIp = data.ip;
+      setIpRange(20);
     })
     .catch(e => {
       document.getElementById('ip-error').classList.remove('hidden');
@@ -443,6 +429,32 @@ function copyIp() {
     const t = document.getElementById('ip-copied');
     t.classList.remove('hidden');
     setTimeout(() => t.classList.add('hidden'), 2000);
+  });
+}
+// Build a range of IPs centered on the current outbound IP, clamped to [1,255].
+// Format: space-separated (Binance accepts that in a single whitelist field).
+function setIpRange(span) {
+  const ip = window._lastIp;
+  if (!ip) { return; }
+  const octets = ip.split('.');
+  if (octets.length !== 4) { return; }
+  const last = parseInt(octets[3]);
+  const base = octets.slice(0, 3).join('.');
+  const lo = Math.max(1, last - span);
+  const hi = Math.min(255, last + span);
+  const ips = [];
+  for (let i = lo; i <= hi; i++) {
+    ips.push(`${base}.${i}`);
+  }
+  document.getElementById('ip-range').value = ips.join(' ');
+}
+function copyIpRange() {
+  const ta = document.getElementById('ip-range');
+  if (!ta.value) { return; }
+  navigator.clipboard.writeText(ta.value).then(() => {
+    const t = document.getElementById('ip-range-copied');
+    t.classList.remove('hidden');
+    setTimeout(() => t.classList.add('hidden'), 3000);
   });
 }
 </script>

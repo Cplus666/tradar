@@ -1,18 +1,34 @@
 {% extends 'crypto_base.html' %}
-{% block title %}{{ symbol }} · Tradar{% endblock %}
+{% block title %}{{ symbol }} · Crypto{% endblock %}
 
 {% block extra_head %}
   <script src="{{ url_for('static', filename='plotly.min.js') }}"></script>
 {% endblock %}
 
 {% block content %}
+{# Price formatter with decimals tiered by price range. Avoids rounding loss on
+   small-cap alts (e.g. ICP at $3.6347 → was rounding to $3.63 in the old code). #}
+{% macro fmt_price(p) -%}
+  {%- if p is none -%}—
+  {%- elif p < 0.0001 -%}${{ "%.8f"|format(p) }}
+  {%- elif p < 0.01 -%}${{ "%.6f"|format(p) }}
+  {%- elif p < 1 -%}${{ "%.5f"|format(p) }}
+  {%- elif p < 10 -%}${{ "%.4f"|format(p) }}
+  {%- elif p < 1000 -%}${{ "%.3f"|format(p) }}
+  {%- else -%}${{ "%.2f"|format(p) }}{%- endif -%}
+{%- endmacro %}
 <div class="flex items-baseline gap-3 mb-4">
-  <h1 class="text-2xl font-semibold mono">{{ symbol }}</h1>
-  <div class="text-2xl mono num font-semibold">
-    {% if readout.last < 0.01 %}${{ "%.6f"|format(readout.last) }}
-    {% elif readout.last < 1 %}${{ "%.4f"|format(readout.last) }}
-    {% else %}${{ "%.2f"|format(readout.last) }}{% endif %}
-  </div>
+  {# Symbol → Binance trade page (e.g. ICPUSDT → ICP_USDT). Strip the 'USDT' suffix
+     and rejoin with underscore. Always opens in new tab. #}
+  <h1 class="text-2xl font-semibold mono">
+    <a href="https://www.binance.com/en/trade/{{ symbol[:-4] }}_USDT?type=spot"
+       target="_blank" rel="noopener"
+       class="hover:text-amber-400 transition-colors"
+       title="Open on Binance">
+      {{ symbol }} <span class="text-xs text-zinc-500 align-middle">↗</span>
+    </a>
+  </h1>
+  <div class="text-2xl mono num font-semibold">{{ fmt_price(readout.last) }}</div>
   <div class="text-lg mono num {% if readout.chg_pct > 0 %}pos{% elif readout.chg_pct < 0 %}neg{% endif %}">
     {{ "%+.2f"|format(readout.chg_pct) }}%
   </div>
@@ -34,17 +50,11 @@
   </div>
   <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
     <div class="text-xs text-zinc-500">SMA50</div>
-    <div class="text-lg mono num">
-      {% if readout.sma50 is not none %}
-        {% if readout.sma50 < 0.01 %}${{ "%.6f"|format(readout.sma50) }}{% elif readout.sma50 < 1 %}${{ "%.4f"|format(readout.sma50) }}{% else %}${{ "%.2f"|format(readout.sma50) }}{% endif %}
-      {% else %}—{% endif %}
-    </div>
+    <div class="text-lg mono num">{{ fmt_price(readout.sma50) }}</div>
   </div>
   <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
     <div class="text-xs text-zinc-500">20-bar high</div>
-    <div class="text-lg mono num">
-      {% if readout.prior_high20 < 0.01 %}${{ "%.6f"|format(readout.prior_high20) }}{% elif readout.prior_high20 < 1 %}${{ "%.4f"|format(readout.prior_high20) }}{% else %}${{ "%.2f"|format(readout.prior_high20) }}{% endif %}
-    </div>
+    <div class="text-lg mono num">{{ fmt_price(readout.prior_high20) }}</div>
   </div>
   <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
     <div class="text-xs text-zinc-500">Gap to high</div>

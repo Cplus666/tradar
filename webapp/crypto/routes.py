@@ -1,4 +1,4 @@
-"""Crypto workspace blueprint. URL prefix: /tradar."""
+"""Crypto workspace blueprint. URL prefix: /crypto."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from flask import Blueprint, abort, flash, jsonify, redirect, render_template, r
 
 from webapp.models import CryptoCoin, CryptoHolding, CryptoRun, CryptoTrade, Setting, db
 
-bp = Blueprint("crypto", __name__, url_prefix="/tradar", template_folder="templates")
+bp = Blueprint("crypto", __name__, url_prefix="/crypto", template_folder="templates")
 
 KEY_SETTING = "binance_api_key"
 SECRET_SETTING = "binance_api_secret"
@@ -25,34 +25,6 @@ STRATEGY_NAMES = (
     "pullback_uptrend",
     "oversold_meanrev",
 )
-
-
-# ---- Jinja template filters (registered app-wide via app_template_filter) ----
-
-@bp.app_template_filter("dt")
-def fmt_dt(value):
-    """UTC datetime → Malaysia Time string. All DB times are stored as UTC."""
-    if not value:
-        return ""
-    from datetime import timezone, timedelta
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    myt = value.astimezone(timezone(timedelta(hours=8)))
-    return myt.strftime("%Y-%m-%d %H:%M MYT")
-
-
-@bp.app_template_filter("money")
-def fmt_money(value):
-    if value is None:
-        return "—"
-    return f"${value:,.2f}"
-
-
-@bp.app_template_filter("pct")
-def fmt_pct(value):
-    if value is None:
-        return "—"
-    return f"{value:+.2f}%"
 
 
 def _setting(key: str, default: str = "") -> str:
@@ -76,36 +48,6 @@ def _binance_client(key: str | None = None, secret: str | None = None):
     """python-binance Client wrapped with our standard request timeouts."""
     from binance.client import Client
     return Client(key, secret, requests_params=_BINANCE_REQUEST_PARAMS)
-
-
-def _is_paper_mode() -> bool:
-    """True if the bot is currently in paper-trading mode.
-
-    Single source of truth — every view that filters CryptoTrade by is_paper
-    should call this and pass the result, so mode-switching is consistent
-    across dashboard / journal / charts / coin pages / notifications.
-    """
-    return _setting("crypto_trading_mode", "paper") == "paper"
-
-
-@bp.context_processor
-def _inject_mode_state():
-    """Make current mode + leftover other-mode position count available to
-    every template — used by the navbar to surface a "you also have N
-    positions in the other mode" warning so users don't lose track when
-    toggling between paper and live.
-    """
-    try:
-        from analysis.crypto_executor import _open_positions
-        is_paper = _is_paper_mode()
-        other_count = len(_open_positions(is_paper=(not is_paper)))
-    except Exception:
-        is_paper, other_count = True, 0
-    return {
-        "current_mode": "paper" if is_paper else "live",
-        "leftover_other_count": other_count,
-        "leftover_other_mode": "live" if is_paper else "paper",
-    }
 
 
 def _set_setting(key: str, value: str) -> None:
@@ -152,20 +94,15 @@ def _mask(s: str | None) -> str:
 def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     """Total account value, today's P&L (realized + unrealized), win rate.
 
-    Mode-aware:
-      - LIVE  → real Binance USDT balance + real position values
-      - PAPER → virtual wallet (starting_capital + cumulative realized + unrealized).
-                Public Binance ticker endpoint used for prices (no API key required).
-
     Today = since 00:00 MYT today. Pass prefetched_tickers to avoid duplicate fetch.
     """
     from datetime import timezone, timedelta
     from analysis.crypto_executor import _open_positions, parse_entry_notes
 
-    is_paper_mode = (_setting("crypto_trading_mode", "paper") == "paper")
-
-    # `starting_capital` = initial + Σ deposits/withdrawals before today.
-    # Only includes prior-day signed deposits; today's flow in tomorrow.
+    # `starting_capital` here = total contributed capital up to now (initial +
+    # deposits − withdrawals through prior days). Used for all_time_pnl which
+    # should ONLY reflect trading P&L, not contributions. _principal_at_day(today)
+    # excludes today's own deposits (they're in tomorrow's rollover).
     from analysis.crypto_executor import _principal_at_day
     from datetime import timezone as _tz_init, timedelta as _td_init
     _init_today_iso = (datetime.utcnow().replace(tzinfo=_tz_init.utc)
@@ -177,20 +114,42 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         "open_count": 0, "open_value": 0.0,
         "starting_capital": _principal_at_day(_init_today_iso),
         "all_time_pnl": 0.0,
-        "mode": "paper" if is_paper_mode else "live",
     }
 
-    # Optional Binance client. LIVE needs it for the real USDT balance;
-    # PAPER only needs it for ticker prices (and the public endpoint works
-    # without keys, so paper users with no keys still get a working dashboard).
-    client = None
-    acct = None
+    # Live USDT balance + ticker prices for open positions
     try:
         key, secret = get_binance_creds()
-        if key and secret:
-            client = _binance_client(key, secret)
+        if not key or not secret:
+            return out
+        client = _binance_client(key, secret)
+        acct = client.get_account()
+        usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
+        out["usdt_free"] = float(usdt["free"]) if usdt else 0.0
     except Exception:
-        client = None
+        return out
+
+    open_pos = _open_positions(is_paper=False)
+    open_value = 0.0
+    today_unrealized = 0.0
+    myt_now = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
+    today_start_utc = (myt_now.replace(hour=0, minute=0, second=0, microsecond=0)).astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Use prefetched tickers if caller provided (avoids duplicate Binance call)
+    if prefetched_tickers is not None:
+        all_tickers = prefetched_tickers
+    else:
+        try:
+            all_tickers = {t["symbol"]: float(t["price"]) for t in client.get_all_tickers()}
+        except Exception:
+            all_tickers = {}
+
+    # Sync the holdings table to whatever we just fetched live — keeps /crypto/holdings
+    # in lock-step with the dashboard. Cheap: no extra API calls, just DB writes.
+    try:
+        from analysis.binance_sync import persist_holdings_from_data
+        persist_holdings_from_data(acct.get("balances", []), all_tickers)
+    except Exception:
+        pass  # never let this break the dashboard
 
     # Fee rate — used to net both today's realized P&L and unrealized P&L
     # so dashboard numbers match journal + daily ROI chart conventions.
@@ -199,139 +158,35 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     except (TypeError, ValueError):
         fee_rate = 0.001
 
-    if not is_paper_mode:
-        # LIVE — real balance is required
-        if client is None:
-            return out  # no keys → can't show live balance
-        try:
-            acct = client.get_account()
-            usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
-            out["usdt_free"] = float(usdt["free"]) if usdt else 0.0
-        except Exception:
-            return out
-
-    # Open positions of THIS MODE
-    open_pos = _open_positions(is_paper=is_paper_mode)
-    open_value = 0.0
-    today_unrealized = 0.0
-    myt_now = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
-    today_start_utc = (myt_now.replace(hour=0, minute=0, second=0, microsecond=0)).astimezone(timezone.utc).replace(tzinfo=None)
-
-    # Tickers — public endpoint, no auth needed. Use authenticated client if we
-    # have one (cheaper API weight) but fall back to anonymous for paper users.
-    if prefetched_tickers is not None:
-        all_tickers = prefetched_tickers
-    else:
-        try:
-            tickers_client = client or _binance_client()
-            all_tickers = {t["symbol"]: float(t["price"]) for t in tickers_client.get_all_tickers()}
-        except Exception:
-            all_tickers = {}
-
-    # Sync real holdings table — LIVE only (paper has no real holdings to sync)
-    if not is_paper_mode and acct is not None:
-        try:
-            from analysis.binance_sync import persist_holdings_from_data
-            persist_holdings_from_data(acct.get("balances", []), all_tickers)
-        except Exception:
-            pass  # never let this break the dashboard
-
-    open_notional = 0.0  # used for paper "free virtual cash" calc
-    all_unrealized = 0.0  # unrealized across all open positions, NET of fees
     for p in open_pos:
         cur = all_tickers.get(p.symbol)
-        # Use REMAINING qty (handles positions that did partial profit-take).
-        # _open_positions attaches _remaining_qty; fall back to original p.qty
-        # for backward compat with positions that were tracked before the fix.
-        qty = float(getattr(p, "_remaining_qty", p.qty))
-        notional = float(p.price) * qty
-        open_notional += notional
         if cur is None:
-            value = notional
-            unr_net = 0.0
-        else:
-            value = cur * qty
-            sell_value = value
-            buy_value = notional
-            gross = sell_value - buy_value
-            fee = (buy_value + sell_value) * fee_rate    # round-trip estimate
-            unr_net = gross - fee                         # NET unrealized
+            continue
+        # Use REMAINING qty (post-partial-sells); falls back to original buy qty.
+        qty = float(getattr(p, "_remaining_qty", p.qty))
+        value = cur * qty
         open_value += value
-        all_unrealized += unr_net
-        if p.executed_at >= today_start_utc:
-            today_unrealized += unr_net
+        # Sum CURRENT unrealized P&L (vs entry, net of estimated round-trip
+        # fees) for ALL open positions — regardless of when they were opened.
+        # Matches the values shown on the dashboard position cards.
+        buy_value = float(p.price) * qty
+        sell_value = value
+        gross = sell_value - buy_value
+        fee = (buy_value + sell_value) * fee_rate
+        today_unrealized += gross - fee
     out["open_count"] = len(open_pos)
     out["open_value"] = open_value
+    out["account_value"] = out["usdt_free"] + open_value
 
-    # Today's realized P&L: pair BUY-SELL of THIS MODE where SELL closed today
-    from webapp.models import CryptoTrade
-    trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == is_paper_mode)
-              .order_by(CryptoTrade.executed_at).all())
-    by_sym: dict = {}
-    for t in trades:
-        if t.strategy == "manual_liquidation":
-            continue
-        by_sym.setdefault(t.symbol, []).append(t)
-    today_realized = 0.0
-    today_wins = today_losses = 0
-    all_realized = 0.0
-    # FIFO with REMAINING-QTY tracking — same as the journal builder so the
-    # dashboard total reconciles exactly with what's visible in the journal.
-    # Each SELL may consume only PART of the current BUY (partial profit-take)
-    # — we attribute pnl based on the consumed qty, not the full buy.qty.
-    for sym, ts in by_sym.items():
-        buys: list[list] = []  # [buy, remaining_qty]
-        for t in ts:
-            if t.side == "BUY":
-                buys.append([t, float(t.qty)])
-            elif t.side == "SELL" and buys:
-                sell_qty_remaining = float(t.qty)
-                while sell_qty_remaining > 1e-9 and buys:
-                    buy, buy_remaining = buys[0]
-                    consumed = min(buy_remaining, sell_qty_remaining)
-                    buys[0][1] -= consumed
-                    sell_qty_remaining -= consumed
-                    buy_value = float(buy.price) * consumed
-                    sell_value = float(t.price) * consumed
-                    gross = sell_value - buy_value
-                    fee = (buy_value + sell_value) * fee_rate
-                    pnl = gross - fee
-                    all_realized += pnl
-                    if t.executed_at >= today_start_utc:
-                        today_realized += pnl
-                        if pnl > 0: today_wins += 1
-                        else: today_losses += 1
-                    if buys[0][1] <= 1e-9:
-                        buys.pop(0)
-
-    # Account value & free-cash:
-    #   LIVE  → real free USDT + open positions value (already set above)
-    #   PAPER → virtual wallet: starting + cumulative realized + current unrealized
-    if is_paper_mode:
-        starting = 0.0
-        try:
-            starting = float(_setting("crypto_starting_capital_usd", "0") or 0)
-        except (TypeError, ValueError):
-            starting = 0.0
-        if starting <= 0:
-            starting = 10000.0  # paper sandbox default — generous so % moves
-                                # on small trades stay readable, and there's
-                                # room for max_concurrent positions at any
-                                # reasonable max_position_usd setting.
-        out["starting_capital"] = starting
-        out["account_value"] = starting + all_realized + all_unrealized
-        # Virtual free cash = starting + realized P&L − notional currently in positions
-        out["usdt_free"] = max(0.0, starting + all_realized - open_notional)
-    else:
-        out["account_value"] = (out["usdt_free"] or 0.0) + open_value
-
-    # Halt firing has been moved out of _account_summary — it now lives only
-    # in run_crypto_loop (15min) and run_fast_exit_check (30s). Without this
-    # change a dashboard refresh could call sell_all_open_positions in the
-    # middle of building its display snapshot, leaving today_unrealized and
-    # account_value pointing at positions that just got liquidated.
-    # day_start_value is recomputed below as the synth value.
+    # NOTE: _account_summary used to call update_day_start_and_check_halt here,
+    # but that triggered halt sells inside a function whose first job is to
+    # build a display snapshot. The halt's sell_all_open_positions ran AFTER
+    # we'd already computed open_value/today_unrealized/account_value above,
+    # so the dashboard would briefly show liquidated positions as still open
+    # (until the next 30s refresh). Halt firing now lives only in the loop
+    # paths (run_crypto_loop every 15 min, run_fast_exit_check every 30s) so
+    # _account_summary is a pure reader. day_start_value is overridden to the
+    # synth value below (out["day_start_value"] = synth_day_start).
     out["day_start_value"] = 0.0
     out["drawdown_pct"] = 0.0
     out["today_pnl_pct"] = 0.0
@@ -353,35 +208,96 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     except (TypeError, ValueError):
         out["profit_halt_pct"] = 5.0
 
+    # Today's realized P&L: pair BUY-SELL where SELL closed today
+    from webapp.models import CryptoTrade
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
+    by_sym: dict = {}
+    for t in trades:
+        if t.strategy == "manual_liquidation":
+            continue
+        by_sym.setdefault(t.symbol, []).append(t)
+    today_realized = 0.0
+    today_wins = today_losses = 0
+    all_realized = 0.0
+    # FIFO with REMAINING-QTY tracking — same as the journal builder so the
+    # dashboard total reconciles exactly with what's visible in the journal.
+    for sym, ts in by_sym.items():
+        buys: list[list] = []  # [buy, remaining_qty]
+        for t in ts:
+            if t.side == "BUY":
+                buys.append([t, float(t.qty)])
+            elif t.side == "SELL" and buys:
+                sell_qty_remaining = float(t.qty)
+                while sell_qty_remaining > 1e-9 and buys:
+                    buy, buy_remaining = buys[0]
+                    consumed = min(buy_remaining, sell_qty_remaining)
+                    buys[0][1] -= consumed
+                    sell_qty_remaining -= consumed
+                    _bq = float(buy.qty) or 1
+                    _sq = float(t.qty) or 1
+                    buy_value = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq)
+                    sell_value = float(t.quote_amount or float(t.price) * float(t.qty)) * (consumed / _sq)
+                    gross = sell_value - buy_value
+                    fee = (buy_value + sell_value) * fee_rate
+                    pnl = gross - fee
+                    all_realized += pnl
+                    if t.executed_at >= today_start_utc:
+                        today_realized += pnl
+                        if pnl > 0: today_wins += 1
+                        else: today_losses += 1
+                    if buys[0][1] <= 1e-9:
+                        buys.pop(0)
     # Today's P&L — designed to RECONCILE with account_value:
     #   today_realized   = trades closed today (sum of net P&L from FIFO)
     #   today_unrealized = current unrealized on ALL open positions (vs entry)
     #   today_total      = realized + unrealized
     #   day_start_value  = STARTING_CAPITAL + Σ realized P&L from closes BEFORE
-    #                      today MYT 00:00 (synthesized from trade history, not
-    #                      a snapshot of midnight account value).
-    # Reconciliation: account_value ≡ day_start_value + today_total. Always.
-    cumulative_realized_pre_today = all_realized - today_realized
+    #                      today MYT 00:00 (synthesized from trade history, NOT
+    #                      a snapshot of midnight account value)
+    #
+    # Why synthesize instead of snapshot? With this formula:
+    #   account_value = day_start_value + today_total   (always reconciles ✓)
+    # Because: account_value = principal + Σ all_realized + current_unrealized
+    #                       = principal + (Σ realized_pre_today + today_realized)
+    #                         + today_unrealized
+    #                       = day_start_value + today_total
+    #
+    # The "midnight account-value snapshot" is still saved in
+    # crypto_day_start_value_usd setting (used by halt logic) and
+    # crypto_daily_snapshots table (kept for halt rollover bookkeeping +
+    # deposit-correction work). We just don't use it as the today's-P&L
+    # denominator anymore — synthesis is cleaner and reproducible from trades.
     out["today_realized"] = today_realized
-    out["today_unrealized"] = all_unrealized       # sum across ALL open positions
-    out["today_total"] = today_realized + all_unrealized
     out["today_wins"] = today_wins
     out["today_losses"] = today_losses
     if today_wins + today_losses > 0:
         out["today_win_rate"] = today_wins / (today_wins + today_losses) * 100
     out["all_time_pnl"] = out["account_value"] - out["starting_capital"] if out["account_value"] else 0
-    # Override day_start_value with synthesized version so the math reconciles.
-    # Original snapshot is still readable from crypto_day_start_value_usd setting
-    # for the halt logic.
-    synth_day_start = out["starting_capital"] + cumulative_realized_pre_today
-    out["day_start_value"] = synth_day_start
-    if synth_day_start > 0 and out["account_value"] is not None:
-        out["today_total_pct"] = out["today_total"] / synth_day_start * 100
-        # today_pnl_pct uses (account - synth) so it matches what the halt
-        # logic compares against — fast-exit-check uses the same definition.
-        today_pnl_pct = (out["account_value"] - synth_day_start) / synth_day_start * 100
-        out["today_pnl_pct"] = today_pnl_pct
-        out["drawdown_pct"] = -today_pnl_pct if today_pnl_pct < 0 else 0.0
+
+    # Day-start: use the stored snapshot (set at midnight reset and updated when
+    # halt fires). This matches the actual Binance balance at the start of the day,
+    # so today_total = account_value - day_start is always the true daily P&L.
+    stored_day_start = 0.0
+    try:
+        stored_day_start = float(_setting("crypto_day_start_value_usd", "0") or 0)
+    except (TypeError, ValueError):
+        stored_day_start = 0.0
+    # Fall back to synth formula if no stored snapshot
+    if stored_day_start <= 0:
+        stored_day_start = out["starting_capital"] + (all_realized - today_realized)
+    out["day_start_value"] = stored_day_start
+
+    # today_total = actual account change since day start (simple, no formula drift)
+    today_total = (out["account_value"] - stored_day_start) if out["account_value"] else 0.0
+    # Unrealized = what's not yet realized (total minus closed-trade portion)
+    today_unrealized_derived = today_total - today_realized
+    out["today_total"] = today_total
+    out["today_unrealized"] = today_unrealized_derived
+
+    if stored_day_start > 0 and out["account_value"] is not None:
+        out["today_total_pct"] = today_total / stored_day_start * 100
+        out["today_pnl_pct"] = today_total / stored_day_start * 100
+        out["drawdown_pct"] = -out["today_pnl_pct"] if out["today_pnl_pct"] < 0 else 0.0
     else:
         out["today_total_pct"] = None
     out["all_time_pct"] = (out["all_time_pnl"] / out["starting_capital"] * 100) if out["starting_capital"] else None
@@ -391,19 +307,16 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
 def _open_position_cards(tickers: dict | None = None) -> list:
     """Position cards. If tickers=None, returns DB-only data with current=None.
 
-    Mode-aware: shows paper positions in PAPER mode, live positions in LIVE mode.
     Caller passes tickers dict (symbol → price) for the live version.
-
     P&L is NET of estimated round-trip fees (matches journal + daily ROI chart).
     """
     from analysis.crypto_executor import _open_positions, parse_entry_notes
-    is_paper_mode = (_setting("crypto_trading_mode", "paper") == "paper")
     try:
         fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
     except (TypeError, ValueError):
         fee_rate = 0.001
     out = []
-    for p in _open_positions(is_paper=is_paper_mode):
+    for p in _open_positions(is_paper=False):
         meta = parse_entry_notes(p.notes)
         cur = (tickers or {}).get(p.symbol)
         if cur is None:
@@ -425,7 +338,9 @@ def _open_position_cards(tickers: dict | None = None) -> list:
         else:
             gauge = 0.5
         # Net P&L — assumes you'll pay both buy + sell fees when this position closes.
-        # Use REMAINING qty (post-partial-sells); falls back to original buy qty.
+        # Use REMAINING qty (handles positions that did partial profit-take). Without
+        # this the dashboard P&L mismatches the journal: dashboard would compute on
+        # original buy qty (e.g. 5.36 LINK) while journal correctly tracks 4.02 LINK.
         qty = float(getattr(p, "_remaining_qty", p.qty))
         buy_value  = entry * qty
         sell_value = cur * qty
@@ -444,9 +359,9 @@ def _open_position_cards(tickers: dict | None = None) -> list:
             "gauge_pct": gauge * 100,  # 0-100 for CSS width
             "risk_pct": (entry - stop) / entry * 100,
             "reward_pct": (target - entry) / entry * 100,
-            # Partial-take state — let the dashboard show a "PARTIAL" badge and
-            # the original (pre-move) stop on positions that have already booked
-            # half their size.
+            # Partial-take state — let the dashboard show a "PARTIAL" badge
+            # and the original (pre-move) stop, so users can see at a glance
+            # which positions have already booked half their size.
             "partial_done": bool(meta.get("partial_done")),
             "original_stop": meta.get("original_stop"),
         })
@@ -455,16 +370,15 @@ def _open_position_cards(tickers: dict | None = None) -> list:
 
 
 def _strategy_breakdown() -> list:
-    """Per-strategy stats: trades, win rate, avg P&L, total. Mode-aware. NET
-    of fees so totals reconcile with dashboard, journal, and ROI graph."""
+    """Per-strategy stats: trades, win rate, avg P&L, total. NET of fees so the
+    totals reconcile with the dashboard card, journal, and ROI graph (which all
+    use the same fee_rate)."""
     from webapp.models import CryptoTrade
     try:
         fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
     except (TypeError, ValueError):
         fee_rate = 0.001
-    trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == _is_paper_mode())
-              .order_by(CryptoTrade.executed_at).all())
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -472,21 +386,23 @@ def _strategy_breakdown() -> list:
         by_sym.setdefault(t.symbol, []).append(t)
     by_strat: dict = {}
     for sym, ts in by_sym.items():
-        # FIFO with REMAINING-QTY tracking — partial sells must consume only
-        # the qty actually sold, not the whole buy.
-        buys: list[list] = []  # [trade, remaining_qty]
+        buys = []
         for t in ts:
             if t.side == "BUY":
                 buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
+                # FIFO with REMAINING-QTY tracking — partial sells consume only
+                # the qty actually sold, not the whole buy.
                 sell_qty_remaining = float(t.qty)
                 while sell_qty_remaining > 1e-9 and buys:
                     buy, buy_remaining = buys[0]
                     consumed = min(buy_remaining, sell_qty_remaining)
                     buys[0][1] -= consumed
                     sell_qty_remaining -= consumed
-                    buy_value = float(buy.price) * consumed
-                    sell_value = float(t.price) * consumed
+                    _bq = float(buy.qty) or 1
+                    _sq = float(t.qty) or 1
+                    buy_value = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq)
+                    sell_value = float(t.quote_amount or float(t.price) * float(t.qty)) * (consumed / _sq)
                     gross = sell_value - buy_value
                     fee = (buy_value + sell_value) * fee_rate
                     pnl_usd = gross - fee
@@ -560,10 +476,10 @@ def _daily_pnl(days: int = 30) -> list:
     today_myt = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(MYT).date()
     cutoff_myt = today_myt - timedelta(days=days - 1)  # window includes today
 
-    # Pull ALL trades of the current mode — buys may predate the window.
+    # Pull ALL real (non-paper) trades — buys may predate the window.
     # Manual liquidations are excluded so they don't pollute strategy P&L.
     trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == _is_paper_mode())
+              .filter(CryptoTrade.is_paper == False)
               .order_by(CryptoTrade.executed_at)
               .all())
 
@@ -587,8 +503,10 @@ def _daily_pnl(days: int = 30) -> list:
     # bar in the chart, including the oldest one.
     pre_window_pnl = 0.0
     for _sym, ts in by_sym.items():
-        # FIFO with REMAINING-QTY tracking — partial sells consume only the
-        # qty actually sold. Without this, ROI graph double-counts on partials.
+        # FIFO with REMAINING-QTY tracking — partial sells must consume only
+        # the qty actually sold, not the whole buy. Without this, daily ROI
+        # double-counts on partial-take + runner exits (buy popped on first
+        # sell, runner has nothing to pair with → P&L lost or doubled).
         buys: list[list] = []  # [trade, remaining_qty]
         for t in ts:
             if t.side == "BUY":
@@ -602,10 +520,12 @@ def _daily_pnl(days: int = 30) -> list:
                     consumed = min(buy_remaining, sell_qty_remaining)
                     buys[0][1] -= consumed
                     sell_qty_remaining -= consumed
-                    buy_price = float(buy.price)
-                    capital = buy_price * consumed
-                    gross_pnl = (sell_price - buy_price) * consumed
-                    fee = (capital + sell_price * consumed) * fee_rate
+                    _bq = float(buy.qty) or 1
+                    _sq = float(t.qty) or 1
+                    capital = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq)
+                    sell_proceeds = float(t.quote_amount or float(t.price) * float(t.qty)) * (consumed / _sq)
+                    gross_pnl = sell_proceeds - capital
+                    fee = (capital + sell_proceeds) * fee_rate
                     pnl = gross_pnl - fee
                     pnl_pct = ((pnl / capital) * 100) if capital > 0 else 0.0
                     if buys[0][1] <= 1e-9:
@@ -627,10 +547,16 @@ def _daily_pnl(days: int = 30) -> list:
                     else:
                         d["losses"] += 1
 
-    # Read existing snapshots and self-heal stale rows. Cache writes skipped
-    # when days > 90 to avoid 365-row write storms on long-window admin queries.
-    # The displayed value is always the freshly computed synth — cache is
-    # only an optimization for repeat dashboard polls.
+    # Read existing snapshot rows for the window. The synth day-start values
+    # are CACHED here — _daily_pnl writes them on first compute and re-uses on
+    # subsequent calls. Rows with source != 'synth' are stale (legacy backfill
+    # from an earlier semantics, or 'rollover' from before the synth migration)
+    # and get auto-overwritten with the freshly computed synth value.
+    #
+    # Cache writes are skipped when `days` > 90 — for long-window admin queries
+    # we still display the right values (computed below) but don't trigger a
+    # 365-row write storm that would lock the DB. The dashboard polls days=30,
+    # so the typical path always benefits from caching.
     from webapp.models import CryptoDailySnapshot, db
     cache_writes_enabled = days <= 90
     snap_start_iso = (today_myt - timedelta(days=days - 1)).isoformat()
@@ -643,10 +569,16 @@ def _daily_pnl(days: int = 30) -> list:
     except Exception:
         snapshots = {}
 
-    # Per-day principal — each day uses principal-as-of-that-day so deposits
-    # affect ONLY new days, never historical bars.
+    # Walk days oldest→newest. For each day, the synth day-start is the running
+    # value BEFORE that day's P&L is added. We always have the freshly computed
+    # value (running_value) — write it to the cache row if missing or stale,
+    # so subsequent queries hit the cache and tradar self-heals after git pull.
+    # Per-day principal: each day's synth uses the principal AS OF THAT DAY
+    # (initial + Σ deposits/withdrawals BEFORE that day). So when a deposit
+    # happens, only NEW days' bars use the new principal. Historical bars
+    # stay locked to the principal that was in effect when they happened.
     from analysis.crypto_executor import _principal_at_day
-    cumulative_realized = pre_window_pnl
+    cumulative_realized = pre_window_pnl  # Σ realized through prior days
     points = []
     rows_dirty = False
     for i in range(days - 1, -1, -1):
@@ -659,8 +591,11 @@ def _daily_pnl(days: int = 30) -> list:
         n = v["wins"] + v["losses"]
         avg_pct = (v["pct_sum"] / n) if n > 0 else 0.0
         return_pct = (v["pnl"] / v["capital"] * 100) if v["capital"] > 0 else 0.0
+        # Time-aware principal — varies across the chart if user deposited mid-window
         synth_day_start = _principal_at_day(date_iso) + cumulative_realized
 
+        # Cache read/write: deterministic from trades + deposits, so we can safely
+        # overwrite stale rows. Trust source='synth' rows; overwrite anything else.
         if cache_writes_enabled:
             snap = snapshots.get(date_iso)
             if snap is None:
@@ -670,16 +605,24 @@ def _daily_pnl(days: int = 30) -> list:
                     source="synth",
                 ))
                 rows_dirty = True
-            elif snap.source != "synth" or abs(float(snap.total_value_usd) - synth_day_start) > 0.01:
+            elif snap.source == "live":
+                # 'live' snapshot was written at midnight from actual Binance
+                # balance — more accurate than synth. Never overwrite it.
+                pass
+            elif abs(float(snap.total_value_usd) - synth_day_start) > 0.01:
                 snap.total_value_usd = round(synth_day_start, 4)
                 snap.source = "synth"
                 rows_dirty = True
-        day_start_value = synth_day_start
+        # Prefer 'live' snapshot when available; fall back to synth.
+        snap = snapshots.get(date_iso)
+        day_start_value = (float(snap.total_value_usd)
+                           if snap and snap.source == "live"
+                           else synth_day_start)
 
         portfolio_pct = (v["pnl"] / day_start_value * 100) if day_start_value > 0 else 0.0
         points.append({
             "date": date_iso,
-            "pnl": round(v["pnl"], 4),
+            "pnl": round(v["pnl"], 4),       # NET (after fees)
             "capital": round(v["capital"], 2),
             "fees": round(v["fees"], 4),
             "return_pct": round(return_pct, 3),
@@ -745,12 +688,13 @@ def _activity_summary(days: int = 7) -> dict:
     for sym, ts in by_symbol.items():
         # Skip manual liquidations (XVG sell wasn't a system trade)
         ts = [t for t in ts if t.strategy != "manual_liquidation"]
-        # FIFO with REMAINING-QTY tracking for partial sells.
-        buys: list[list] = []  # [trade, remaining_qty]
+        # Walk through pairing: each BUY consumed by next SELL on same symbol
+        buys = []
         for t in ts:
             if t.side == "BUY":
                 buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
+                # FIFO with REMAINING-QTY tracking for partial sells.
                 sell_qty_remaining = float(t.qty)
                 sell_price = float(t.price)
                 while sell_qty_remaining > 1e-9 and buys:
@@ -758,8 +702,10 @@ def _activity_summary(days: int = 7) -> dict:
                     consumed = min(buy_remaining, sell_qty_remaining)
                     buys[0][1] -= consumed
                     sell_qty_remaining -= consumed
-                    buy_value = float(buy.price) * consumed
-                    sell_value = sell_price * consumed
+                    _bq = float(buy.qty) or 1
+                    _sq = float(t.qty) or 1
+                    buy_value = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq)
+                    sell_value = float(t.quote_amount or float(t.price) * float(t.qty)) * (consumed / _sq)
                     gross = sell_value - buy_value
                     fee = (buy_value + sell_value) * fee_rate
                     pnl_usd = gross - fee
@@ -859,11 +805,9 @@ def api_manual_buy(symbol: str):
 
 @bp.route("/api/sell-position/<int:trade_id>", methods=["POST"])
 def api_sell_position(trade_id: int):
-    """Manually sell an open position by trade ID. Returns JSON result.
-    Mode-aware: paper mode looks up paper positions; live looks up live ones.
-    """
+    """Manually sell an open position by trade ID. Returns JSON result."""
     from analysis.crypto_executor import _open_positions, execute_sell
-    open_pos = {p.id: p for p in _open_positions(is_paper=_is_paper_mode())}
+    open_pos = {p.id: p for p in _open_positions(is_paper=False)}
     pos = open_pos.get(trade_id)
     if not pos:
         return jsonify({"ok": False, "reason": "position not found or already closed"}), 404
@@ -882,16 +826,9 @@ def api_sell_position(trade_id: int):
 
 @bp.route("/api/partial-sell-position/<int:trade_id>", methods=["POST"])
 def api_partial_sell_position(trade_id: int):
-    """Manually trigger a partial profit-take on an open position.
-
-    Body / query: `fraction` (float, 0 < f < 1) — defaults to crypto_partial_take_fraction
-    setting. Same logic as the auto-fired partial: sells `fraction × qty`,
-    moves stop to entry × (1 + crypto_breakeven_buffer_pct/100), marks
-    partial_done=1 so the auto-trigger won't double-fire.
-    """
+    """Manually trigger a partial profit-take on an open position."""
     from analysis.crypto_executor import _open_positions, execute_partial_sell, parse_entry_notes
 
-    # Parse fraction (form, JSON body, or query string — accept any)
     raw_fraction = (request.form.get("fraction")
                     or (request.get_json(silent=True) or {}).get("fraction")
                     or request.args.get("fraction"))
@@ -908,7 +845,7 @@ def api_partial_sell_position(trade_id: int):
     if not (0 < fraction < 1):
         return jsonify({"ok": False, "reason": f"fraction must be between 0 and 1 (got {fraction})"}), 400
 
-    open_pos = {p.id: p for p in _open_positions(is_paper=_is_paper_mode())}
+    open_pos = {p.id: p for p in _open_positions(is_paper=False)}
     pos = open_pos.get(trade_id)
     if not pos:
         return jsonify({"ok": False, "reason": "position not found or already closed"}), 404
@@ -933,6 +870,9 @@ def api_partial_sell_position(trade_id: int):
 def api_dashboard_static():
     """FAST endpoint — DB-only data. No Binance calls. Used for instant render.
 
+    Imports _starting_capital here (not at module top) to keep the import
+    graph the same as _account_summary's existing pattern.
+
     Account values that need Binance (account_value, usdt_free, today_unrealized)
     return None — JS fetches /api/dashboard separately to fill them in.
     """
@@ -943,15 +883,13 @@ def api_dashboard_static():
     myt_now = datetime.utcnow().replace(tzinfo=_tz.utc).astimezone(_tz(_td(hours=8)))
     today_iso_static = myt_now.date().isoformat()
     today_start_utc = (myt_now.replace(hour=0, minute=0, second=0, microsecond=0)).astimezone(_tz.utc).replace(tzinfo=None)
-    # Match LIVE endpoint NET-of-fees calc — was GROSS before, causing today_realized
-    # to briefly differ on each refresh as the live endpoint took over.
+    # Match the LIVE endpoint's NET-of-fees calc (gross was returned here previously,
+    # making today_realized briefly jump on each refresh as the live endpoint took over).
     try:
         fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
     except (TypeError, ValueError):
         fee_rate = 0.001
-    trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == _is_paper_mode())
-              .order_by(CryptoTrade.executed_at).all())
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -973,8 +911,10 @@ def api_dashboard_static():
                     consumed = min(buy_remaining, sell_qty_remaining)
                     buys[0][1] -= consumed
                     sell_qty_remaining -= consumed
-                    buy_value = float(buy.price) * consumed
-                    sell_value = float(t.price) * consumed
+                    _bq = float(buy.qty) or 1
+                    _sq = float(t.qty) or 1
+                    buy_value = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq)
+                    sell_value = float(t.quote_amount or float(t.price) * float(t.qty)) * (consumed / _sq)
                     gross = sell_value - buy_value
                     fee = (buy_value + sell_value) * fee_rate
                     pnl = gross - fee
@@ -984,8 +924,9 @@ def api_dashboard_static():
                         else: today_losses += 1
                     if buys[0][1] <= 1e-9:
                         buys.pop(0)
-    # Halt-banner fields populated from settings so the banner doesn't flicker
-    # off during the static-render window (JS reads === true strictly).
+    # Halt-banner fields populated from settings (no Binance call needed) so
+    # the banner doesn't flicker off during the static-render window. JS reads
+    # `=== true` strictly, so undefined values would have hidden the banner.
     try:
         loss_halt_pct = float(_setting("crypto_loss_halt_pct", "5.0"))
     except (TypeError, ValueError):
@@ -1004,6 +945,7 @@ def api_dashboard_static():
         "open_count": len(cards), "open_value": 0.0,
         "starting_capital": _principal_at_day(today_iso_static),
         "all_time_pnl": 0.0, "all_time_pct": None,
+        # Halt state — readable from settings without Binance.
         "loss_halted_today": (_setting("crypto_today_loss_halted", "0") == "1"),
         "profit_halted_today": (_setting("crypto_today_profit_halted", "0") == "1"),
         "loss_halt_overridden": (_setting("crypto_today_loss_overridden", "0") == "1"),
@@ -1029,7 +971,6 @@ def api_dashboard():
         tickers = {t["symbol"]: float(t["price"]) for t in _binance_client().get_all_tickers()}
         binance_ok = True
     except Exception as e:
-        # Wedged socket / DNS hiccup / Binance outage / rate limit — handled below.
         import logging
         logging.getLogger("crypto").warning("api_dashboard: binance fetch failed: %s", e)
 
@@ -1042,7 +983,6 @@ def api_dashboard():
         _DASHBOARD_CACHE["ts"] = datetime.utcnow().isoformat() + "Z"
         return jsonify(payload)
 
-    # Binance unreachable — serve last good payload if we have one.
     cached = _DASHBOARD_CACHE.get("payload")
     if cached is not None:
         stale_payload = dict(cached)
@@ -1051,7 +991,6 @@ def api_dashboard():
         stale_payload["stale_since"] = _DASHBOARD_CACHE.get("ts")
         return jsonify(stale_payload)
 
-    # No cache yet (first dashboard load failed) — fall back to DB-only render.
     account = _account_summary(prefetched_tickers={})
     cards = _open_position_cards(tickers={})
     return jsonify({"account": account, "position_cards": cards,
@@ -1061,8 +1000,10 @@ def api_dashboard():
 @bp.route("/api/daily-pnl")
 def api_daily_pnl():
     """Daily realized P&L points for the dashboard ROI bar chart.
-    Replaces server-rendered Jinja injection so the chart can refresh in place
-    without a full page reload. Frontend polls this every 30s."""
+
+    Replaces the previous server-rendered Jinja injection so the chart can
+    refresh without a full page reload. Frontend polls this every 30s.
+    """
     try:
         days = int(request.args.get("days", "30"))
     except (TypeError, ValueError):
@@ -1078,7 +1019,7 @@ def api_recent_trades():
     since_id = int(flask_request.args.get("since_id", 0))
     trades = (
         CryptoTrade.query
-        .filter(CryptoTrade.id > since_id, CryptoTrade.is_paper == _is_paper_mode())
+        .filter(CryptoTrade.id > since_id, CryptoTrade.is_paper == False)
         .order_by(CryptoTrade.id)
         .limit(20).all()
     )
@@ -1088,7 +1029,7 @@ def api_recent_trades():
             "price": float(t.price), "qty": float(t.qty),
             "quote": float(t.quote_amount or 0),
             "strategy": t.strategy or "?",
-            "ts": t.executed_at.isoformat(),
+            "ts": t.executed_at.isoformat() + "Z",
         }
         for t in trades
     ])
@@ -1103,15 +1044,12 @@ _STRUCTURED_NOTES_PREFIXES = (
 def _extract_entry_reason(notes: str | None, strategy_fallback: str | None = None) -> str:
     """Pull the human-readable entry reason out of a position's notes string.
 
-    Notes are stored as `· · ·`-joined tokens, mixing structured fields
-    (stop=$X, target=$Y, partial_done=1, original_stop=$Z, etc.) with one
-    free-text reason like "fresh breakout +4.2%, vol=1.6x, RSI=67". The
-    naive `notes.split("·")[-1]` grabs whichever token is last — after a
-    partial-take rewrite that's `original_stop=$X`, NOT the entry reason.
-
-    This walks the tokens and returns the LAST one that doesn't match a
-    structured prefix. If nothing free-text is found, falls back to the
-    strategy name (so the journal still shows something meaningful).
+    Notes mix structured tokens (stop=$X, partial_done=1, etc.) with one
+    free-text reason like "fresh breakout +4.2%, vol=1.6x, RSI=67". The naive
+    `notes.split("·")[-1]` grabs whichever token is last — after a partial-take
+    rewrite that's `original_stop=$X`, NOT the entry reason. This walks the
+    tokens and returns the LAST one that doesn't match a structured prefix.
+    Falls back to strategy name when no free-text reason is available.
     """
     fallback = (strategy_fallback or "").strip()
     if not notes:
@@ -1132,7 +1070,6 @@ def _extract_entry_reason(notes: str | None, strategy_fallback: str | None = Non
 def _build_journal_entries(include_live_prices: bool = True) -> dict:
     """Build journal entries (open + closed). Returns dict with totals + entries.
 
-    Mode-aware: shows paper trades in PAPER mode, live trades in LIVE mode.
     Heavy: makes a Binance API call for live prices on open positions.
     """
     from analysis.crypto_executor import parse_entry_notes
@@ -1143,9 +1080,7 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
     except (TypeError, ValueError):
         fee_rate = 0.001
 
-    trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == _is_paper_mode())
-              .order_by(CryptoTrade.executed_at).all())
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -1155,10 +1090,7 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
     closed_entries = []
     open_entries = []
     for sym, ts in by_sym.items():
-        # FIFO with REMAINING-QTY tracking: a SELL may consume only PART of the
-        # current BUY (partial profit-take). The unconsumed remainder of the BUY
-        # stays "open" with a tightened stop. Each partial creates its OWN
-        # closed-entry row with its own qty.
+        # FIFO with REMAINING-QTY tracking — handles partial sells correctly.
         buys: list[list] = []  # each entry: [buy_trade, remaining_qty]
         for t in ts:
             if t.side == "BUY":
@@ -1171,9 +1103,9 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
                     consumed = min(buy_remaining, sell_qty_remaining)
                     buys[0][1] -= consumed
                     sell_qty_remaining -= consumed
-                    # Create a closed-entry row for THIS chunk (consumed qty)
                     meta = parse_entry_notes(buy.notes)
-                    buy_value = float(buy.price) * consumed
+                    _bq3 = float(buy.qty) or 1
+                    buy_value = float(buy.quote_amount or float(buy.price) * float(buy.qty)) * (consumed / _bq3)
                     sell_value = sell_price * consumed
                     # Dust filter (matches the open-positions path): when a SELL
                     # consumes a tiny BUY residual left by lot-step rounding on a
@@ -1193,38 +1125,34 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
                         parts = t.notes.split("·", 1)
                         exit_reason = parts[1].strip() if len(parts) > 1 else t.notes.strip()
                     is_partial_fill = consumed < float(buy.qty)
-                    # Each closed-entry row should show the stop that was
-                    # ACTIVE during its segment of the position:
-                    #   - PARTIAL sell event → original_stop (active until partial fired)
-                    #   - RUNNER sell after partial → current stop (active after move)
-                    #   - Regular full sell → current stop (no movement)
+                    # Each closed-entry row shows the stop active during ITS segment.
                     is_partial_event = "partial profit take" in (exit_reason or "")
                     has_partial_history = meta["original_stop"] is not None
                     if is_partial_event and has_partial_history:
-                        seg_stop = meta["original_stop"]     # what was active up to partial
-                        seg_moved_to = meta["stop"]           # → moved to this after partial
+                        seg_stop = meta["original_stop"]
+                        seg_moved_to = meta["stop"]
                         seg_prior = None
                     elif has_partial_history:
-                        seg_stop = meta["stop"]               # tightened stop on runner
+                        seg_stop = meta["stop"]
                         seg_moved_to = None
-                        seg_prior = meta["original_stop"]     # was this before partial
+                        seg_prior = meta["original_stop"]
                     else:
                         seg_stop = meta["stop"]
                         seg_moved_to = None
                         seg_prior = None
                     closed_entries.append({
                         "is_open": False,
-                        "is_partial": is_partial_fill,    # mark for UI ("partial" badge)
+                        "is_partial": is_partial_fill,
                         "symbol": sym, "strategy": buy.strategy,
-                        "entry_at": buy.executed_at.isoformat(),
-                        "exit_at":  t.executed_at.isoformat(),
+                        "entry_at": buy.executed_at.isoformat() + "Z",
+                        "exit_at":  t.executed_at.isoformat() + "Z",
                         "entry_price": float(buy.price), "exit_price": sell_price,
                         "qty": consumed, "notional": buy_value,
                         "entry_value": buy_value, "exit_value": sell_value,
                         "stop": seg_stop, "target": meta["target"],
-                        "stop_moved_to": seg_moved_to,    # set on partial-sell card → "→ moved to $X"
-                        "stop_was": seg_prior,            # set on runner card → "(was $X before partial)"
-                        "original_stop": meta["original_stop"],   # raw value for any future use
+                        "stop_moved_to": seg_moved_to,
+                        "stop_was": seg_prior,
+                        "original_stop": meta["original_stop"],
                         "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
                         "fee_usd": round(fee_usd, 4),
                         "gross_pnl_usd": round(gross_pnl_usd, 4),
@@ -1234,9 +1162,8 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
                     })
                     if buys[0][1] <= 1e-9:
                         buys.pop(0)
-        # Remaining buys (with positive remaining_qty) are still-open positions.
-        # Apply dust filter (matches _open_positions): residuals worth < $1 are
-        # rounding remnants from prior sells and should NOT show as journal entries.
+        # Remaining buys (positive qty) are still-open. Apply dust filter
+        # (matches _open_positions): residuals < $1 are rounding remnants.
         for buy, remaining_qty in buys:
             if remaining_qty <= 1e-9:
                 continue
@@ -1247,16 +1174,16 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
             held_h = (datetime.utcnow() - buy.executed_at).total_seconds() / 3600
             open_entries.append({
                 "is_open": True,
-                "is_partial": remaining_qty < float(buy.qty),  # runner = partial sold
+                "is_partial": remaining_qty < float(buy.qty),
                 "symbol": sym, "strategy": buy.strategy,
-                "entry_at": buy.executed_at.isoformat(), "exit_at": None,
+                "entry_at": buy.executed_at.isoformat() + "Z", "exit_at": None,
                 "entry_price": float(buy.price), "exit_price": None,
                 "qty": remaining_qty, "notional": entry_value,
                 "entry_value": entry_value, "exit_value": None,
                 "stop": meta["stop"], "target": meta["target"],
-                "original_stop": meta["original_stop"],   # for journal display
+                "original_stop": meta["original_stop"],
                 "pnl_pct": None, "pnl_usd": None, "held_h": held_h,
-                "entry_reason": (buy.notes or "").split("·")[-1].strip() if buy.notes else "",
+                "entry_reason": _extract_entry_reason(buy.notes, buy.strategy),
                 "exit_reason": None,
             })
 
@@ -1325,7 +1252,6 @@ def api_journal():
     def _myt_date(iso: str | None):
         if not iso:
             return None
-        # entry_at/exit_at are naive UTC ISO strings written by .isoformat()
         from datetime import datetime as _dt
         try:
             dt = _dt.fromisoformat(iso)
@@ -1361,8 +1287,8 @@ def api_journal():
         "open_count": len(open_filtered),
         "closed_count": len(closed_filtered),
         "realized_pnl": sum(e["pnl_usd"] for e in closed_filtered),  # net of fees
-        "unrealized_pnl": 0,  # not yet known — will be updated after price fetch
-        "open_symbols": open_symbols,  # tells JS which to fetch live prices for
+        "unrealized_pnl": 0,
+        "open_symbols": open_symbols,
         "fee_rate": fee_rate,  # JS uses this to deduct estimated fees in live updates
         "selected_date": selected_date.isoformat(),
         "today_date": today_myt.isoformat(),
@@ -1389,42 +1315,12 @@ def api_journal_prices():
 
 @bp.route("/holdings")
 def holdings():
-    from analysis.crypto_executor import _open_positions
-    is_paper = _is_paper_mode()
-
-    if is_paper:
-        # Paper mode has no real wallet to sync — what the bot "owns" IS the
-        # set of open paper positions. Synthesize rows in CryptoHolding shape
-        # so the template doesn't have to care about mode.
-        # NO live-price fetch here — JS lazy-loads via /api/journal/prices and
-        # updates the DOM in place. Initial render uses ENTRY price as
-        # placeholder so totals render immediately instead of blocking on a
-        # ~1-3s Binance call.
-        from types import SimpleNamespace
-        now = datetime.utcnow()
-        rows = []
-        for p in _open_positions(is_paper=True):
-            asset = p.symbol[:-4] if p.symbol.endswith("USDT") else p.symbol
-            # _remaining_qty reflects post-partial-sell qty; falls back to p.qty.
-            qty = float(getattr(p, "_remaining_qty", p.qty))
-            entry_price = float(p.price)
-            rows.append(SimpleNamespace(
-                asset=asset, free=qty, locked=0.0,
-                last_price_usd=entry_price,        # placeholder; JS will update
-                value_usd=entry_price * qty,       # placeholder; JS will update
-                fetched_at=now,
-                _is_paper=True,                    # template can flag "live price loading"
-                _symbol=p.symbol,                  # full pair for JS price lookup
-            ))
-        rows.sort(key=lambda r: r.value_usd or 0, reverse=True)
-    else:
-        rows = CryptoHolding.query.order_by(CryptoHolding.value_usd.desc().nullslast()).all()
+    from analysis.crypto_executor import _open_positions, parse_entry_notes
+    rows = CryptoHolding.query.order_by(CryptoHolding.value_usd.desc().nullslast()).all()
     total = sum((r.value_usd or 0) for r in rows)
-
-    # Map asset (e.g. "DOGE") → open position trade ID, so the page can show a Sell button
-    from analysis.crypto_executor import parse_entry_notes
+    # Map asset (e.g. "DOGE") → open position trade ID, so the holdings page can show a Sell button
     open_pos_by_asset = {}
-    for p in _open_positions(is_paper=is_paper):
+    for p in _open_positions(is_paper=False):
         # Strip the trading-quote suffix to get the base asset (DOGEUSDT → DOGE)
         if p.symbol.endswith("USDT"):
             asset = p.symbol[:-4]
@@ -1434,12 +1330,11 @@ def holdings():
                 "symbol": p.symbol,
                 "entry_price": float(p.price),
                 "strategy": p.strategy,
-                "partial_done": meta.get("partial_done", False),  # disable Partial btn if true
+                "partial_done": meta.get("partial_done", False),
             }
     return render_template(
         "crypto_holdings.html",
         rows=rows, total=total,
-        is_paper_mode=is_paper,
         has_keys=_has_binance_keys(),
         open_pos_by_asset=open_pos_by_asset,
     )
@@ -1592,14 +1487,14 @@ def coin_detail(symbol: str):
 
     # Existing position? Use the proper net-quantity logic (BUYs - SELLs, dust-filtered)
     from analysis.crypto_executor import _open_positions
-    open_pos = next((p for p in _open_positions(is_paper=_is_paper_mode()) if p.symbol == symbol), None)
+    open_pos = next((p for p in _open_positions(is_paper=False) if p.symbol == symbol), None)
     has_position = open_pos is not None
     position_info = None
     if open_pos:
-        # _open_positions attaches _remaining_qty (post-partial-sells); use it
-        # so the coin page matches the journal after a partial profit-take.
-        # P&L is NET of fees — was GROSS, causing this page to differ from
-        # every other surface (dashboard card, journal, ROI graph).
+        # _open_positions attaches _remaining_qty (post-partial-sells); use it so
+        # the coin page matches the journal after a partial profit-take.
+        # P&L is NET of fees (matches dashboard card, journal, ROI graph) — was
+        # GROSS before, causing this page to differ from every other surface.
         try:
             _coin_fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
         except (TypeError, ValueError):
@@ -1637,7 +1532,7 @@ def coin_detail(symbol: str):
 
     trades_in_window = (
         CryptoTrade.query
-        .filter(CryptoTrade.symbol == symbol, CryptoTrade.is_paper == _is_paper_mode())
+        .filter(CryptoTrade.symbol == symbol, CryptoTrade.is_paper == False)
         .filter(CryptoTrade.executed_at >= chart_start_ts)
         .order_by(CryptoTrade.executed_at)
         .all()
@@ -1656,7 +1551,7 @@ def coin_detail(symbol: str):
             "qty": float(t.qty),
             "quote": float(t.quote_amount or 0),
             "strategy": t.strategy or "?",
-            "ts_iso": t.executed_at.isoformat(),
+            "ts_iso": t.executed_at.isoformat() + "Z",
         })
 
     return render_template(
@@ -1729,7 +1624,6 @@ def settings():
         "crypto_max_position_usd", "crypto_max_concurrent",
         "crypto_min_balance_usd",
         "crypto_loop_interval_min", "crypto_fast_check_interval_sec",
-        # Partial profit-take controls
         "crypto_partial_take_enabled",
         "crypto_partial_take_trigger_pct",
         "crypto_partial_take_fraction",
@@ -1740,9 +1634,6 @@ def settings():
         "crypto_ghost_feature_enabled",
     )
     if request.method == "POST":
-        # Checkboxes only POST when checked. The settings form sends a hidden
-        # marker so we can detect submit-but-unchecked and coerce to "off"
-        # for any tickbox setting.
         if request.form.get("settings_form_present") == "1":
             if "crypto_partial_take_enabled" not in request.form:
                 _set_setting("crypto_partial_take_enabled", "off")
@@ -1813,21 +1704,17 @@ def settings():
             flash("Crypto settings updated", "ok")
         return redirect(url_for("crypto.settings"))
     key, secret = get_binance_creds()
-
-    # System health snapshot — single panel so user doesn't have to grep logs.
     health = _system_health()
-
-    # Per-strategy toggles — current disabled set, plus the ordered name list
-    # the template renders.
     disabled_csv = _setting("crypto_disabled_strategies", "")
     disabled_strategies = {s.strip() for s in disabled_csv.split(",") if s.strip()}
-
     return render_template(
         "crypto_settings.html",
         kill_switch=_setting("crypto_kill_switch", "off"),
         trading_mode=_setting("crypto_trading_mode", "paper"),
         max_position_usd=_setting("crypto_max_position_usd", "50"),
         max_concurrent=_setting("crypto_max_concurrent", "2"),
+        day_start_value_usd=_setting("crypto_day_start_value_usd", "0"),
+        day_start_date=_setting("crypto_day_start_date", ""),
         min_balance_usd=_setting("crypto_min_balance_usd", "100"),
         loop_interval_min=_setting("crypto_loop_interval_min", "15"),
         fast_check_interval_sec=_setting("crypto_fast_check_interval_sec", "60"),
@@ -1843,8 +1730,6 @@ def settings():
         today_loss_halted=_setting("crypto_today_loss_halted", "0"),
         today_profit_halted=_setting("crypto_today_profit_halted", "0"),
         ghost_feature_enabled=_setting("crypto_ghost_feature_enabled", "on"),
-        day_start_value_usd=_setting("crypto_day_start_value_usd", "0"),
-        day_start_date=_setting("crypto_day_start_date", ""),
         health=health,
         strategy_names=STRATEGY_NAMES,
         disabled_strategies=disabled_strategies,
@@ -1857,8 +1742,8 @@ def settings():
 def _system_health() -> dict:
     """Snapshot of running-system state for the Settings page health panel.
 
-    Aggregates: scheduler next fire, last sync, last error, current peak,
-    drawdown vs peak. All best-effort — missing data renders as None.
+    Aggregates: scheduler next fire, last sync, last error, today's start
+    value + daily drawdown. All best-effort — missing data renders as None.
     """
     from datetime import timezone, timedelta
     MYT = timezone(timedelta(hours=8))
@@ -1867,7 +1752,6 @@ def _system_health() -> dict:
         if dt is None:
             return None
         if dt.tzinfo is None:
-            # Scheduler's get_next_run returns tz-aware; CryptoRun.started_at is naive UTC
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(MYT).strftime("%Y-%m-%d %H:%M:%S MYT")
 
@@ -1884,7 +1768,6 @@ def _system_health() -> dict:
                          or _setting("crypto_profit_halt_enabled", "off") == "on"),
     }
 
-    # Scheduler next fires
     try:
         from webapp.scheduler import get_next_run
         health["next_loop_fire"] = _to_myt(get_next_run("crypto_loop"))
@@ -1892,7 +1775,7 @@ def _system_health() -> dict:
     except Exception:
         pass
 
-    # Last sync run (kind='sync')
+    last_sync = None
     try:
         last_sync = (CryptoRun.query.filter_by(kind="sync", status="ok")
                      .order_by(CryptoRun.id.desc()).first())
@@ -1902,7 +1785,6 @@ def _system_health() -> dict:
     except Exception:
         pass
 
-    # Most recent error (any kind)
     try:
         last_err = (CryptoRun.query.filter_by(status="error")
                     .order_by(CryptoRun.id.desc()).first())
@@ -1912,13 +1794,10 @@ def _system_health() -> dict:
     except Exception:
         pass
 
-    # Today's start-of-day value + current daily drawdown
     try:
         day_start = float(_setting("crypto_day_start_value_usd", "0") or 0)
         if day_start > 0:
             health["day_start_value"] = day_start
-            # Latest account value from the most recent sync summary.
-            # Format: "synced N real + M dust assets, total value $XXX.XX"
             import re
             if last_sync and last_sync.summary:
                 m = re.search(r"total value \$(\d+\.\d+)", last_sync.summary)
@@ -1934,19 +1813,32 @@ def _system_health() -> dict:
 @bp.route("/api/snapshots/backfill", methods=["POST"])
 def api_snapshots_backfill():
     """One-shot: seed crypto_daily_snapshots from historical CryptoRun summaries.
-    Returns: {"ok": True, "inserted": N, "skipped_existing": M, "scanned": K}"""
+
+    Sync runs (kind='sync', status='ok') log strings like
+    "synced N real + M dust assets, total value $XXX.XX". For each MYT day,
+    we pick the EARLIEST sync (closest to MYT midnight) as the day-start
+    approximation and insert it as a 'backfill' source snapshot. Existing
+    rows (e.g. real rollover snapshots) are NOT overwritten — backfill only
+    fills gaps.
+
+    Returns: {"ok": True, "inserted": N, "skipped_existing": M, "scanned": K}
+    """
     from datetime import timezone, timedelta
     from webapp.models import CryptoDailySnapshot, CryptoRun, db
     import re
     MYT = timezone(timedelta(hours=8))
     pattern = re.compile(r"total value \$([\d,]+\.\d+)")
+
     runs = (CryptoRun.query
             .filter(CryptoRun.kind == "sync",
                     CryptoRun.status == "ok",
                     CryptoRun.summary.isnot(None))
             .order_by(CryptoRun.started_at.asc())
             .all())
-    earliest_per_day: dict = {}
+
+    # For each MYT date, take the EARLIEST sync we can parse — that's the
+    # closest proxy for "value at start of that day."
+    earliest_per_day: dict = {}  # date_iso → total_value_usd
     scanned = 0
     for r in runs:
         if not r.summary:
@@ -1965,6 +1857,9 @@ def api_snapshots_backfill():
                     .astimezone(MYT).date().isoformat())
         if date_iso not in earliest_per_day:
             earliest_per_day[date_iso] = value
+
+    # Bulk-check existing rows so we know what to skip without per-iteration
+    # round-trips.
     existing_dates = {s.date for s in CryptoDailySnapshot.query.all()}
     inserted = 0
     skipped = 0
@@ -1977,7 +1872,7 @@ def api_snapshots_backfill():
             total_value_usd=value,
             usdt_free=None,
             open_value_usd=None,
-            deposits_during_day_usd=None,
+            deposits_during_day_usd=None,  # unknown from CryptoRun summaries
             source="backfill",
         ))
         inserted += 1
@@ -2019,6 +1914,9 @@ def api_halts_override():
     overridden_key = f"crypto_today_{kind}_overridden"
     if _setting(halted_key, "0") != "1":
         return jsonify({"ok": False, "reason": f"no active {kind} halt to override"}), 400
+    # Capture today's P&L pct for the audit log so we can later see at what
+    # drawdown the user chose to push through. Best-effort — don't block override
+    # if account_value lookup fails.
     pnl_pct = None
     try:
         try:
@@ -2032,11 +1930,24 @@ def api_halts_override():
                 pnl_pct = (cur - day_start) / day_start * 100.0
     except Exception:
         pass
-    # ORDER MATTERS: override flag FIRST, then clear halted. Without this
-    # ordering, fast-exit-check could fire halt + sell positions during the
-    # gap between the two commits.
+    # ORDER MATTERS: set the override flag FIRST, then clear the halted flag.
+    # Each _set_setting commits independently, so there's a brief window where
+    # both flags are visible to other threads. Halt-fire condition is
+    # (halted != "1") AND (overridden != "1"); writing in this order means the
+    # window has (halted=1, overridden=1) — which still passes the gate (halt
+    # stays armed, but no re-fire because halted is set). Reverse order would
+    # produce (halted=0, overridden=0) — the fast-exit-check would re-fire
+    # the halt and re-liquidate positions the user wanted to keep.
     _set_setting(overridden_key, "1")
     _set_setting(halted_key, "0")
+    # Kill ghost — user has resumed real trading, ghost no longer represents
+    # a meaningful counterfactual (real bot is now opening new positions).
+    try:
+        from analysis.crypto_ghost import kill_ghost
+        kill_ghost(f"resumed (override {kind} halt)")
+    except Exception as _e:
+        import logging
+        logging.getLogger("crypto").warning("ghost kill failed (non-fatal): %s", _e)
     ts = datetime.utcnow()
     pnl_str = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "?"
     summary = (f"User override: {kind.upper()} halt cleared (today P&L {pnl_str}). "
@@ -2052,125 +1963,131 @@ def api_halts_override():
     return jsonify({"ok": True, "kind": kind, "today_pnl_pct": pnl_pct})
 
 
-@bp.route("/simulation")
-def simulation():
-    """Ghost portfolio page — live no-halt simulation view."""
-    from analysis.crypto_ghost import ghost_summary
-    from datetime import timezone, timedelta
-    MYT = timezone(timedelta(hours=8))
-    summary = ghost_summary()
-    if summary.get("trades"):
-        from datetime import datetime
-        for t in summary["trades"]:
-            try:
-                utc = datetime.fromisoformat(t["time_utc"])
-                t["time_myt"] = utc.replace(tzinfo=timezone.utc).astimezone(MYT).strftime("%H:%M")
-            except Exception:
-                t["time_myt"] = t.get("time_utc", "")[:16]
-    return render_template("crypto_simulation.html", ghost=summary)
+@bp.route("/api/halts/halt_now", methods=["POST"])
+def api_halts_halt_now():
+    """Manual halt: sell all open positions + block new entries until next MYT midnight.
 
-
-@bp.route("/api/ghost/summary")
-def api_ghost_summary():
-    """JSON ghost portfolio summary for the dashboard card."""
-    try:
-        from analysis.crypto_ghost import ghost_summary
-        return jsonify(ghost_summary())
-    except Exception as e:
-        return jsonify({"enabled": False, "error": str(e)})
-
-
-@bp.route("/api/paper/deposit", methods=["POST"])
-def api_paper_deposit():
-    """Paper-mode deposit/withdraw form submission.
-
-    Single text input — accepts signed numbers (+ deposit, − withdrawal).
-    Increments today's snapshot row's deposits_during_day_usd by the entered
-    amount, then recomputes synth so dashboard + halt threshold immediately
-    reflect the new principal.
-
-    Per-event detail is NOT preserved — only the aggregated daily total
-    persists. Submit twice (e.g., +$50 then +$30) and today's row reads $80.
-    Mistake recovery: enter the inverse amount (e.g., -$80) to zero it out.
-
-    Live-mode users should use the 'Refresh deposit/withdraw' button instead,
-    which queries Binance directly. This endpoint refuses in live mode to
-    avoid muddying the live deposit ledger with manually-entered values.
+    Mirrors the auto-halt flow (including ghost portfolio start) so you can
+    later see what your held positions would have done after the halt.
+    Reuses the loss_halted flag for guardrail blocking — banner will show as
+    a "LOSS HALT" with override + end+rearm buttons available.
     """
-    from analysis.crypto_executor import (
-        _compute_synth_day_start_today,
-        _set_setting,
-        _is_paper_mode_setting,
-    )
-    from webapp.models import CryptoDailySnapshot, db
-    from datetime import timezone, timedelta
-
-    if not _is_paper_mode_setting():
-        flash("Paper-deposit form is paper-mode only. Live users: use the 'Refresh deposit/withdraw' button.", "error")
-        return redirect(url_for("crypto.settings"))
-
-    raw = (request.form.get("amount") or "").strip()
+    from webapp.models import CryptoRun, db
+    from analysis.crypto_executor import sell_all_open_positions, _collect_ghost_init_data
+    ts = datetime.utcnow()
+    # Snapshot positions + current account value BEFORE selling — ghost needs both
+    ghost_pre = _collect_ghost_init_data()
+    pre_value = None
     try:
-        amount = float(raw)
-    except (TypeError, ValueError):
-        flash(f"Invalid amount '{raw}' — enter a number, e.g. 100 or -50.", "error")
-        return redirect(url_for("crypto.settings"))
-    if abs(amount) < 0.01:
-        flash("Amount too small (need ≥ $0.01 absolute). Skipped.", "warn")
-        return redirect(url_for("crypto.settings"))
-
-    MYT = timezone(timedelta(hours=8))
-    today_iso = (datetime.utcnow().replace(tzinfo=timezone.utc)
-                 .astimezone(MYT).date().isoformat())
-
-    # Update today's row in the snapshot table. Increment, don't replace —
-    # so multiple submissions accumulate (e.g., user splits a $200 deposit
-    # into two $100 entries).
-    row = CryptoDailySnapshot.query.get(today_iso)
-    if row is None:
-        # No row yet today — create one. total_value_usd will be set by the
-        # synth recompute below; deposits column starts at the entered amount.
-        row = CryptoDailySnapshot(
-            date=today_iso,
-            total_value_usd=0.0,  # placeholder; synth-recompute updates below
-            deposits_during_day_usd=amount,
-            source="synth",
-        )
-        db.session.add(row)
-    else:
-        prior = float(row.deposits_during_day_usd or 0.0)
-        row.deposits_during_day_usd = prior + amount
-    db.session.commit()
-
-    # Recompute synth so the dashboard + halt threshold see the new principal
-    # on the next tick.
+        acct = _account_summary()
+        pre_value = acct.get("account_value")
+    except Exception:
+        pass
     try:
-        synth = _compute_synth_day_start_today()
-        _set_setting("crypto_day_start_value_usd", f"{synth:.4f}")
-        _set_setting("crypto_day_start_format", "synth")
-        # Update today's row's total_value_usd to the new synth (keeps the
-        # snapshot row consistent with the setting).
-        row = CryptoDailySnapshot.query.get(today_iso)
-        if row is not None:
-            row.total_value_usd = float(synth)
-            db.session.commit()
+        n_closed = sell_all_open_positions("MANUAL HALT")
     except Exception as e:
-        flash(f"Paper deposit recorded ({amount:+.2f}) but synth recompute failed: {e}", "warn")
-        return redirect(url_for("crypto.settings"))
+        return jsonify({"ok": False, "reason": f"sell_all failed: {e}"}), 500
+    _set_setting("crypto_today_loss_halted", "1")
+    # Start ghost portfolio so user can see what would have happened if held
+    try:
+        from analysis.crypto_ghost import start_ghost
+        start_ghost(ghost_pre, pre_value)
+    except Exception as _ge:
+        import logging
+        logging.getLogger("crypto").warning("ghost start failed (non-fatal): %s", _ge)
+    summary = f"User MANUAL HALT: closed {n_closed} positions, blocking new entries until MYT midnight."
+    try:
+        db.session.add(CryptoRun(kind="manual_halt", status="ok",
+                                  started_at=ts, ended_at=ts, summary=summary))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    import logging
+    logging.getLogger("crypto").warning(summary)
+    return jsonify({"ok": True, "closed": n_closed})
 
-    new_total = float(row.deposits_during_day_usd or 0.0) if row else amount
-    sign = "+" if amount >= 0 else ""
-    flash(f"Paper {('deposit' if amount > 0 else 'withdrawal')} {sign}{amount:.2f} recorded. "
-          f"Today's row total: ${new_total:+.2f}. Synth day-start: ${synth:.2f}.", "ok")
-    return redirect(url_for("crypto.settings"))
+
+@bp.route("/api/halts/end_and_rearm", methods=["POST"])
+def api_halts_end_and_rearm():
+    """End the active halt AND re-arm at a new threshold percent.
+
+    Body: {"type": "loss" | "profit", "new_pct": 8.0}
+
+    Differs from /api/halts/override:
+      - Override: clears halt + sets overridden flag (no re-fire today)
+      - End+rearm: clears BOTH flags AND updates the threshold setting
+        → halt CAN fire again today if P&L crosses the new threshold
+
+    Use case: hit +5% profit halt, want to ride higher with re-armed safety
+    net at, say, +8%. The user picks the new threshold via a dashboard prompt.
+    """
+    from webapp.models import CryptoRun, db
+    body = request.get_json(silent=True) or {}
+    kind = (body.get("type") or "").strip().lower()
+    if kind not in ("loss", "profit"):
+        return jsonify({"ok": False, "reason": "type must be 'loss' or 'profit'"}), 400
+    try:
+        new_pct = float(body.get("new_pct"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "reason": "new_pct must be a number"}), 400
+    # Min/floor (kind='loss') accepts signed values: -5 = halt at -5%, +6 = halt at +6%
+    # Max/ceiling (kind='profit') must be positive (no use case for negative ceiling)
+    if kind == "profit" and new_pct <= 0:
+        return jsonify({"ok": False, "reason": "max P&L must be positive"}), 400
+
+    halted_key = f"crypto_today_{kind}_halted"
+    overridden_key = f"crypto_today_{kind}_overridden"
+    threshold_key = f"crypto_{kind}_halt_pct"
+
+    old_pct = _setting(threshold_key, "?")
+    # Update threshold first so the halt re-arms at the new value
+    _set_setting(threshold_key, f"{new_pct:.2f}")
+    # Clear BOTH flags so halt can fire again today
+    _set_setting(overridden_key, "0")
+    _set_setting(halted_key, "0")
+    # Kill the current ghost — user resumed real trading, this ghost is stale.
+    # If the halt re-fires later at the new threshold, a fresh ghost spawns.
+    try:
+        from analysis.crypto_ghost import kill_ghost
+        kill_ghost(f"resumed (re-arm {kind} at {new_pct:.2f}%)")
+    except Exception as _e:
+        import logging
+        logging.getLogger("crypto").warning("ghost kill failed (non-fatal): %s", _e)
+
+    ts = datetime.utcnow()
+    label = "MAX" if kind == "profit" else "MIN"
+    summary = (f"User end-halt+rearm: {label} P&L halt cleared, threshold "
+               f"changed from {old_pct}% to {new_pct:+.2f}%. Halt may re-fire today "
+               f"if P&L crosses new threshold.")
+    try:
+        db.session.add(CryptoRun(kind="halt_end_rearm", status="ok",
+                                  started_at=ts, ended_at=ts, summary=summary))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    import logging
+    logging.getLogger("crypto").warning(summary)
+    return jsonify({"ok": True, "kind": kind, "new_threshold_pct": new_pct,
+                    "old_threshold_pct": old_pct})
 
 
 @bp.route("/api/deposits/refresh", methods=["POST"])
 def api_deposits_refresh():
     """Refresh today's deposits/withdrawals from Binance and re-sync synth.
-    Replaces 'Force re-synth'. Pulls since-midnight flows, updates so-far
-    counter, recomputes synth so dashboard + halt threshold reflect today's
-    contributions immediately."""
+
+    Replaces the old 'Force re-synth' button. Safer + more useful:
+      1. Queries Binance for net deposits/withdrawals since today MYT 00:00
+      2. Stores the value in crypto_today_deposits_so_far_usd setting
+      3. Recomputes synth_day_start (now reflects today's contributions)
+      4. Updates crypto_day_start_value_usd so halt threshold + dashboard align
+
+    Without this button, today's deposits/withdrawals only flow into the
+    principal at the next MYT-midnight rollover (when past-24h fetch captures
+    them into tomorrow's snapshot row). With it, the user can apply same-day
+    contributions immediately.
+
+    Idempotent: clicking it twice gives the same result. Safe to re-fire.
+    """
     from analysis.crypto_executor import (
         _fetch_net_usdt_deposits_since_today_midnight,
         _compute_synth_day_start_today,
@@ -2181,15 +2098,17 @@ def api_deposits_refresh():
         flash("Couldn't reach Binance to fetch deposits — try again.", "error")
         return redirect(url_for("crypto.settings"))
     _set_setting("crypto_today_deposits_so_far_usd", f"{fresh_deposits:.4f}")
+    # Adjust day_start by the net deposit so trading P&L is unaffected.
+    # Do NOT recompute from synth formula — keep the live midnight baseline
+    # and simply add today's net deposit/withdrawal.
     try:
-        synth = _compute_synth_day_start_today()
-        _set_setting("crypto_day_start_value_usd", f"{synth:.4f}")
-        _set_setting("crypto_day_start_format", "synth")
+        existing = float(_setting("crypto_day_start_value_usd") or 0)
+        new_day_start = existing + fresh_deposits
+        _set_setting("crypto_day_start_value_usd", f"{new_day_start:.4f}")
     except Exception as e:
-        flash(f"Deposits refreshed (${fresh_deposits:+.2f}) but synth recompute failed: {e}", "warn")
+        flash(f"Deposits refreshed (${fresh_deposits:+.2f}) but day-start update failed: {e}", "warn")
         return redirect(url_for("crypto.settings"))
-    flash(f"Deposits refreshed: net ${fresh_deposits:+.2f} today. "
-          f"Synth day-start updated to ${synth:.2f}.", "ok")
+    flash(f"Deposits refreshed: net ${fresh_deposits:+.2f} today. Day-start adjusted.", "ok")
     return redirect(url_for("crypto.settings"))
 
 
@@ -2199,9 +2118,9 @@ def reset_drawdown_peak():
 
     Used after deposits/withdrawals when the user wants halt thresholds rebased
     to current portfolio value. The next account_value read snapshots the new
-    baseline. Note: this does NOT clear today's halt flags — those auto-clear
-    at next MYT midnight. (To resume trading after a halt fire, just wait for
-    midnight or manually flip crypto_today_loss_halted/profit_halted to "0".)
+    baseline. Does NOT clear today's halt flags — those auto-clear at next MYT
+    midnight. (To resume mid-day after a halt fire, manually set
+    crypto_today_loss_halted/profit_halted to "0".)
     """
     _set_setting("crypto_day_start_value_usd", "0")
     _set_setting("crypto_day_start_date", "")
@@ -2280,17 +2199,6 @@ def test_connection():
     return redirect(url_for("crypto.settings"))
 
 
-@bp.route("/api/sell-all", methods=["POST"])
-def api_sell_all():
-    """Manually close all open positions at market price."""
-    try:
-        from analysis.crypto_executor import sell_all_open_positions
-        n = sell_all_open_positions("manual liquidation", mode_filter=_is_paper_mode())
-        return jsonify({"ok": True, "closed": n})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
 @bp.route("/sync", methods=["POST"])
 def sync_balances():
     """Pull current Binance balances and refresh the crypto_holdings table."""
@@ -2310,3 +2218,48 @@ def sync_balances():
         errs = "; ".join(result["errors"]) or "unknown"
         flash(f"Sync failed: {errs}", "err")
     return redirect(url_for("crypto.dashboard"))
+
+
+# ── Manual sell-all ───────────────────────────────────────────────────────
+
+@bp.route("/api/sell-all", methods=["POST"])
+def api_sell_all():
+    """Manually close all open positions at market price."""
+    try:
+        from analysis.crypto_executor import sell_all_open_positions, _is_paper_mode_setting
+        mode_filter = True if _is_paper_mode_setting() else False
+        n = sell_all_open_positions("manual liquidation", mode_filter=mode_filter)
+        return jsonify({"ok": True, "closed": n})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── Ghost portfolio ────────────────────────────────────────────────────────
+
+@bp.route("/simulation")
+def simulation():
+    """Ghost portfolio page — live 'no-halt' simulation view."""
+    from analysis.crypto_ghost import ghost_summary
+    from datetime import timezone, timedelta
+    MYT = timezone(timedelta(hours=8))
+    summary = ghost_summary()
+    # Convert UTC trade times to MYT for display
+    if summary.get("trades"):
+        from datetime import datetime
+        for t in summary["trades"]:
+            try:
+                utc = datetime.fromisoformat(t["time_utc"])
+                t["time_myt"] = utc.replace(tzinfo=timezone.utc).astimezone(MYT).strftime("%H:%M")
+            except Exception:
+                t["time_myt"] = t.get("time_utc", "")[:16]
+    return render_template("crypto_simulation.html", ghost=summary)
+
+
+@bp.route("/api/ghost/summary")
+def api_ghost_summary():
+    """JSON ghost portfolio summary for the dashboard card (polled every 30s)."""
+    try:
+        from analysis.crypto_ghost import ghost_summary
+        return jsonify(ghost_summary())
+    except Exception as e:
+        return jsonify({"enabled": False, "error": str(e)})

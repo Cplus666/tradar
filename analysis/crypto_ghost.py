@@ -58,6 +58,26 @@ def _add_usdt(delta: float) -> None:
     _set("crypto_ghost_usdt", f"{_ghost_usdt() + delta:.6f}")
 
 
+# ── kill ghost ─────────────────────────────────────────────────────────────
+
+def kill_ghost(reason: str = "user resumed trading") -> int:
+    """Close all open ghost positions when user resumes real trading."""
+    if _get("crypto_ghost_feature_enabled", "on") != "on":
+        return 0
+    from webapp.models import CryptoGhostPosition, db
+    now_utc = datetime.utcnow()
+    n = (CryptoGhostPosition.query
+         .filter_by(status="open")
+         .update({"status": "closed", "closed_at": now_utc,
+                   "close_reason": reason}))
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return 0
+    return n
+
+
 # ── start ghost ────────────────────────────────────────────────────────────
 
 def start_ghost(sold_positions: list[dict], starting_usdt: float) -> None:

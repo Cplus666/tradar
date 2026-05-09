@@ -1,5 +1,5 @@
 {% extends 'crypto_base.html' %}
-{% block title %}Dashboard · Tradar{% endblock %}
+{% block title %}Crypto Dashboard{% endblock %}
 {% block extra_head %}
   <script src="{{ url_for('static', filename='plotly.min.js') }}"></script>
 {% endblock %}
@@ -8,20 +8,14 @@
 {% if not has_keys %}
 <section class="bg-amber-950/40 border border-amber-800 rounded-lg p-5 mb-4">
   <h2 class="text-amber-300 font-semibold mb-2">🔑 Binance API keys not configured</h2>
-  <div class="flex items-center gap-3 flex-wrap">
-    <a href="{{ url_for('crypto.settings') }}" class="inline-block bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm">→ Set up Binance API keys</a>
-    <span class="text-xs text-zinc-400">No Binance account yet?
-      <a href="https://www.binance.com/register?ref=127569393" target="_blank" rel="noopener"
-         class="text-amber-400 hover:text-amber-300 font-semibold underline">Sign up with referral <span class="mono">127569393</span> →</a>
-    </span>
-  </div>
+  <a href="{{ url_for('crypto.settings') }}" class="inline-block bg-amber-700 hover:bg-amber-600 text-white px-4 py-2 rounded text-sm">→ Set up Binance API keys</a>
 </section>
 {% endif %}
 
 {# === DAILY P&L AUTO-HALT BANNER (hidden until live snapshot says a halt fired today) === #}
 <section id="halt-banner" class="hidden rounded-lg p-4 mb-4 border-2"></section>
 
-{# === GHOST PORTFOLIO CARD === #}
+{# === GHOST PORTFOLIO CARD (shown only when ghost simulation is active) === #}
 <section id="ghost-card" class="hidden bg-zinc-900 border border-blue-900 rounded-lg p-3 mb-4">
   <div class="flex items-center justify-between flex-wrap gap-2">
     <div class="flex items-center gap-3">
@@ -32,10 +26,22 @@
        class="text-xs text-blue-400 hover:text-blue-300 font-semibold">View detail →</a>
   </div>
   <div class="flex items-center gap-6 mt-2 flex-wrap">
-    <div><div class="text-xs text-zinc-500">Ghost value</div><div id="ghost-total" class="text-lg font-bold mono text-zinc-200">—</div></div>
-    <div><div class="text-xs text-zinc-500">vs locked</div><div id="ghost-diff" class="text-lg font-bold mono text-zinc-200">—</div></div>
-    <div><div class="text-xs text-zinc-500">Open positions</div><div id="ghost-nopen" class="text-lg font-bold mono text-zinc-200">—</div></div>
-    <div><div class="text-xs text-zinc-500">Realized P&L</div><div id="ghost-realized" class="text-lg font-bold mono text-zinc-200">—</div></div>
+    <div>
+      <div class="text-xs text-zinc-500">Ghost value</div>
+      <div id="ghost-total" class="text-lg font-bold mono text-zinc-200">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-zinc-500">vs locked</div>
+      <div id="ghost-diff" class="text-lg font-bold mono text-zinc-200">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-zinc-500">Open positions</div>
+      <div id="ghost-nopen" class="text-lg font-bold mono text-zinc-200">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-zinc-500">Realized P&L</div>
+      <div id="ghost-realized" class="text-lg font-bold mono text-zinc-200">—</div>
+    </div>
   </div>
 </section>
 
@@ -65,7 +71,7 @@
       <div class="text-xl font-bold {% if trading_mode == 'live' %}text-amber-400{% else %}text-emerald-400{% endif %} mt-1">
         {{ trading_mode | upper }}
       </div>
-      {% if kill_switch == 'on' %}<div class="text-sm text-red-400 mt-1">⛔ KILL SWITCH ON</div>{% endif %}
+      {% if kill_switch == 'on' %}<div class="text-sm text-red-400 mt-1">⛔ NEW BUYS PAUSED</div>{% endif %}
     </div>
   </div>
 </section>
@@ -251,10 +257,11 @@
 
 <script>
   // ---- Daily realized P&L bar chart (last 30 days) ----
-  // State refreshes in place via /api/daily-pnl every 30s — no page reload needed.
+  // State: data is replaceable on each refresh; mode is sticky across refreshes
+  // so the user's toggle choice survives the periodic re-fetch.
   const _roiState = {
-    data: {{ daily_pnl_json | safe }},
-    mode: 'portfolio',
+    data: {{ daily_pnl_json | safe }},  // initial server-rendered payload
+    mode: 'portfolio',                   // default toggle
     plotInitialized: false,
   };
 
@@ -294,6 +301,8 @@
       return;
     }
     const colors = dailyPnl.map(d => d.pnl > 0 ? '#10b981' : d.pnl < 0 ? '#ef4444' : '#3f3f46');
+    // customdata layout: [wins, losses, pnl_net, capital, avg_pct, fees,
+    //                     return_pct, portfolio_pct, day_start_value]
     const customdata = dailyPnl.map(d => [
       d.wins, d.losses, d.pnl, d.capital, d.avg_pct, d.fees,
       d.return_pct, d.portfolio_pct, d.day_start_value,
@@ -321,6 +330,8 @@
       yaxis: { gridcolor: '#27272a', title: 'ROI %', tickformat: '.1f', ticksuffix: '%', zerolinecolor: '#52525b' },
       bargap: 0.25,
     };
+    // Plotly.react updates in place without flicker if the chart already exists;
+    // newPlot is the first-time init path.
     if (_roiState.plotInitialized) {
       Plotly.react('daily-pnl-chart', [trace], layout, { displayModeBar: false, responsive: true });
     } else {
@@ -368,10 +379,11 @@
         _renderRoiChart();
       }
     } catch (e) {
-      // silent — keep existing chart on transient fetch failure
+      // silent — keep the existing chart visible if a single refresh fails
     }
   }
 
+  // Initial render from server-injected data (instant, no fetch needed).
   _renderRoiHeadline();
   _renderRoiChart();
   _renderRoiToggle();
@@ -401,12 +413,16 @@
   // Manual halt override — wired to the "Resume trading today" button on the
   // halt banner. Two-step confirm: native confirm() with the actual P&L, then
   // POST to the override endpoint, then refresh the dashboard so the banner
-  // updates to the muted "override active" state.
+  // updates to the muted "override active" state. We deliberately use the
+  // browser's confirm() so the user can't reflexively click through it.
   async function overrideHalt(kind, pnlPct, threshPct) {
     const pnlStr = (pnlPct != null) ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%' : 'unknown';
+    // threshPct is signed (e.g., -5 or +6 for min, +8 for max).
+    const t = parseFloat(threshPct);
+    const threshSigned = isFinite(t) ? (t >= 0 ? `+${t.toFixed(2)}` : t.toFixed(2)) : '?';
     const warning = kind === 'loss'
-      ? `LOSS HALT OVERRIDE\n\nToday's P&L: ${pnlStr} (threshold was -${threshPct}%).\n\nIf you continue trading, the halt will NOT fire again today. Further losses are uncapped until MYT midnight.\n\nDo you accept this risk and want to resume trading?`
-      : `PROFIT HALT OVERRIDE\n\nToday's P&L: ${pnlStr} (threshold was +${threshPct}%).\n\nIf you continue trading, today's locked-in gains may give back. Halt will NOT fire again today.\n\nResume trading?`;
+      ? `MIN HALT OVERRIDE\n\nToday's P&L: ${pnlStr} (floor was ${threshSigned}%).\n\nIf you continue trading, the floor will NOT fire again today. Further drops are uncapped until MYT midnight.\n\nDo you accept this risk and want to resume trading?`
+      : `MAX HALT OVERRIDE\n\nToday's P&L: ${pnlStr} (ceiling was +${threshPct}%).\n\nIf you continue trading, today's locked-in gains may give back. Halt will NOT fire again today.\n\nResume trading?`;
     if (!window.confirm(warning)) { return; }
     try {
       const res = await fetch('{{ url_for("crypto.api_halts_override") }}', {
@@ -419,10 +435,69 @@
         alert('Override failed: ' + (data.reason || res.statusText));
         return;
       }
+      // Force-refresh the dashboard so the banner switches to the override-active state.
       _hasRenderedLive = false;
       loadDashboard();
     } catch (e) {
       alert('Override request failed: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  // End halt + re-arm at a NEW threshold (signed semantic).
+  //   - Min halt (kind='loss'): threshold can be negative or positive
+  //       Pre-fill = old_min - 3 (further down, more lenient floor)
+  //   - Max halt (kind='profit'): threshold positive only
+  //       Pre-fill = old_max + 3 (further up, more lenient ceiling)
+  async function endHaltAndRearm(kind, pnlPct, threshPct) {
+    const pnlStr = (pnlPct != null) ? (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%' : 'unknown';
+    const t = parseFloat(threshPct);
+    const oldThreshSigned = isFinite(t) ? (t >= 0 ? `+${t.toFixed(2)}` : t.toFixed(2)) : '?';
+    let suggested, label, helpText;
+    if (kind === 'profit') {
+      // Max halt: re-arm higher = give more headroom for P&L to climb
+      suggested = (isFinite(t) ? t + 3 : 8).toFixed(1);
+      label = 'MAX';
+      helpText = 'Enter the new MAX P&L (positive, %). Halt fires when P&L ≥ this.';
+    } else {
+      // Min halt: re-arm lower = give more headroom for P&L to drop
+      // Signed: old_min was -5 → suggest -8 (more lenient floor); old_min was +6 → suggest +3
+      suggested = (isFinite(t) ? t - 3 : -8).toFixed(1);
+      label = 'MIN';
+      helpText = 'Enter the new MIN P&L (signed, %). Halt fires when P&L ≤ this. Negative = loss protection; positive = lock-in floor.';
+    }
+    const newPctStr = window.prompt(
+      `End ${label} halt + RE-ARM\n\n` +
+      `Today's P&L: ${pnlStr} (current ${label} = ${oldThreshSigned}%)\n\n` +
+      `${helpText}\n` +
+      `If P&L crosses the new threshold today, the halt will fire again.\n\n` +
+      `Suggested: ${suggested}`,
+      suggested
+    );
+    if (newPctStr === null) { return; }   // user cancelled
+    const newPct = parseFloat(newPctStr);
+    if (!isFinite(newPct)) {
+      alert('Invalid threshold — must be a number.');
+      return;
+    }
+    if (kind === 'profit' && newPct <= 0) {
+      alert('Max P&L must be positive (use negative values only on Min).');
+      return;
+    }
+    try {
+      const res = await fetch('{{ url_for("crypto.api_halts_end_and_rearm") }}', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: kind, new_pct: newPct }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.ok !== true) {
+        alert('End+rearm failed: ' + (data.reason || res.statusText));
+        return;
+      }
+      _hasRenderedLive = false;
+      loadDashboard();
+    } catch (e) {
+      alert('End+rearm request failed: ' + (e && e.message ? e.message : e));
     }
   }
 
@@ -438,7 +513,7 @@
     if (!el) { return; }
     if (kind === 'hidden' || kind === 'ok') {
       el.classList.add('hidden');
-      el.textContent = '';
+      el.innerHTML = '';
       return;
     }
     el.classList.remove('hidden', 'border-amber-700', 'bg-amber-950/40', 'text-amber-300',
@@ -448,7 +523,9 @@
     } else {
       el.classList.add('border-rose-700', 'bg-rose-950/40', 'text-rose-300');
     }
-    el.textContent = message;
+    // innerHTML so we can include actionable links (settings page, fixes).
+    // Messages are server/client-controlled — no user input embedded → safe.
+    el.innerHTML = message;
   }
 
   // Wrap fetch with an AbortController timeout — without this, a hung Flask
@@ -461,21 +538,15 @@
   }
 
   function loadDashboard() {
-    // Skip if an earlier fetch is still pending (avoids 6-deep request queue
-    // when Flask is wedged — old requests will eventually time out via AbortController).
     if (_inFlight) {
       return;
     }
-    // STAGE 1 — only on the FIRST load: instant DB render with placeholders
-    // for live values. Skipped on subsequent refreshes to avoid flicker.
     if (!_hasRenderedLive) {
-      fetchWithTimeout('/tradar/api/dashboard/static', 8000)
+      fetchWithTimeout('/crypto/api/dashboard/static', 8000)
         .then(r => r.json())
         .then(d => { if (!_hasRenderedLive) { applyDashboard(d); } })
         .catch(e => { console.warn('static dashboard failed:', e); });
     }
-    // STAGE 2 — live data. 20s budget covers slow Binance calls but releases
-    // the browser slot if the backend is wedged.
     _inFlight = true;
     fetchWithTimeout('{{ url_for("crypto.api_dashboard") }}', 20000)
       .then(r => r.json())
@@ -485,7 +556,12 @@
         if (d.stale === true) {
           const since = d.stale_since ? new Date(d.stale_since).toLocaleTimeString() : '?';
           setStatus({kind: 'stale',
-            message: `⚠️ Binance unreachable — showing last good values from ${since} MYT (auto-retry every 30s)`});
+            message: `⚠️ Binance API call failing — showing last good values from ${since} MYT. ` +
+              `<br>Most likely: <strong>IP changed</strong> (your IP isn't on Binance's whitelist anymore → -2015 error). ` +
+              `<br>Fixes: ` +
+              `(1) <a href="{{ url_for('crypto.settings') }}" class="underline">reveal current IP</a> in Settings and re-add to Binance, ` +
+              `(2) remove IP whitelist entirely on the API key page (then disable "Enable Withdrawals" for safety), or ` +
+              `(3) wait — auto-retry every 30s.`});
         } else {
           setStatus({kind: 'ok'});
         }
@@ -493,13 +569,12 @@
       .catch(e => {
         console.error('dashboard live load failed:', e);
         const reason = (e && e.name === 'AbortError') ? 'request timed out' : (e.message || e);
-        // Always show a status — even if we have stale data on screen — so
-        // the user knows refreshes are failing instead of believing it's live.
         setStatus({kind: 'error',
-          message: `⚠️ Live update failed (${reason}). Retrying in 30s. If stuck, hard-refresh (Cmd+Shift+R).`});
+          message: `⚠️ Live update failed (${reason}). Retrying in 30s. ` +
+            `If persistent: likely <strong>API key blocked by IP whitelist</strong> ` +
+            `→ <a href="{{ url_for('crypto.settings') }}" class="underline">check IP in Settings</a> ` +
+            `and re-add to Binance, OR remove the whitelist + disable withdrawals on the key.`});
         if (!_hasRenderedLive) {
-          // First-load failure with no cache: surface explicitly so the user
-          // doesn't see a permanent "loading…" placeholder.
           const accVal = document.getElementById('pnl-account-value');
           if (accVal) { accVal.textContent = 'unavailable'; accVal.classList.add('text-rose-400'); }
           document.getElementById('position-cards').innerHTML =
@@ -532,15 +607,19 @@
         const isProfit = profitHalt && !lossHalt;
         const kind = isProfit ? 'profit' : 'loss';
         const tone = isProfit
-          ? { bg: 'bg-emerald-950/40', border: 'border-emerald-700', icon: '🎯', label: 'PROFIT HALT', heading: 'text-emerald-300', btn: 'bg-emerald-700 hover:bg-emerald-600' }
-          : { bg: 'bg-rose-950/40',    border: 'border-rose-700',    icon: '🛑', label: 'LOSS HALT',   heading: 'text-rose-300',    btn: 'bg-rose-700 hover:bg-rose-600' };
+          ? { bg: 'bg-emerald-950/40', border: 'border-emerald-700', icon: '🎯', label: 'MAX HALT', heading: 'text-emerald-300', btn: 'bg-emerald-700 hover:bg-emerald-600' }
+          : { bg: 'bg-rose-950/40',    border: 'border-rose-700',    icon: '🛑', label: 'MIN HALT', heading: 'text-rose-300',    btn: 'bg-rose-700 hover:bg-rose-600' };
         haltBanner.className = `rounded-lg p-4 mb-4 border-2 ${tone.bg} ${tone.border}`;
         const pnlPct = (a.today_pnl_pct != null) ? a.today_pnl_pct.toFixed(2) : '?';
-        const threshPct = isProfit ? (a.profit_halt_pct != null ? a.profit_halt_pct.toFixed(1) : '?')
-                                   : (a.loss_halt_pct   != null ? a.loss_halt_pct.toFixed(1)   : '?');
+        // threshPct is now SIGNED (loss_halt_pct can be negative or positive after the
+        // signed-semantic refactor). Display with explicit sign for clarity.
+        const _signed = (v) => v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2);
+        const threshRaw = isProfit ? a.profit_halt_pct : a.loss_halt_pct;
+        const threshPct = (threshRaw != null) ? threshRaw : '?';
+        const threshDisplay = (threshRaw != null) ? _signed(threshRaw) : '?';
         const detail = isProfit
-          ? `Today's P&L hit <span class="mono">+${pnlPct}%</span> (≥ +${threshPct}% threshold). All positions closed; new entries blocked until next MYT midnight.`
-          : `Today's P&L hit <span class="mono">${pnlPct}%</span> (≤ -${threshPct}% threshold). All positions closed; new entries blocked until next MYT midnight.`;
+          ? `Today's P&L hit <span class="mono">+${pnlPct}%</span> (≥ ceiling ${threshDisplay}%). All positions closed; new entries blocked until next MYT midnight.`
+          : `Today's P&L ${pnlPct >= 0 ? '+' : ''}${pnlPct}% reached the floor ${threshDisplay}%. All positions closed; new entries blocked until next MYT midnight.`;
         haltBanner.innerHTML = `
           <div class="flex items-start gap-3">
             <div class="text-2xl">${tone.icon}</div>
@@ -548,10 +627,14 @@
               <div class="${tone.heading} font-bold text-sm tracking-wide">${tone.label} — TRADING PAUSED FOR THE DAY</div>
               <div class="text-zinc-300 text-sm mt-1">${detail}</div>
               <div class="text-xs text-zinc-500 mt-2">Auto-resumes at MYT 00:00. Adjust thresholds in <a href="{{ url_for('crypto.settings') }}" class="underline hover:text-zinc-300">Settings</a>.</div>
-              <div class="mt-3">
+              <div class="mt-3 flex flex-wrap gap-2">
                 <button type="button" onclick="overrideHalt('${kind}', ${a.today_pnl_pct != null ? a.today_pnl_pct : 'null'}, ${threshPct})"
                         class="${tone.btn} text-white text-xs font-semibold px-3 py-1.5 rounded">
-                  ⚠️ Resume trading today (override)
+                  ⚠️ Resume + no halt today (override)
+                </button>
+                <button type="button" onclick="endHaltAndRearm('${kind}', ${a.today_pnl_pct != null ? a.today_pnl_pct : 'null'}, ${threshPct})"
+                        class="bg-zinc-700 hover:bg-zinc-600 text-white text-xs font-semibold px-3 py-1.5 rounded">
+                  🔄 Resume + re-arm at new %
                 </button>
               </div>
             </div>
@@ -713,7 +796,10 @@
         const capitalLine = `$${c.notional.toFixed(2)} cost`
           + (valueNow != null ? ` → $${valueNow.toFixed(2)} now` : '')
           + ` · ${fmtQty(c.qty)} units`;
-        // Partial-take indicator: badge + "stop was $X" line.
+        // Partial-take indicator: badge + "stop was $X" line so the dashboard
+        // matches what the journal already shows. Tells you at a glance which
+        // positions have already booked half their size and have a tightened
+        // (locked-in-profit) stop.
         const partialBadge = c.partial_done
           ? '<span class="ml-2 text-[10px] uppercase tracking-wide font-semibold text-emerald-400 bg-emerald-950/40 border border-emerald-800 px-1.5 py-0.5 rounded">partial</span>'
           : '';
@@ -723,7 +809,7 @@
         return `<div class="border rounded-lg p-3 ${borderCls}">
           <div class="flex items-baseline justify-between mb-2">
             <div>
-              <a href="/tradar/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+              <a href="/crypto/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
               ${partialBadge}
             </div>
             <span class="text-xs text-zinc-500">${c.strategy}</span>
@@ -755,29 +841,6 @@
   loadDashboard();
   setInterval(loadDashboard, 30000);  // refresh live data every 30s
 
-  // ---- Ghost portfolio card ----
-  function refreshGhost() {
-    fetch('{{ url_for("crypto.api_ghost_summary") }}')
-      .then(r => r.json())
-      .then(g => {
-        const card = document.getElementById('ghost-card');
-        if (!g.enabled) { card.classList.add('hidden'); return; }
-        card.classList.remove('hidden');
-        const diffCls = g.diff > 0 ? 'text-emerald-400' : g.diff < 0 ? 'text-rose-400' : 'text-zinc-200';
-        document.getElementById('ghost-total').textContent    = '$' + g.total.toFixed(2);
-        const diffEl = document.getElementById('ghost-diff');
-        diffEl.textContent = (g.diff >= 0 ? '+' : '') + g.diff.toFixed(2);
-        diffEl.className   = 'text-lg font-bold mono ' + diffCls;
-        document.getElementById('ghost-nopen').textContent    = g.n_open;
-        const rlEl = document.getElementById('ghost-realized');
-        rlEl.textContent = (g.realized >= 0 ? '+' : '') + g.realized.toFixed(2);
-        rlEl.className   = 'text-lg font-bold mono ' + (g.realized >= 0 ? 'text-emerald-400' : 'text-rose-400');
-      })
-      .catch(() => {});
-  }
-  refreshGhost();
-  setInterval(refreshGhost, 30000);
-
   // ---- Manual sell-all ----
   function sellAll() {
     if (!confirm('Sell ALL open positions at market price right now?\n\nThis cannot be undone.')) return;
@@ -794,8 +857,31 @@
       .catch(e => alert('Network error: ' + e.message));
   }
 
+  // ---- Ghost portfolio card (independent poll, non-blocking) ----
+  function refreshGhost() {
+    fetch('{{ url_for("crypto.api_ghost_summary") }}')
+      .then(r => r.json())
+      .then(g => {
+        const card = document.getElementById('ghost-card');
+        if (!g.enabled) { card.classList.add('hidden'); return; }
+        card.classList.remove('hidden');
+        const diffCls = g.diff > 0 ? 'text-emerald-400' : g.diff < 0 ? 'text-rose-400' : 'text-zinc-200';
+        document.getElementById('ghost-total').textContent    = '$' + g.total.toFixed(2);
+        const diffEl = document.getElementById('ghost-diff');
+        diffEl.textContent  = (g.diff >= 0 ? '+' : '') + g.diff.toFixed(2);
+        diffEl.className    = 'text-lg font-bold mono ' + diffCls;
+        document.getElementById('ghost-nopen').textContent    = g.n_open;
+        const rlEl = document.getElementById('ghost-realized');
+        rlEl.textContent = (g.realized >= 0 ? '+' : '') + g.realized.toFixed(2);
+        rlEl.className   = 'text-lg font-bold mono ' + (g.realized >= 0 ? 'text-emerald-400' : 'text-rose-400');
+      })
+      .catch(() => {});  // silent — ghost failure must never break main dashboard
+  }
+  refreshGhost();
+  setInterval(refreshGhost, 30000);
   // ROI graph used to depend on a periodic full-page reload to pick up new
   // closed trades. Now it has its own JSON endpoint and re-renders in place.
+  // First refresh after 30s so newly-closed trades show up without a page reload.
   setInterval(refreshRoi, 30000);
 
   // ---- Browser notifications on new trades ----
