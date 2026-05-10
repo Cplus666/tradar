@@ -176,16 +176,17 @@
     <div class="space-y-5">
     <h3 class="font-semibold border-b border-zinc-800 pb-2">Scheduler intervals</h3>
 
-    <div>
-      <label class="block text-xs font-semibold mb-1">Full scan interval (minutes){{ tip("Heavy loop: refresh klines + scan all strategies + sync. Min 5 (Binance rate limits), max 60.") }}</label>
-      <input type="number" step="1" min="5" max="60" name="crypto_loop_interval_min" value="{{ loop_interval_min }}"
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-    </div>
-
-    <div>
-      <label class="block text-xs font-semibold mb-1">Fast exit-check interval (seconds){{ tip("Light loop in <strong>seconds</strong>: checks current prices vs stop/target on open positions. Fires exits FAST.<br>Set to <span class='mono'>0</span> to disable. Common: <span class='mono'>30</span>, <span class='mono'>60</span>, <span class='mono'>15</span>.<br>Floor: 10s. Max: 600s.") }}</label>
-      <input type="number" step="5" min="0" max="600" name="crypto_fast_check_interval_sec" value="{{ fast_check_interval_sec }}"
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <label class="block text-xs font-semibold mb-1">Full scan interval (minutes){{ tip("Heavy loop: refresh klines + scan all strategies + sync. Min 5 (Binance rate limits), max 60.") }}</label>
+        <input type="number" step="1" min="5" max="60" name="crypto_loop_interval_min" value="{{ loop_interval_min }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Fast exit-check interval (seconds){{ tip("Light loop in <strong>seconds</strong>: checks current prices vs stop/target on open positions. Fires exits FAST.<br>Set to <span class='mono'>0</span> to disable. Common: <span class='mono'>30</span>, <span class='mono'>60</span>, <span class='mono'>15</span>.<br>Floor: 10s. Max: 600s.") }}</label>
+        <input type="number" step="5" min="0" max="600" name="crypto_fast_check_interval_sec" value="{{ fast_check_interval_sec }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+      </div>
     </div>
 
     {# === STRATEGY ENABLE/DISABLE === #}
