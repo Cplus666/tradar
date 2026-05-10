@@ -1,6 +1,15 @@
 {% extends 'crypto_base.html' %}
 {% block title %}Crypto Settings{% endblock %}
 
+{# Reusable hover-tooltip used to collapse long hint paragraphs into a single ⓘ
+   so labels stay tight and the form fits more on screen. #}
+{% macro tip(content) -%}
+<span class="relative group inline-block ml-1 align-middle">
+  <span class="text-zinc-500 hover:text-zinc-200 cursor-help text-xs">ⓘ</span>
+  <span class="invisible group-hover:visible absolute left-0 top-full mt-1 z-30 w-64 bg-zinc-900 border border-zinc-700 rounded shadow-lg p-2 text-[11px] text-zinc-300 normal-case whitespace-normal font-normal leading-relaxed">{{ content|safe }}</span>
+</span>
+{%- endmacro %}
+
 {% block content %}
 <h1 class="text-xl font-semibold mb-4">Crypto settings</h1>
 
@@ -57,8 +66,7 @@
     <div class="space-y-5">
     <h3 class="font-semibold border-b border-zinc-800 pb-2">Trading controls</h3>
     <div>
-      <label class="block text-sm font-semibold mb-1">Pause new buys</label>
-      <p class="text-xs text-zinc-500 mb-2">ON = no new positions opened. Existing positions still managed (stops, targets, partial takes, manual sell all all still work). Use this to drain down without slamming exit.</p>
+      <label class="block text-sm font-semibold mb-1">Pause new buys{{ tip("ON = no new positions opened. Existing positions still managed (stops, targets, partial takes, manual sell-all still work). Use this to drain down without slamming exit.") }}</label>
       <select name="crypto_kill_switch" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-64">
         <option value="off" {% if kill_switch == 'off' %}selected{% endif %}>OFF — new buys allowed</option>
         <option value="on" {% if kill_switch == 'on' %}selected{% endif %}>ON — block new buys (drain mode)</option>
@@ -66,8 +74,7 @@
     </div>
 
     <div>
-      <label class="block text-sm font-semibold mb-1">Trading mode</label>
-      <p class="text-xs text-zinc-500 mb-2">Paper = simulated. Live = real Binance orders.</p>
+      <label class="block text-sm font-semibold mb-1">Trading mode{{ tip("Paper = simulated. Live = real Binance orders.") }}</label>
       <select name="crypto_trading_mode" class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-64">
         <option value="paper" {% if trading_mode == 'paper' %}selected{% endif %}>paper</option>
         <option value="live" {% if trading_mode == 'live' %}selected{% endif %}>LIVE — real money</option>
@@ -84,36 +91,32 @@
     <h4 class="text-sm font-semibold text-zinc-300">Hard guardrails</h4>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Max position size (USD per trade)</label>
+      <label class="block text-xs font-semibold mb-1">Max position size (USD per trade){{ tip("Hard cap. System refuses any intent above this.") }}</label>
       <input type="number" step="1" min="1" name="crypto_max_position_usd" value="{{ max_position_usd }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">Hard cap. System refuses any intent above this.</p>
     </div>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Max concurrent open positions</label>
+      <label class="block text-xs font-semibold mb-1">Max concurrent open positions{{ tip("No new entries while at cap.") }}</label>
       <input type="number" step="1" min="1" max="10" name="crypto_max_concurrent" value="{{ max_concurrent }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">No new entries while at cap.</p>
     </div>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Min USDT balance before live mode allowed</label>
+      <label class="block text-xs font-semibold mb-1">Min USDT balance before live mode allowed{{ tip("Live orders refused if free USDT &lt; this.") }}</label>
       <input type="number" step="10" min="0" name="crypto_min_balance_usd" value="{{ min_balance_usd }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">Live orders refused if free USDT &lt; this.</p>
     </div>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Per-coin cooldown after losing exit (hours)</label>
+      <label class="block text-xs font-semibold mb-1">Per-coin cooldown after losing exit (hours){{ tip("After a losing SELL on a coin, block re-entry on the SAME coin for this many hours. Set 0 to disable.") }}</label>
       <input type="number" step="0.5" min="0" max="48" name="crypto_loss_cooldown_hours" value="{{ loss_cooldown_hours }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">After a losing SELL on a coin, block re-entry on the SAME coin for this many hours. Set 0 to disable.</p>
     </div>
 
     <div class="border-t border-zinc-800 pt-4">
       <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-        <h4 class="text-xs font-semibold uppercase text-zinc-400 tracking-wide">Daily P&amp;L auto-halts (soft, auto-resume next MYT day)</h4>
+        <h4 class="text-xs font-semibold uppercase text-zinc-400 tracking-wide">Daily P&amp;L auto-halts (soft, auto-resume next MYT day){{ tip("When today's P&amp;L crosses the threshold, the bot <strong>sells all open positions</strong> and halts new entries until next MYT midnight. Auto-resumes — no manual reset.") }}</h4>
         <label class="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
           <input type="checkbox" name="crypto_ghost_feature_enabled" value="on"
                  {% if ghost_feature_enabled == 'on' %}checked{% endif %}
@@ -128,7 +131,6 @@
           ↻ Refresh deposit/withdraw
         </button>
       </div>
-      <p class="text-xs text-zinc-500 mb-3">When today's P&amp;L crosses the threshold, the bot <strong>sells all open positions</strong> and halts new entries until next MYT midnight. Auto-resumes — no manual reset.</p>
 
       <div class="grid grid-cols-2 gap-4">
         <div>
@@ -138,13 +140,9 @@
                    class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
             Enable min P&amp;L halt (floor)
           </label>
-          <label class="block text-xs font-semibold mb-1">Min P&amp;L (%) — signed</label>
+          <label class="block text-xs font-semibold mb-1">Min P&amp;L (%) — signed{{ tip("If today P&amp;L ≤ this: sell all + halt.<br><span class='text-zinc-500'>e.g. <span class='mono'>-5</span> = halt at −5% (loss protection); <span class='mono'>+6</span> = halt at +6% (lock gains above 6%).</span>") }}</label>
           <input type="number" step="0.05" min="-50" max="50" name="crypto_loss_halt_pct" value="{{ loss_halt_pct }}"
                  class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-          <p class="text-xs text-zinc-500 mt-1">
-            If today P&amp;L ≤ this: sell all + halt.<br>
-            <span class="text-zinc-600">e.g. <span class="mono">-5</span> = halt at −5% (loss protection); <span class="mono">+6</span> = halt at +6% (lock gains above 6%).</span>
-          </p>
         </div>
 
         <div>
@@ -154,10 +152,9 @@
                    class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
             Enable max P&amp;L halt (ceiling)
           </label>
-          <label class="block text-xs font-semibold mb-1">Max P&amp;L (%) — positive</label>
+          <label class="block text-xs font-semibold mb-1">Max P&amp;L (%) — positive{{ tip("If today P&amp;L ≥ +X%: sell all + halt (take profit).") }}</label>
           <input type="number" step="0.05" min="0.5" max="50" name="crypto_profit_halt_pct" value="{{ profit_halt_pct }}"
                  class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-          <p class="text-xs text-zinc-500 mt-1">If today P&amp;L ≥ +X%: sell all + halt (take profit).</p>
         </div>
       </div>
 
@@ -180,33 +177,26 @@
     <h3 class="font-semibold border-b border-zinc-800 pb-2">Scheduler intervals</h3>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Full scan interval (minutes)</label>
+      <label class="block text-xs font-semibold mb-1">Full scan interval (minutes){{ tip("Heavy loop: refresh klines + scan all strategies + sync. Min 5 (Binance rate limits), max 60.") }}</label>
       <input type="number" step="1" min="5" max="60" name="crypto_loop_interval_min" value="{{ loop_interval_min }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">Heavy loop: refresh klines + scan all strategies + sync. Min 5 (Binance rate limits), max 60.</p>
     </div>
 
     <div>
-      <label class="block text-xs font-semibold mb-1">Fast exit-check interval (seconds)</label>
+      <label class="block text-xs font-semibold mb-1">Fast exit-check interval (seconds){{ tip("Light loop in <strong>seconds</strong>: checks current prices vs stop/target on open positions. Fires exits FAST.<br>Set to <span class='mono'>0</span> to disable. Common: <span class='mono'>30</span>, <span class='mono'>60</span>, <span class='mono'>15</span>.<br>Floor: 10s. Max: 600s.") }}</label>
       <input type="number" step="5" min="0" max="600" name="crypto_fast_check_interval_sec" value="{{ fast_check_interval_sec }}"
              class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-      <p class="text-xs text-zinc-500 mt-1">
-        Light loop in <strong>seconds</strong>: just checks current prices vs stop/target on open positions. Fires exits FAST. <br>
-        Set to <span class="mono">0</span> to disable. Common values: <span class="mono">30</span> (every 30s), <span class="mono">60</span> (1 min), <span class="mono">15</span> (very aggressive).<br>
-        Floor: 10s when enabled (rate-limit safety). Max: 600s (10 min).
-      </p>
     </div>
 
     {# === STRATEGY ENABLE/DISABLE === #}
     <hr class="border-zinc-800">
-    <h4 class="font-semibold border-b border-zinc-800 pb-2">Strategies</h4>
-    <p class="text-xs text-zinc-500 -mt-2">
-      Disable strategies that misfire in the current regime (e.g., turn off breakouts in choppy bear markets). Disabled strategies still scan and log signals — they just don't open positions.
-    </p>
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Strategies{{ tip("Disable strategies that misfire in the current regime (e.g., turn off breakouts in choppy bear markets). Disabled strategies still scan and log signals — they just don't open positions.") }}</h4>
     {# Hidden marker so the POST handler knows this section was submitted #}
     <input type="hidden" name="strategies_form_present" value="1">
 
-    {# Strategy spec table — keep in sync with analysis/crypto_strategies.py #}
+    {# Strategy spec table — shows target/stop/hold per strategy so user understands
+       what each one does. NOTE: keep these in sync with the actual strategy
+       implementations in analysis/crypto_strategies.py and simulator/strategies_*.py. #}
     {% set strategy_specs = {
       'breakout_4h':       {'target': '+10.6%', 'stop': '-6.6%',  'hold': '~96h', 'desc': '4h breakout above 20-bar high — wide R:R, slow signal'},
       'breakout_1h':       {'target': '+4.2%',  'stop': '-2.8%',  'hold': '~12h', 'desc': '1h scalper — small fast targets, high frequency'},
@@ -247,10 +237,7 @@
 
     {# === PARTIAL PROFIT-TAKE + BREAKEVEN-MOVE === #}
     <hr class="border-zinc-800">
-    <h4 class="font-semibold border-b border-zinc-800 pb-2">Partial profit-take</h4>
-    <p class="text-xs text-zinc-500 -mt-2">
-      Once a position runs to <strong>+trigger %</strong>, sell <strong>fraction</strong> at market and move the stop on the remainder to <strong>entry + buffer %</strong>. Locks in profit on chopped winners while letting runners go to target.
-    </p>
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Partial profit-take{{ tip("Once a position runs to <strong>+trigger %</strong>, sell <strong>fraction</strong> at market and move the stop on the remainder to <strong>entry + buffer %</strong>. Locks in profit on chopped winners while letting runners go to target.") }}</h4>
 
     <label class="flex items-center gap-2 text-xs font-semibold cursor-pointer">
       <input type="checkbox" name="crypto_partial_take_enabled" value="on"
@@ -261,37 +248,30 @@
 
     <div class="grid grid-cols-2 gap-3">
       <div>
-        <label class="block text-xs font-semibold mb-1">Trigger (%)</label>
+        <label class="block text-xs font-semibold mb-1">Trigger (%){{ tip("Fire at entry + this %.") }}</label>
         <input type="number" step="0.05" min="1" max="20" name="crypto_partial_take_trigger_pct" value="{{ partial_take_trigger_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">Fire at entry + this %</p>
       </div>
       <div>
-        <label class="block text-xs font-semibold mb-1">Fraction</label>
+        <label class="block text-xs font-semibold mb-1">Fraction{{ tip("0.5 = sell half.") }}</label>
         <input type="number" step="0.05" min="0.1" max="0.9" name="crypto_partial_take_fraction" value="{{ partial_take_fraction }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">0.5 = sell half</p>
       </div>
       <div>
-        <label class="block text-xs font-semibold mb-1">Stop buffer (%)</label>
+        <label class="block text-xs font-semibold mb-1">Stop buffer (%){{ tip("Min new stop = entry + this %.") }}</label>
         <input type="number" step="0.05" min="0" max="10" name="crypto_breakeven_buffer_pct" value="{{ breakeven_buffer_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">Min new stop = entry + this %</p>
       </div>
       <div>
-        <label class="block text-xs font-semibold mb-1">Lock fraction</label>
+        <label class="block text-xs font-semibold mb-1">Lock fraction{{ tip("Lock X of partial gain. 0.5 = half. New stop = entry × (1 + max(buffer, gain × this)/100).") }}</label>
         <input type="number" step="0.05" min="0" max="0.95" name="crypto_partial_lock_fraction" value="{{ partial_lock_fraction }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">Lock X of partial gain. 0.5 = half. New stop = entry × (1 + max(buffer, gain × this)/100)</p>
       </div>
     </div>
 
     {# === SURGE-PROMOTED RUNNER TRAIL === #}
     <hr class="border-zinc-800">
-    <h4 class="font-semibold border-b border-zinc-800 pb-2">Surge-promoted runner trail</h4>
-    <p class="text-xs text-zinc-500 -mt-2">
-      When a runner hits its strategy target AND a sudden surge is in progress, switch to <strong>trail mode</strong> instead of selling. Captures memecoin-style runs while keeping fixed-target behavior on normal trades.
-    </p>
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Surge-promoted runner trail{{ tip("When a runner hits its strategy target AND a sudden surge is in progress, switch to <strong>trail mode</strong> instead of selling. Captures memecoin-style runs while keeping fixed-target behavior on normal trades.") }}</h4>
 
     <label class="flex items-center gap-2 text-xs font-semibold cursor-pointer">
       <input type="checkbox" name="crypto_surge_promote_enabled" value="on"
@@ -302,22 +282,19 @@
 
     <div class="grid grid-cols-3 gap-3">
       <div>
-        <label class="block text-xs font-semibold mb-1">Surge ROC over 15 min (%)</label>
+        <label class="block text-xs font-semibold mb-1">Surge ROC over 15 min (%){{ tip("Price must rise this much in last 15 min to qualify as a surge.") }}</label>
         <input type="number" step="0.5" min="0" max="50" name="crypto_surge_roc_15min_pct" value="{{ surge_roc_15min_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">Price must rise this much in last 15 min to qualify as a surge.</p>
       </div>
       <div>
-        <label class="block text-xs font-semibold mb-1">Volume multiplier</label>
+        <label class="block text-xs font-semibold mb-1">Volume multiplier{{ tip("Volume in last 15 min must be ≥ this × avg of preceding 45 min.") }}</label>
         <input type="number" step="0.1" min="1" max="10" name="crypto_surge_vol_mult" value="{{ surge_vol_mult }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">Volume in last 15 min must be ≥ this × avg of preceding 45 min.</p>
       </div>
       <div>
-        <label class="block text-xs font-semibold mb-1">Trail pullback (%)</label>
+        <label class="block text-xs font-semibold mb-1">Trail pullback (%){{ tip("Sell when price drops this % from peak after promotion.") }}</label>
         <input type="number" step="0.1" min="0.5" max="15" name="crypto_surge_trail_pct" value="{{ surge_trail_pct }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-        <p class="text-xs text-zinc-500 mt-1">Sell when price drops this % from peak after promotion.</p>
       </div>
     </div>
 
@@ -328,20 +305,6 @@
       <button class="bg-emerald-700 hover:bg-emerald-600 text-white px-8 py-2 rounded">Save settings</button>
     </div>
   </form>
-
-  {# === Paper deposit/withdraw — separate form so it can't nest inside settings form === #}
-  {% if trading_mode != 'live' %}
-  <div class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-    <h3 class="text-sm font-semibold mb-3 text-amber-400">Paper deposit / withdraw</h3>
-    <form method="post" action="{{ url_for('crypto.api_paper_deposit') }}" class="flex items-center gap-3 flex-wrap">
-      <span class="text-xs text-zinc-500 mono">$</span>
-      <input type="number" step="0.01" name="amount" placeholder="100 or -50" required
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 w-36 mono text-zinc-200">
-      <button type="submit" class="text-xs bg-amber-700 hover:bg-amber-600 text-white px-4 py-1.5 rounded">Apply</button>
-      <span class="text-xs text-zinc-500">Positive = deposit, negative = withdrawal. Adds to today's daily total.</span>
-    </form>
-  </div>
-  {% endif %}
 
   {# === Below the settings form: API credentials + Server IP in a 2-col row === #}
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
