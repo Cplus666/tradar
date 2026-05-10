@@ -208,8 +208,6 @@
       'oversold_meanrev':  {'target': '+9.1%',  'stop': '-3.5%',  'hold': '~24h', 'desc': 'Oversold bounce, tight stop, mean-reversion'}
     } %}
 
-    <p class="text-[11px] text-zinc-500 -mt-1 mb-1">Hover <span class="text-zinc-400">ⓘ</span> to see each strategy's target / stop / max-hold.</p>
-
     <div class="space-y-1">
       {% for s in strategy_names %}
         {% set spec = strategy_specs.get(s, {}) %}
@@ -239,8 +237,6 @@
         </label>
       {% endfor %}
     </div>
-
-    <p class="text-[11px] text-zinc-500 mt-1">⚠ Partial-take fires at +4% globally (set below). If a strategy's own target is near +4% (e.g. breakout_1h +4.2%), both halves exit together — set partial trigger lower than your targets to let the runner reach further.</p>
 
     {# === PARTIAL PROFIT-TAKE + BREAKEVEN-MOVE === #}
     <hr class="border-zinc-800">
