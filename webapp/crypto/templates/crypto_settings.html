@@ -286,6 +286,34 @@
       </div>
     </div>
 
+    {# === SURGE-PROMOTED RUNNER TRAIL === #}
+    <hr class="border-zinc-800">
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Surge-promoted runner trail</h4>
+    <p class="text-xs text-zinc-500 -mt-2">
+      When a runner hits its strategy target AND a sudden surge is in progress, switch to <strong>trail mode</strong> instead of selling. Captures SUI-style runs while keeping fixed-target behavior on normal trades. Set ROC to a high value (e.g. 99) to effectively disable.
+    </p>
+
+    <div class="grid grid-cols-3 gap-3">
+      <div>
+        <label class="block text-xs font-semibold mb-1">Surge ROC over 15 min (%)</label>
+        <input type="number" step="0.5" min="0" max="50" name="crypto_surge_roc_15min_pct" value="{{ surge_roc_15min_pct }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">Price must rise this much in last 15 min to qualify as a surge.</p>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Volume multiplier</label>
+        <input type="number" step="0.1" min="1" max="10" name="crypto_surge_vol_mult" value="{{ surge_vol_mult }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">Volume in last 15 min must be ≥ this × avg of preceding 45 min.</p>
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Trail pullback (%)</label>
+        <input type="number" step="0.1" min="0.5" max="15" name="crypto_surge_trail_pct" value="{{ surge_trail_pct }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+        <p class="text-xs text-zinc-500 mt-1">Sell when price drops this % from peak after promotion.</p>
+      </div>
+    </div>
+
     </div>{# === END INNER RIGHT COLUMN === #}
     </div>{# === END inner 2-col grid === #}
 

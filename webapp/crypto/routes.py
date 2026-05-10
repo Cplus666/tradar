@@ -1745,6 +1745,7 @@ def settings():
         "crypto_loss_halt_enabled", "crypto_loss_halt_pct",
         "crypto_profit_halt_enabled", "crypto_profit_halt_pct",
         "crypto_ghost_feature_enabled",
+        "crypto_surge_roc_15min_pct", "crypto_surge_vol_mult", "crypto_surge_trail_pct",
     )
     if request.method == "POST":
         if request.form.get("settings_form_present") == "1":
@@ -1844,6 +1845,9 @@ def settings():
         today_loss_halted=_setting("crypto_today_loss_halted", "0"),
         today_profit_halted=_setting("crypto_today_profit_halted", "0"),
         ghost_feature_enabled=_setting("crypto_ghost_feature_enabled", "on"),
+        surge_roc_15min_pct=_setting("crypto_surge_roc_15min_pct", "5.0"),
+        surge_vol_mult=_setting("crypto_surge_vol_mult", "2.0"),
+        surge_trail_pct=_setting("crypto_surge_trail_pct", "3.0"),
         health=health,
         strategy_names=STRATEGY_NAMES,
         disabled_strategies=disabled_strategies,

@@ -780,6 +780,7 @@ def parse_entry_notes(notes: str | None) -> dict:
     out = {
         "stop": None, "target": None, "max_hold": 24, "exit_rule": "stop_target_time",
         "partial_done": False, "original_stop": None,
+        "trail_active": False, "trail_high": None,
     }
     if not notes:
         return out
@@ -801,7 +802,74 @@ def parse_entry_notes(notes: str | None) -> dict:
         elif token.startswith("original_stop=$"):
             try: out["original_stop"] = float(token.replace("original_stop=$", ""))
             except ValueError: pass
+        elif token == "trail_active=1":
+            out["trail_active"] = True
+        elif token.startswith("trail_high=$"):
+            try: out["trail_high"] = float(token.replace("trail_high=$", ""))
+            except ValueError: pass
     return out
+
+
+def _detect_surge(symbol: str) -> bool:
+    """Detect a sudden price+volume surge over the last 15 minutes.
+    Returns True if last-15min ROC >= surge_roc_15min_pct AND last-15min volume
+    >= surge_vol_mult x avg per-15min volume of the previous 45 minutes.
+    Single 1m-klines API call per invocation; caller should gate to rare events."""
+    try:
+        roc_pct = float(_get_setting("crypto_surge_roc_15min_pct") or "5.0")
+        vol_mult = float(_get_setting("crypto_surge_vol_mult") or "2.0")
+    except (TypeError, ValueError):
+        roc_pct, vol_mult = 5.0, 2.0
+    try:
+        from binance.client import Client
+        klines = Client().get_klines(symbol=symbol, interval="1m", limit=60)
+    except Exception as e:
+        log.warning("surge detect %s: kline fetch failed: %s", symbol, e)
+        return False
+    if not klines or len(klines) < 60:
+        return False
+    try:
+        first_close = float(klines[-16][4])
+        last_close = float(klines[-1][4])
+        if first_close <= 0:
+            return False
+        roc = (last_close - first_close) / first_close * 100.0
+        if roc < roc_pct:
+            return False
+        last_15_vol = sum(float(k[5]) for k in klines[-15:])
+        prev_45_vol = sum(float(k[5]) for k in klines[-60:-15])
+        if prev_45_vol <= 0:
+            return False
+        prev_15_avg = prev_45_vol / 3.0
+        return last_15_vol >= vol_mult * prev_15_avg
+    except (ValueError, IndexError) as e:
+        log.warning("surge detect %s: parse failed: %s", symbol, e)
+        return False
+
+
+def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> None:
+    """Update notes to set or refresh trail-mode state. Idempotent."""
+    from webapp.models import db
+    parts: list[str] = []
+    seen_active = False
+    seen_high = False
+    if position.notes:
+        for token in position.notes.split("·"):
+            t = token.strip()
+            if t == "trail_active=1":
+                seen_active = True
+                parts.append(t)
+            elif t.startswith("trail_high=$"):
+                seen_high = True
+                parts.append(f"trail_high=${_fmt_price(high_water)}")
+            elif t:
+                parts.append(t)
+    if activate and not seen_active:
+        parts.append("trail_active=1")
+    if not seen_high:
+        parts.append(f"trail_high=${_fmt_price(high_water)}")
+    position.notes = " · ".join(parts)
+    db.session.commit()
 
 
 def _open_positions(is_paper: bool | None = None) -> list:

@@ -120,7 +120,7 @@ def run_fast_exit_check() -> None:
     """
     from analysis.crypto_executor import (
         _open_positions, parse_entry_notes, execute_sell, execute_partial_sell,
-        _get_setting, _binance_client,
+        _get_setting, _binance_client, _detect_surge, _set_trail_in_notes,
     )
     from analysis.crypto_strategies import _btc_trend_ok
 
@@ -157,8 +157,24 @@ def run_fast_exit_check() -> None:
             exit_reason = "REGIME EXIT (BTC trend broken)"
         elif meta["stop"] is not None and cur <= meta["stop"]:
             exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
+        elif meta.get("trail_active"):
+            try:
+                trail_pct = float(_get_setting("crypto_surge_trail_pct") or "3.0")
+            except (TypeError, ValueError):
+                trail_pct = 3.0
+            high = max(float(meta.get("trail_high") or cur), cur)
+            if high > float(meta.get("trail_high") or 0):
+                _set_trail_in_notes(pos, high)
+            trail_stop = high * (1 - trail_pct / 100.0)
+            if cur <= trail_stop:
+                exit_reason = (f"trail stop hit (${cur:.6f} <= ${trail_stop:.6f}, "
+                               f"peak ${high:.6f}, trail {trail_pct:.1f}%)")
         elif meta["target"] is not None and cur >= meta["target"]:
-            exit_reason = f"target hit (${cur:.6f} >= ${meta['target']:.6f})"
+            if _detect_surge(pos.symbol):
+                _set_trail_in_notes(pos, cur, activate=True)
+                log.info("SURGE PROMOTED %s @ $%.6f — runner switched to trail mode", pos.symbol, cur)
+            else:
+                exit_reason = f"target hit (${cur:.6f} >= ${meta['target']:.6f})"
         elif bars_held >= meta["max_hold"]:
             exit_reason = f"time stop ({bars_held}/{meta['max_hold']} bars)"
 
