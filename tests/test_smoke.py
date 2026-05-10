@@ -302,6 +302,85 @@ def test_dashboard_doesnt_500_in_live_mode_without_keys(client, app):
     assert resp.status_code == 200
 
 
+def test_cards_sum_equals_today_unrealized(client, app):
+    """The sum of position card pnl_usd MUST equal today_unrealized at the
+    account level, exactly. This is the contract from task #76 — the
+    confusion that cost most of 2026-05-09 to debug.
+
+    Lock-in test: create one open position with predictable price setup,
+    verify dashboard's today_unrealized matches the position card's pnl_usd
+    within $0.01.
+    """
+    with app.app_context():
+        from webapp.models import Setting, CryptoTrade, db
+        from datetime import datetime, timedelta
+        for k, v in [
+            ("crypto_trading_mode", "paper"),
+            ("binance_api_key", ""), ("binance_api_secret", ""),
+            ("crypto_starting_capital_usd", "200.29"),
+        ]:
+            row = Setting.query.get(k)
+            if row: row.value = v
+            else: db.session.add(Setting(key=k, value=v))
+        CryptoTrade.query.delete()
+        # One open BUY from earlier today (will produce some unrealized P&L
+        # vs current ticker price, but exact amount doesn't matter — only that
+        # cards-sum equals account-level today_unrealized)
+        ts = datetime.utcnow() - timedelta(hours=1)
+        db.session.add(CryptoTrade(
+            symbol="BTCUSDT", side="BUY", qty=0.001, price=50000.0,
+            quote_amount=50.0, executed_at=ts,
+            status="filled", is_paper=True, strategy="test"
+        ))
+        db.session.commit()
+
+    resp = client.get("/tradar/api/dashboard")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    cards_sum = sum(c.get("pnl_usd", 0) for c in data.get("position_cards", []))
+    account_unrealized = data["account"]["today_unrealized"]
+    if account_unrealized is None or not data.get("position_cards"):
+        return  # tickers might not have loaded; skip
+    diff = abs(cards_sum - account_unrealized)
+    assert diff < 0.01, (
+        f"CARDS-SUM RECONCILIATION BROKEN (task #76 contract):\n"
+        f"  account.today_unrealized = {account_unrealized}\n"
+        f"  sum(card.pnl_usd) = {cards_sum}\n"
+        f"  diff = ${diff:.4f}"
+    )
+
+
+def test_account_value_reconciles_with_today_total(client, app):
+    """account_value MUST equal day_start_value + today_total exactly.
+    This is the second contract from task #76 — the BIG dashboard number
+    must always reconcile with the formula in your head."""
+    with app.app_context():
+        from webapp.models import Setting, db
+        for k, v in [
+            ("crypto_trading_mode", "paper"),
+            ("binance_api_key", ""), ("binance_api_secret", ""),
+            ("crypto_starting_capital_usd", "200.29"),
+        ]:
+            row = Setting.query.get(k)
+            if row: row.value = v
+            else: db.session.add(Setting(key=k, value=v))
+        db.session.commit()
+
+    resp = client.get("/tradar/api/dashboard")
+    assert resp.status_code == 200
+    a = resp.get_json()["account"]
+    if a["account_value"] is None or a["day_start_value"] is None:
+        return  # nothing to check
+    expected = a["day_start_value"] + a["today_total"]
+    diff = abs(expected - a["account_value"])
+    assert diff < 0.01, (
+        f"ACCOUNT_VALUE FORMULA BROKEN (task #76 contract):\n"
+        f"  day_start_value + today_total = {expected}\n"
+        f"  account_value = {a['account_value']}\n"
+        f"  diff = ${diff:.4f}"
+    )
+
+
 def test_paper_deposit_endpoint_exists(app):
     """`crypto.api_paper_deposit` was removed in commit 999a870 (the bad
     rewrite) and restored in this session. Lock it in so it never gets

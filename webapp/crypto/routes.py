@@ -233,7 +233,11 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         today_unrealized += gross - fee
     out["open_count"] = len(open_pos)
     out["open_value"] = open_value
-    out["account_value"] = out["usdt_free"] + open_value
+    # Real balance from Binance (live) or synthesized cash + open value (paper).
+    # We expose this separately as `binance_real_balance` for the drift indicator.
+    # The displayed `account_value` will be the DERIVED value (day_start + realized
+    # + unrealized) so it always reconciles with cards. See the day-start block below.
+    binance_real_balance = out["usdt_free"] + open_value
 
     # NOTE: _account_summary used to call update_day_start_and_check_halt here,
     # but that triggered halt sells inside a function whose first job is to
@@ -284,7 +288,12 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
             if t.side == "BUY":
                 buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
+                # One SELL = one round-trip = one W/L tick. Old code counted
+                # each FIFO buy-lot consumption as a separate W/L → multi-lot
+                # SELL produced phantom extra wins/losses.
                 sell_qty_remaining = float(t.qty)
+                sell_event_pnl = 0.0
+                sell_event_today = (t.executed_at >= today_start_utc)
                 while sell_qty_remaining > 1e-9 and buys:
                     buy, buy_remaining = buys[0]
                     consumed = min(buy_remaining, sell_qty_remaining)
@@ -298,12 +307,16 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
                     fee = (buy_value + sell_value) * fee_rate
                     pnl = gross - fee
                     all_realized += pnl
-                    if t.executed_at >= today_start_utc:
+                    sell_event_pnl += pnl
+                    if sell_event_today:
                         today_realized += pnl
-                        if pnl > 0: today_wins += 1
-                        else: today_losses += 1
                     if buys[0][1] <= 1e-9:
                         buys.pop(0)
+                if sell_event_today:
+                    if sell_event_pnl > 0:
+                        today_wins += 1
+                    else:
+                        today_losses += 1
     # Today's P&L — designed to RECONCILE with account_value:
     #   today_realized   = trades closed today (sum of net P&L from FIFO)
     #   today_unrealized = current unrealized on ALL open positions (vs entry)
@@ -329,32 +342,36 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     out["today_losses"] = today_losses
     if today_wins + today_losses > 0:
         out["today_win_rate"] = today_wins / (today_wins + today_losses) * 100
-    out["all_time_pnl"] = out["account_value"] - out["starting_capital"] if out["account_value"] else 0
 
-    # Day-start derivation differs by mode:
-    #   Live mode: trust the stored snapshot (set at midnight from real Binance
-    #     balance) and derive today_unrealized = today_total − today_realized.
-    #     This catches deposits/withdrawals during the day that show up as
-    #     "unrealized" delta.
-    #   Paper mode: stored snapshot is unreliable (no real Binance call), so
-    #     use the per-position-card sum we already computed in the loop above.
-    #     today_total = today_realized + today_unrealized; day_start derived
-    #     from account_value − today_total (always reconciles).
+    # === UNIFIED DERIVED-MATH BLOCK (task #76) =================================
+    # Goal: cards must add up EXACTLY to today_unrealized; account_value must
+    # always equal day_start + today_realized + today_unrealized. The real
+    # Binance balance (which can drift due to dust price moves, untracked
+    # fees, deposits) is shown separately as a small drift indicator so the
+    # user sees reality without it polluting the main P&L numbers.
     #
-    # Without this split, paper mode read a stale stored_day_start from a
-    # prior config and computed today_unrealized = -$6,200 while the actual
-    # per-position sum was -$37 (off by ~167×). Fixed 2026-05-09.
+    # Live mode: day_start = real Binance balance snapshotted at MYT 00:00
+    # Paper mode: day_start = derived from trade history (no Binance call)
+
+    out["today_unrealized"] = today_unrealized            # always = sum(card.pnl_usd)
+    today_total = today_realized + today_unrealized       # always reconciles
+    out["today_total"] = today_total
+
+    # Day-start: differs by mode per user's mental model
+    #   PAPER: day_start = principal + Σ realized BEFORE today.
+    #     Excludes overnight unrealized — open positions "carry" their unrealized
+    #     forward as today_unrealized until they close. When they finally close,
+    #     the FULL P&L (including overnight portion) becomes realized that day.
+    #     Math: account_value = day_start + today_realized + today_unrealized
+    #     reconciles correctly.
+    #   LIVE: day_start = real Binance balance snapshotted at MYT 00:00.
+    #     Captures actual portfolio value (incl. overnight unrealized + dust).
     if is_paper:
-        # Paper: use the loop-computed today_unrealized as truth
-        out["today_unrealized"] = today_unrealized
-        today_total = today_realized + today_unrealized
-        out["today_total"] = today_total
-        if out["account_value"] is not None:
-            out["day_start_value"] = out["account_value"] - today_total
-        else:
-            out["day_start_value"] = out["starting_capital"]
+        # Always derive from formula — never trust stored snapshot for paper
+        # because midnight rollover stores `current_value` (with unrealized)
+        # which contradicts user's "no unrealized in day_start" intent.
+        out["day_start_value"] = out["starting_capital"] + (all_realized - today_realized)
     else:
-        # Live: trust the stored Binance midnight snapshot
         stored_day_start = 0.0
         try:
             stored_day_start = float(_setting("crypto_day_start_value_usd", "0") or 0)
@@ -363,13 +380,24 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         if stored_day_start <= 0:
             stored_day_start = out["starting_capital"] + (all_realized - today_realized)
         out["day_start_value"] = stored_day_start
-        today_total = (out["account_value"] - stored_day_start) if out["account_value"] else 0.0
-        out["today_total"] = today_total
-        out["today_unrealized"] = today_total - today_realized
+
+    # account_value (DISPLAYED) = derived. Always reconciles with cards.
+    out["account_value"] = out["day_start_value"] + today_total
+
+    # Drift = how much real Binance differs from our derived account.
+    # Positive = Binance has MORE than dashboard says (dust appreciated, etc.)
+    # Negative = Binance has LESS (we're overestimating — should not happen often)
+    # Show this as a small badge under account_value in the dashboard.
+    out["binance_real_balance"] = binance_real_balance
+    out["drift_vs_binance"] = binance_real_balance - out["account_value"]
+
+    # All-time P&L uses the derived account vs the starting principal
+    out["all_time_pnl"] = out["account_value"] - out["starting_capital"]
+    # === END UNIFIED DERIVED-MATH BLOCK ========================================
 
     # P&L percentages — divide by day_start_value (positive number)
     day_start_for_pct = out["day_start_value"]
-    if day_start_for_pct and day_start_for_pct > 0 and out["account_value"] is not None:
+    if day_start_for_pct and day_start_for_pct > 0:
         out["today_total_pct"] = today_total / day_start_for_pct * 100
         out["today_pnl_pct"] = today_total / day_start_for_pct * 100
         out["drawdown_pct"] = -out["today_pnl_pct"] if out["today_pnl_pct"] < 0 else 0.0
@@ -980,7 +1008,10 @@ def api_dashboard_static():
             if t.side == "BUY":
                 buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
+                # See _account_summary above — one SELL = one W/L tick.
                 sell_qty_remaining = float(t.qty)
+                sell_event_pnl = 0.0
+                sell_event_today = (t.executed_at >= today_start_utc)
                 while sell_qty_remaining > 1e-9 and buys:
                     buy, buy_remaining = buys[0]
                     consumed = min(buy_remaining, sell_qty_remaining)
@@ -993,12 +1024,16 @@ def api_dashboard_static():
                     gross = sell_value - buy_value
                     fee = (buy_value + sell_value) * fee_rate
                     pnl = gross - fee
-                    if t.executed_at >= today_start_utc:
+                    sell_event_pnl += pnl
+                    if sell_event_today:
                         today_realized += pnl
-                        if pnl > 0: today_wins += 1
-                        else: today_losses += 1
                     if buys[0][1] <= 1e-9:
                         buys.pop(0)
+                if sell_event_today:
+                    if sell_event_pnl > 0:
+                        today_wins += 1
+                    else:
+                        today_losses += 1
     # Halt-banner fields populated from settings (no Binance call needed) so
     # the banner doesn't flicker off during the static-render window. JS reads
     # `=== true` strictly, so undefined values would have hidden the banner.

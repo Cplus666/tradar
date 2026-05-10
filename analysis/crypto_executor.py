@@ -552,14 +552,63 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
     # (instead of waiting until next MYT midnight to re-sync).
     snap_format = _get_setting("crypto_day_start_format") or ""
 
-    # New MYT day → re-snapshot with ACTUAL account value + clear halt flags.
-    # Using current_value (live Binance balance) avoids synth-formula drift.
-    # day_start is set ONCE at midnight and never changed during the day —
-    # halts are trading gates only, not P&L resets.
+    # New MYT day → re-snapshot day_start + clear halt flags.
+    #
+    # PAPER mode: day_start = principal + Σ all-time realized P&L (excludes
+    # unrealized; matches dashboard formula in _account_summary). At midnight
+    # rollover, today_realized was 0 (rolled over by the date check above), so
+    # this equals "yesterday's day_end + yesterday's realized" = next day's open.
+    #
+    # LIVE mode: day_start = current_value (real Binance balance, includes dust
+    # + unrealized). Captures actual portfolio state — needed to catch deposits
+    # that happen mid-rollover.
     if snap_date != today_str or snap_value <= 0:
+        if _is_paper_mode_setting():
+            # Compute principal + Σ all-time realized for paper-mode day_start.
+            # Avoid circular import by inlining a minimal FIFO realized calc here.
+            from webapp.models import CryptoTrade
+            try:
+                fee_rate_dsv = float(_get_setting("crypto_fee_rate_per_side") or "0.001")
+            except (TypeError, ValueError):
+                fee_rate_dsv = 0.001
+            paper_trades = (CryptoTrade.query
+                            .filter_by(is_paper=True)
+                            .filter(CryptoTrade.strategy != "manual_liquidation")
+                            .order_by(CryptoTrade.executed_at)
+                            .all())
+            by_sym_dsv = {}
+            for t in paper_trades:
+                by_sym_dsv.setdefault(t.symbol, []).append(t)
+            all_realized = 0.0
+            for sym, ts in by_sym_dsv.items():
+                buys = []
+                for t in ts:
+                    if t.side == "BUY":
+                        buys.append([t, float(t.qty)])
+                    elif t.side == "SELL" and buys:
+                        sell_qty = float(t.qty)
+                        while sell_qty > 1e-9 and buys:
+                            buy, br = buys[0]
+                            consumed = min(br, sell_qty)
+                            buys[0][1] -= consumed
+                            sell_qty -= consumed
+                            bq = float(buy.qty) or 1
+                            sq = float(t.qty) or 1
+                            bv = float(buy.quote_amount or float(buy.price)*float(buy.qty)) * (consumed/bq)
+                            sv = float(t.quote_amount or float(t.price)*float(t.qty)) * (consumed/sq)
+                            all_realized += (sv - bv) - (bv + sv) * fee_rate_dsv
+                            if buys[0][1] <= 1e-9:
+                                buys.pop(0)
+            try:
+                principal = float(_get_setting("crypto_starting_capital_usd") or "0")
+            except (TypeError, ValueError):
+                principal = 0.0
+            day_start_to_save = principal + all_realized
+        else:
+            day_start_to_save = current_value
         _set_setting("crypto_day_start_date", today_str)
-        _set_setting("crypto_day_start_value_usd", f"{current_value:.4f}")
-        _set_setting("crypto_day_start_format", "live")
+        _set_setting("crypto_day_start_value_usd", f"{day_start_to_save:.4f}")
+        _set_setting("crypto_day_start_format", "synth" if _is_paper_mode_setting() else "live")
         _set_setting("crypto_today_loss_halted", "0")
         _set_setting("crypto_today_profit_halted", "0")
         _set_setting("crypto_today_loss_overridden", "0")

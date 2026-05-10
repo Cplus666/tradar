@@ -54,6 +54,7 @@
     <div>
       <div class="text-xs text-zinc-400 uppercase tracking-wide">Account value</div>
       <div id="pnl-account-value" class="text-4xl font-bold mono num mt-1 text-zinc-600">loading…</div>
+      <div id="pnl-drift" class="text-[10px] text-zinc-500 mt-0.5 hidden" title="Difference between dashboard's derived account value and the real Binance balance. Comes from dust price drift, untracked fees, or deposits. Convert dust on Binance to bring this back to ~$0."></div>
       <div id="pnl-updated" class="text-xs mt-1"></div>
     </div>
     <div class="text-right">
@@ -677,13 +678,27 @@
         else banner.classList.add('bg-zinc-900','border-zinc-700');
       }
 
-      // Account value (live only)
+      // Account value (live only) — DERIVED = day_start + realized + unrealized.
+      // Always reconciles with cards. Real Binance balance can drift from this
+      // (dust price moves, untracked fees, deposits) — shown as a small badge.
       const accVal = document.getElementById('pnl-account-value');
       if (a.account_value != null) {
         accVal.textContent = '$' + a.account_value.toFixed(2);
         accVal.classList.remove('text-zinc-600');
       } else if (isStatic) {
         accVal.textContent = 'loading…';
+      }
+
+      // Drift indicator — small badge under account value
+      const driftEl = document.getElementById('pnl-drift');
+      if (driftEl && a.drift_vs_binance != null && Math.abs(a.drift_vs_binance) >= 0.05) {
+        const d = a.drift_vs_binance;
+        const sign = d >= 0 ? '+' : '';
+        const cls = Math.abs(d) >= 5 ? 'text-amber-400' : 'text-zinc-500';
+        driftEl.className = `text-[10px] ${cls} mt-0.5`;
+        driftEl.textContent = `drift vs Binance: ${sign}$${d.toFixed(2)}`;
+      } else if (driftEl) {
+        driftEl.classList.add('hidden');
       }
 
       // "Last updated" timestamp under the account value — auto-ticks via
