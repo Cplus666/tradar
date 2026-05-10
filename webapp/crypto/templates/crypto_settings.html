@@ -198,19 +198,46 @@
     </p>
     {# Hidden marker so the POST handler knows this section was submitted #}
     <input type="hidden" name="strategies_form_present" value="1">
-    <div class="space-y-2">
+
+    {# Strategy spec table — keep in sync with analysis/crypto_strategies.py #}
+    {% set strategy_specs = {
+      'breakout_4h':       {'target': '+10.6%', 'stop': '-6.6%',  'hold': '~96h', 'desc': '4h breakout above 20-bar high — wide R:R, slow signal'},
+      'breakout_1h':       {'target': '+4.2%',  'stop': '-2.8%',  'hold': '~12h', 'desc': '1h scalper — small fast targets, high frequency'},
+      'momentum_surge':    {'target': '+8.0%',  'stop': '-5.0%',  'hold': '~12h', 'desc': 'RSI + 24h vol spike — catches early momentum'},
+      'pullback_uptrend':  {'target': '+8.7%',  'stop': '-7.0%',  'hold': '~72h', 'desc': 'Pullback 5-10% in uptrend, RSI 35-58 reversal'},
+      'oversold_meanrev':  {'target': '+9.1%',  'stop': '-3.5%',  'hold': '~24h', 'desc': 'Oversold bounce, tight stop, mean-reversion'}
+    } %}
+
+    <div class="bg-zinc-950/50 border border-zinc-800 rounded p-2 mb-2 text-[11px]">
+      <div class="text-zinc-500 mb-1">⚠ Note: <strong>partial-take fires at +4%</strong> globally (set below). When that's near or at a strategy's own target (e.g. breakout_1h's +4.2%), both halves exit close together — no "second leg runs to higher %" effect. To capture more on the runner half, set partial trigger LOWER than your strategies' targets.</div>
+    </div>
+
+    <div class="space-y-1.5">
       {% for s in strategy_names %}
-        <label class="flex items-center gap-3 text-sm cursor-pointer">
+        {% set spec = strategy_specs.get(s, {}) %}
+        <div class="flex items-start gap-3 text-sm bg-zinc-950/30 border border-zinc-800 rounded p-2">
           <input type="checkbox" name="strategy_enabled" value="{{ s }}"
                  {% if s not in disabled_strategies %}checked{% endif %}
-                 class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
-          <span class="mono">{{ s }}</span>
-          {% if s in disabled_strategies %}
-            <span class="text-xs text-rose-400">disabled</span>
-          {% else %}
-            <span class="text-xs text-emerald-400">active</span>
-          {% endif %}
-        </label>
+                 class="w-4 h-4 mt-0.5 rounded bg-zinc-950 border-zinc-700 cursor-pointer flex-shrink-0">
+          <div class="flex-1 min-w-0">
+            <div class="flex items-baseline gap-2 flex-wrap">
+              <span class="mono font-semibold">{{ s }}</span>
+              {% if s in disabled_strategies %}
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-900/40 text-rose-300">disabled</span>
+              {% else %}
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-300">active</span>
+              {% endif %}
+              {% if spec %}
+                <span class="text-[10px] mono text-emerald-400">target {{ spec.target }}</span>
+                <span class="text-[10px] mono text-rose-400">stop {{ spec.stop }}</span>
+                <span class="text-[10px] mono text-zinc-500">max-hold {{ spec.hold }}</span>
+              {% endif %}
+            </div>
+            {% if spec %}
+              <div class="text-[11px] text-zinc-500 mt-0.5">{{ spec.desc }}</div>
+            {% endif %}
+          </div>
+        </div>
       {% endfor %}
     </div>
 
