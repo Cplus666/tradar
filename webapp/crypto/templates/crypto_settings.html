@@ -16,9 +16,15 @@
 {# === SYSTEM HEALTH PANEL — "is the bot alive and working?" at a glance === #}
 {% if health %}
 <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 mb-4">
-  <div class="flex items-center justify-between mb-3">
-    <h2 class="font-semibold text-zinc-200">System health</h2>
-    <span class="text-xs text-zinc-500">live snapshot</span>
+  <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+    <div class="flex items-center gap-3">
+      <h2 class="font-semibold text-zinc-200">System health</h2>
+      <span class="text-xs text-zinc-500">live snapshot</span>
+    </div>
+    <form method="post" action="{{ url_for('crypto.api_deposits_refresh') }}" class="inline"
+          onsubmit="return confirm('Pull today\'s USDT deposits/withdrawals from Binance and update the synth day-start?');">
+      <button class="text-xs bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-3 py-1 rounded">↻ Refresh deposit/withdraw</button>
+    </form>
   </div>
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
     <div class="bg-zinc-950 rounded p-3">
@@ -123,13 +129,6 @@
                  class="w-3.5 h-3.5 rounded bg-zinc-950 border-zinc-700">
           Ghost simulation
         </label>
-        <button type="submit"
-                formaction="{{ url_for('crypto.api_deposits_refresh') }}"
-                formmethod="post"
-                onclick="return confirm('Pull today\'s USDT deposits/withdrawals from Binance and update the synth day-start?');"
-                class="text-xs bg-emerald-800 hover:bg-emerald-700 text-emerald-100 px-3 py-1 rounded">
-          ↻ Refresh deposit/withdraw
-        </button>
       </div>
 
       <div class="grid grid-cols-2 gap-4">
