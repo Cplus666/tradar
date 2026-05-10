@@ -814,7 +814,10 @@ def _detect_surge(symbol: str) -> bool:
     """Detect a sudden price+volume surge over the last 15 minutes.
     Returns True if last-15min ROC >= surge_roc_15min_pct AND last-15min volume
     >= surge_vol_mult x avg per-15min volume of the previous 45 minutes.
-    Single 1m-klines API call per invocation; caller should gate to rare events."""
+    Single 1m-klines API call per invocation; caller should gate to rare events.
+    Returns False unconditionally when crypto_surge_promote_enabled is off."""
+    if (_get_setting("crypto_surge_promote_enabled") or "on").lower() != "on":
+        return False
     try:
         roc_pct = float(_get_setting("crypto_surge_roc_15min_pct") or "2.5")
         vol_mult = float(_get_setting("crypto_surge_vol_mult") or "2.0")

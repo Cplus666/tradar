@@ -1745,6 +1745,7 @@ def settings():
         "crypto_loss_halt_enabled", "crypto_loss_halt_pct",
         "crypto_profit_halt_enabled", "crypto_profit_halt_pct",
         "crypto_ghost_feature_enabled",
+        "crypto_surge_promote_enabled",
         "crypto_surge_roc_15min_pct", "crypto_surge_vol_mult", "crypto_surge_trail_pct",
     )
     if request.method == "POST":
@@ -1757,6 +1758,8 @@ def settings():
                 _set_setting("crypto_profit_halt_enabled", "off")
             if "crypto_ghost_feature_enabled" not in request.form:
                 _set_setting("crypto_ghost_feature_enabled", "off")
+            if "crypto_surge_promote_enabled" not in request.form:
+                _set_setting("crypto_surge_promote_enabled", "off")
         intervals_changed = False
         # Snapshot current trading mode BEFORE applying changes — used to detect transition
         current_mode = _setting("crypto_trading_mode", "paper")
@@ -1845,6 +1848,7 @@ def settings():
         today_loss_halted=_setting("crypto_today_loss_halted", "0"),
         today_profit_halted=_setting("crypto_today_profit_halted", "0"),
         ghost_feature_enabled=_setting("crypto_ghost_feature_enabled", "on"),
+        surge_promote_enabled=_setting("crypto_surge_promote_enabled", "on"),
         surge_roc_15min_pct=_setting("crypto_surge_roc_15min_pct", "2.5"),
         surge_vol_mult=_setting("crypto_surge_vol_mult", "2.0"),
         surge_trail_pct=_setting("crypto_surge_trail_pct", "1.0"),

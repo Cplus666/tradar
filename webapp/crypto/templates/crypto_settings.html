@@ -290,8 +290,15 @@
     <hr class="border-zinc-800">
     <h4 class="font-semibold border-b border-zinc-800 pb-2">Surge-promoted runner trail</h4>
     <p class="text-xs text-zinc-500 -mt-2">
-      When a runner hits its strategy target AND a sudden surge is in progress, switch to <strong>trail mode</strong> instead of selling. Captures SUI-style runs while keeping fixed-target behavior on normal trades. Set ROC to a high value (e.g. 99) to effectively disable.
+      When a runner hits its strategy target AND a sudden surge is in progress, switch to <strong>trail mode</strong> instead of selling. Captures memecoin-style runs while keeping fixed-target behavior on normal trades.
     </p>
+
+    <label class="flex items-center gap-2 text-xs font-semibold cursor-pointer">
+      <input type="checkbox" name="crypto_surge_promote_enabled" value="on"
+             {% if surge_promote_enabled == 'on' %}checked{% endif %}
+             class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+      Enable surge-promoted runner trail
+    </label>
 
     <div class="grid grid-cols-3 gap-3">
       <div>
