@@ -851,6 +851,55 @@ def _open_paper_positions() -> list:
     return _open_positions(is_paper=True)
 
 
+def _last_losing_exit_at(symbol: str, is_paper: bool):
+    """Timestamp of the most recent losing SELL on `symbol` for the given mode,
+    or None if no losing exit on record. FIFO-paired against prior BUYs."""
+    from webapp.models import CryptoTrade
+    trades = (
+        CryptoTrade.query
+        .filter_by(symbol=symbol, is_paper=is_paper)
+        .filter(CryptoTrade.strategy != "manual_liquidation")
+        .order_by(CryptoTrade.executed_at)
+        .all()
+    )
+    if not trades:
+        return None
+    last_sell = None
+    for t in reversed(trades):
+        if t.side == "SELL":
+            last_sell = t
+            break
+    if last_sell is None:
+        return None
+    buys: list[list] = []
+    def _consume(buys: list[list], qty: float) -> float:
+        cost = 0.0
+        sq = qty
+        while sq > 1e-9 and buys:
+            bq, bv = buys[0]
+            consumed = min(bq, sq)
+            cost += bv * (consumed / bq) if bq > 0 else 0.0
+            buys[0][0] -= consumed
+            buys[0][1] -= bv * (consumed / bq) if bq > 0 else 0.0
+            sq -= consumed
+            if buys[0][0] <= 1e-9:
+                buys.pop(0)
+        return cost
+    for t in trades:
+        if t.id == last_sell.id:
+            break
+        if t.side == "BUY":
+            bv = float(t.quote_amount or float(t.price) * float(t.qty))
+            buys.append([float(t.qty), bv])
+        elif t.side == "SELL":
+            _consume(buys, float(t.qty))
+    cost = _consume(buys, float(last_sell.qty))
+    sell_value = float(last_sell.quote_amount or float(last_sell.price) * float(last_sell.qty))
+    if sell_value < cost:
+        return last_sell.executed_at
+    return None
+
+
 def _check_guardrails(intent: dict, mode: str, client=None) -> tuple[bool, str]:
     """Return (ok, reason). Any failure aborts execution."""
     if _get_setting("crypto_kill_switch") == "on":
@@ -887,6 +936,23 @@ def _check_guardrails(intent: dict, mode: str, client=None) -> tuple[bool, str]:
     # Don't double up on the same symbol
     if any(p.symbol == intent["symbol"] for p in open_positions):
         return False, f"already have open position in {intent['symbol']}"
+
+    # Per-coin cooldown after a losing exit. The market regime that produced
+    # the loss is usually still in effect for a few hours; re-entering the
+    # same setup is the SAHARA bug (sold at stop, re-bought 11 min later).
+    try:
+        cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "4")
+    except (TypeError, ValueError):
+        cooldown_h = 4.0
+    if cooldown_h > 0:
+        last_loss = _last_losing_exit_at(intent["symbol"], is_paper_mode)
+        if last_loss is not None:
+            from datetime import datetime as _dt, timedelta as _td
+            elapsed = _dt.utcnow() - last_loss
+            cool_td = _td(hours=cooldown_h)
+            if elapsed < cool_td:
+                mins_left = int((cool_td - elapsed).total_seconds() / 60)
+                return False, f"cooldown after loss on {intent['symbol']} ({mins_left}min remaining)"
 
     if mode == "live":
         if client is None:
