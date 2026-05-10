@@ -513,7 +513,32 @@ def _compute_synth_day_start_today() -> float:
     return _principal_at_day(today_iso) + pre_today_realized
 
 
-def update_day_start_and_check_halt(current_value: float) -> dict:
+def _entry_basis_value(usdt_free: float | None = None) -> float:
+    """Day-start value using ENTRY-PRICE basis for open positions:
+        day_start = usdt_free + Σ(remaining_qty × entry_price) for live positions
+    This makes today_pnl = realized + unrealized reconcile cleanly because both
+    sides use the same cost basis. Caller may pass usdt_free if already known
+    (avoids an extra Binance API call). Returns 0 if Binance unreachable."""
+    if usdt_free is None:
+        try:
+            from webapp.crypto.routes import get_binance_creds
+            key, secret = get_binance_creds()
+            if not key or not secret:
+                return 0.0
+            client = _binance_client(key, secret)
+            acct = client.get_account()
+            usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
+            usdt_free = float(usdt["free"]) if usdt else 0.0
+        except Exception:
+            return 0.0
+    entry_basis = 0.0
+    for p in _open_positions(is_paper=False):
+        qty = float(getattr(p, "_remaining_qty", p.qty))
+        entry_basis += qty * float(p.price)
+    return usdt_free + entry_basis
+
+
+def update_day_start_and_check_halt(current_value: float, usdt_free: float | None = None) -> dict:
     """Snapshot today's start-of-day value and fire BOTH loss and profit halts.
 
     Each MYT day is its own threshold; flags auto-clear at midnight rollover.
@@ -604,11 +629,17 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
             except (TypeError, ValueError):
                 principal = 0.0
             day_start_to_save = principal + all_realized
+            day_start_format = "synth"
         else:
-            day_start_to_save = current_value
+            # LIVE mode: use ENTRY-BASIS valuation so today_pnl = realized +
+            # unrealized reconciles cleanly. Falls back to raw current_value
+            # if entry-basis can't be computed (no Binance keys, etc).
+            entry_based = _entry_basis_value(usdt_free=usdt_free)
+            day_start_to_save = entry_based if entry_based > 0 else current_value
+            day_start_format = "entry_basis" if entry_based > 0 else "live"
         _set_setting("crypto_day_start_date", today_str)
         _set_setting("crypto_day_start_value_usd", f"{day_start_to_save:.4f}")
-        _set_setting("crypto_day_start_format", "synth" if _is_paper_mode_setting() else "live")
+        _set_setting("crypto_day_start_format", day_start_format)
         _set_setting("crypto_today_loss_halted", "0")
         _set_setting("crypto_today_profit_halted", "0")
         _set_setting("crypto_today_loss_overridden", "0")
@@ -620,10 +651,10 @@ def update_day_start_and_check_halt(current_value: float) -> dict:
         # Daily snapshot table stores SYNTH value (same number used by the
         # halt + dashboard + ROI graph). Single source of truth.
         try:
-            _write_daily_snapshot(today_str, current_value, source="live", overwrite=True)
+            _write_daily_snapshot(today_str, day_start_to_save, source=day_start_format, overwrite=True)
         except Exception as e:
             log.warning("daily snapshot write failed (non-fatal): %s", e)
-        snap_value = current_value
+        snap_value = day_start_to_save
         return {"day_start": snap_value, "drawdown_pct": 0.0,
                 "halt_triggered": False, "enabled": True,
                 "today_pnl_pct": 0.0, "loss_halt_fired": False, "profit_halt_fired": False}

@@ -245,7 +245,7 @@ def run_fast_exit_check() -> None:
                 open_value += cp * qty
             total = usdt_free + open_value
             if total > 0:
-                risk = update_day_start_and_check_halt(total)
+                risk = update_day_start_and_check_halt(total, usdt_free=usdt_free)
                 if risk.get("loss_halt_fired"):
                     log.warning("FAST LOSS HALT fired (today %+.2f%%)",
                                 risk.get("today_pnl_pct", 0))
