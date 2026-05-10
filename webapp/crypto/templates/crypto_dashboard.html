@@ -229,11 +229,11 @@
 
   </div>
 
-  <div class="col-span-12 lg:col-span-4 space-y-4">
-    <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
-      <div class="text-xs text-zinc-500 uppercase mb-2">Recent runs</div>
+  <div class="col-span-12 lg:col-span-4 space-y-4 flex flex-col">
+    <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 flex flex-col flex-1 min-h-0">
+      <div class="text-xs text-zinc-500 uppercase mb-2 flex-shrink-0">Recent runs</div>
       {% if recent_runs %}
-        <ul class="text-sm space-y-1">
+        <ul class="text-sm space-y-1 overflow-y-auto flex-1 min-h-0 pr-1">
           {% for r in recent_runs %}
             <li class="flex justify-between">
               <span class="text-zinc-400 mono">{{ r.started_at | dt }}</span>
