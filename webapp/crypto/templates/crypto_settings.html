@@ -208,38 +208,39 @@
       'oversold_meanrev':  {'target': '+9.1%',  'stop': '-3.5%',  'hold': '~24h', 'desc': 'Oversold bounce, tight stop, mean-reversion'}
     } %}
 
-    <div class="bg-zinc-950/50 border border-zinc-800 rounded p-2 mb-2 text-[11px]">
-      <div class="text-zinc-500 mb-1">⚠ Note: <strong>partial-take fires at +4%</strong> globally (set below). When that's near or at a strategy's own target (e.g. breakout_1h's +4.2%), both halves exit close together — no "second leg runs to higher %" effect. To capture more on the runner half, set partial trigger LOWER than your strategies' targets.</div>
-    </div>
+    <p class="text-[11px] text-zinc-500 -mt-1 mb-1">Hover <span class="text-zinc-400">ⓘ</span> to see each strategy's target / stop / max-hold.</p>
 
-    <div class="space-y-1.5">
+    <div class="space-y-1">
       {% for s in strategy_names %}
         {% set spec = strategy_specs.get(s, {}) %}
-        <div class="flex items-start gap-3 text-sm bg-zinc-950/30 border border-zinc-800 rounded p-2">
+        <label class="flex items-center gap-2 text-sm bg-zinc-950/30 border border-zinc-800 rounded px-2 py-1.5 cursor-pointer hover:bg-zinc-900/40">
           <input type="checkbox" name="strategy_enabled" value="{{ s }}"
                  {% if s not in disabled_strategies %}checked{% endif %}
-                 class="w-4 h-4 mt-0.5 rounded bg-zinc-950 border-zinc-700 cursor-pointer flex-shrink-0">
-          <div class="flex-1 min-w-0">
-            <div class="flex items-baseline gap-2 flex-wrap">
-              <span class="mono font-semibold">{{ s }}</span>
-              {% if s in disabled_strategies %}
-                <span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-900/40 text-rose-300">disabled</span>
-              {% else %}
-                <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-300">active</span>
-              {% endif %}
-              {% if spec %}
-                <span class="text-[10px] mono text-emerald-400">target {{ spec.target }}</span>
-                <span class="text-[10px] mono text-rose-400">stop {{ spec.stop }}</span>
-                <span class="text-[10px] mono text-zinc-500">max-hold {{ spec.hold }}</span>
-              {% endif %}
-            </div>
-            {% if spec %}
-              <div class="text-[11px] text-zinc-500 mt-0.5">{{ spec.desc }}</div>
-            {% endif %}
-          </div>
-        </div>
+                 class="w-4 h-4 rounded bg-zinc-950 border-zinc-700 cursor-pointer flex-shrink-0">
+          <span class="mono font-semibold">{{ s }}</span>
+          {% if s in disabled_strategies %}
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-rose-900/40 text-rose-300">disabled</span>
+          {% else %}
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900/40 text-emerald-300">active</span>
+          {% endif %}
+          {% if spec %}
+            <span class="relative ml-auto group">
+              <span class="text-zinc-400 hover:text-zinc-200 cursor-help text-xs">ⓘ</span>
+              <span class="invisible group-hover:visible absolute right-0 top-full mt-1 z-20 w-64 bg-zinc-900 border border-zinc-700 rounded shadow-lg p-2 text-[11px] text-zinc-300 normal-case whitespace-normal">
+                <div class="flex justify-between mono mb-1">
+                  <span class="text-emerald-400">target {{ spec.target }}</span>
+                  <span class="text-rose-400">stop {{ spec.stop }}</span>
+                  <span class="text-zinc-500">hold {{ spec.hold }}</span>
+                </div>
+                <div class="text-zinc-400">{{ spec.desc }}</div>
+              </span>
+            </span>
+          {% endif %}
+        </label>
       {% endfor %}
     </div>
+
+    <p class="text-[11px] text-zinc-500 mt-1">⚠ Partial-take fires at +4% globally (set below). If a strategy's own target is near +4% (e.g. breakout_1h +4.2%), both halves exit together — set partial trigger lower than your targets to let the runner reach further.</p>
 
     {# === PARTIAL PROFIT-TAKE + BREAKEVEN-MOVE === #}
     <hr class="border-zinc-800">
