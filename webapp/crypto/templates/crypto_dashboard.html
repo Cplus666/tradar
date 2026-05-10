@@ -89,16 +89,9 @@
           <span id="cards-updated" class="text-xs text-zinc-600 ml-2"></span>
         </div>
         <div class="flex gap-2">
-          <form method="post" action="{{ url_for('crypto.sync_balances') }}" class="inline">
-            <button class="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-3 py-1.5 rounded">↻ Sync</button>
-          </form>
-          <form method="post" action="{{ url_for('crypto.run_loop_now') }}" class="inline">
-            <button class="text-xs bg-blue-800 hover:bg-blue-700 text-blue-100 px-3 py-1.5 rounded">▶ Run loop</button>
-          </form>
-          <a href="{{ url_for('crypto.universe') }}" class="text-xs bg-amber-800 hover:bg-amber-700 text-amber-100 px-3 py-1.5 rounded">🔥 Universe</a>
-          <button onclick="sellAll()"
-                  class="text-xs bg-rose-900 hover:bg-rose-800 text-rose-200 px-3 py-1.5 rounded">
-            ✕ Sell All
+          <button onclick="haltNow()"
+                  class="text-xs bg-red-700 hover:bg-red-600 text-white px-3 py-1.5 rounded">
+            ⏸ Halt Now
           </button>
         </div>
       </div>
@@ -863,18 +856,15 @@
   loadDashboard();
   setInterval(loadDashboard, 30000);  // refresh live data every 30s
 
-  // ---- Manual sell-all ----
-  function sellAll() {
-    if (!confirm('Sell ALL open positions at market price right now?\n\nThis cannot be undone.')) return;
-    fetch('{{ url_for("crypto.api_sell_all") }}', { method: 'POST' })
+  // ---- Halt now (sells all + blocks new entries until MYT midnight) ----
+  function haltNow() {
+    if (!confirm("HALT NOW\n\n• Sell ALL open positions at market\n• Block new entries until next MYT midnight\n\nUse the halt banner's 'Resume' or 'Re-arm' buttons to undo before midnight.\n\nProceed?")) { return; }
+    fetch('{{ url_for("crypto.api_halts_halt_now") }}', { method: 'POST' })
       .then(r => r.json())
       .then(d => {
-        if (d.ok) {
-          alert(d.closed + ' position(s) closed.');
-          loadDashboard();
-        } else {
-          alert('Error: ' + (d.error || 'unknown'));
-        }
+        if (d.ok !== true) { alert('Halt failed: ' + (d.reason || 'unknown')); return; }
+        alert(d.closed + ' position(s) closed. New entries blocked until MYT midnight.');
+        loadDashboard();
       })
       .catch(e => alert('Network error: ' + e.message));
   }
