@@ -467,6 +467,8 @@ def _open_position_cards(tickers: dict | None = None) -> list:
             # which positions have already booked half their size.
             "partial_done": bool(meta.get("partial_done")),
             "original_stop": meta.get("original_stop"),
+            "trail_active": bool(meta.get("trail_active")),
+            "trail_high": meta.get("trail_high"),
         })
     out.sort(key=lambda x: -x["pnl_pct"])  # winners first
     return out

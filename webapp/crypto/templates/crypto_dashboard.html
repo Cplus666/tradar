@@ -818,14 +818,20 @@
         const partialBadge = c.partial_done
           ? '<span class="ml-2 text-[10px] uppercase tracking-wide font-semibold text-emerald-400 bg-emerald-950/40 border border-emerald-800 px-1.5 py-0.5 rounded">partial</span>'
           : '';
+        const trailBadge = c.trail_active
+          ? '<span class="ml-2 text-[10px] uppercase tracking-wide font-semibold text-amber-300 bg-amber-950/40 border border-amber-700 px-1.5 py-0.5 rounded">trail</span>'
+          : '';
         const stopWasLine = (c.partial_done && c.original_stop != null)
           ? `<div class="text-[10px] text-zinc-500 mono mt-0.5">stop was ${fmtPrice(c.original_stop)} (locked profit on partial)</div>`
+          : '';
+        const trailLine = (c.trail_active && c.trail_high != null)
+          ? `<div class="text-[10px] text-amber-400 mono mt-0.5">trail mode: peak ${fmtPrice(c.trail_high)} · sells on pullback</div>`
           : '';
         return `<div class="border rounded-lg p-3 ${borderCls}">
           <div class="flex items-baseline justify-between mb-2">
             <div>
               <a href="${COIN_URL_TPL.replace('__SYM__', c.symbol)}" class="font-bold text-lg hover:underline">${c.symbol}</a>
-              ${partialBadge}
+              ${partialBadge}${trailBadge}
             </div>
             <span class="text-xs text-zinc-500">${c.strategy}</span>
           </div>
@@ -843,6 +849,7 @@
               <span>target ${fmtPrice(c.target)} (+${c.reward_pct.toFixed(1)}%)</span>
             </div>
             ${stopWasLine}
+            ${trailLine}
           </div>
           <div class="flex justify-between text-sm mt-2">
             <span class="font-bold mono num ${pnlCls}">${pnlStr}</span>
