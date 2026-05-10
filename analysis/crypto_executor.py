@@ -816,10 +816,10 @@ def _detect_surge(symbol: str) -> bool:
     >= surge_vol_mult x avg per-15min volume of the previous 45 minutes.
     Single 1m-klines API call per invocation; caller should gate to rare events."""
     try:
-        roc_pct = float(_get_setting("crypto_surge_roc_15min_pct") or "5.0")
+        roc_pct = float(_get_setting("crypto_surge_roc_15min_pct") or "2.5")
         vol_mult = float(_get_setting("crypto_surge_vol_mult") or "2.0")
     except (TypeError, ValueError):
-        roc_pct, vol_mult = 5.0, 2.0
+        roc_pct, vol_mult = 2.5, 2.0
     try:
         from binance.client import Client
         klines = Client().get_klines(symbol=symbol, interval="1m", limit=60)

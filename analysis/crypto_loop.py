@@ -159,9 +159,9 @@ def run_fast_exit_check() -> None:
             exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
         elif meta.get("trail_active"):
             try:
-                trail_pct = float(_get_setting("crypto_surge_trail_pct") or "3.0")
+                trail_pct = float(_get_setting("crypto_surge_trail_pct") or "1.0")
             except (TypeError, ValueError):
-                trail_pct = 3.0
+                trail_pct = 1.0
             high = max(float(meta.get("trail_high") or cur), cur)
             if high > float(meta.get("trail_high") or 0):
                 _set_trail_in_notes(pos, high)
