@@ -129,8 +129,11 @@ def run_fast_exit_check() -> None:
     # already branch on position.is_paper, so the per-position behavior is correct.
     # Hardcoding is_paper=False here used to silently strand all paper trades.
     open_pos = _open_positions()
-    if not open_pos:
-        return  # nothing to check
+    # NOTE: do NOT early-return when open_pos is empty. The daily-rollover halt
+    # check at the end of this function MUST run every tick so day_start
+    # auto-snaps at MYT midnight even when the bot is between trades. Skipping
+    # the per-position iteration is fine; skipping the whole function leaves
+    # day_start stale until the slower 15-min main loop catches up.
 
     # ONE API call gets all prices (with timeout — paper positions don't need
     # auth, but live ones might; bare client is fine for the public ticker endpoint).
