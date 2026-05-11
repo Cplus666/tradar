@@ -936,9 +936,11 @@ def _open_positions(is_paper: bool | None = None) -> list:
         )
         if not last_buy:
             continue
-        # Dust filter: ignore positions worth less than $1 (leftover rounding)
+        # Dust filter: ignore positions worth less than $5 — Binance MIN_NOTIONAL
+        # rejects sells under $5/$10 anyway, so tracking these leads to repeated
+        # SELL FAILED warnings and clutters the dashboard with un-closeable dust.
         residual_value = qty * float(last_buy.price)
-        if residual_value < 1.0:
+        if residual_value < 5.0:
             continue
         # Attach the remaining net qty (post-partial-sells) so callers can
         # compute correct unrealized P&L. last_buy.qty is the ORIGINAL buy
