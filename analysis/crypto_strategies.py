@@ -132,7 +132,7 @@ def momentum_surge_4h(df: pd.DataFrame, symbol: str) -> dict | None:
         "stop_price": stop,
         "target_price": target,
         "max_hold_bars": 12,  # 2 days — momentum dies fast
-        "exit_rule": "rsi_overbought_80",
+        "exit_rule": "rsi_overbought_85",
         "reason": f"24h vol={vol_ratio_24h:.1f}x, +{chg_24h_pct:.1f}%, RSI={rsi:.0f}",
     }
 

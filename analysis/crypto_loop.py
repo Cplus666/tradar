@@ -41,6 +41,10 @@ def _check_strategy_exit(exit_rule: str, df) -> tuple[bool, str]:
         rsi = last.get("rsi14")
         if pd.notna(rsi) and float(rsi) > 80:
             return True, f"RSI overbought ({float(rsi):.0f} > 80)"
+    elif exit_rule == "rsi_overbought_85":
+        rsi = last.get("rsi14")
+        if pd.notna(rsi) and float(rsi) > 85:
+            return True, f"RSI overbought ({float(rsi):.0f} > 85)"
     return False, ""
 
 
