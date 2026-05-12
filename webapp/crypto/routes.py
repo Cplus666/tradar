@@ -1223,7 +1223,7 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
                     # consumes a tiny BUY residual left by lot-step rounding on a
                     # PRIOR sell, the FIFO produces a ghost segment ($X cents)
                     # paired against an unrelated strategy's exit-reason. Skip.
-                    if buy_value < 1.0:
+                    if buy_value < 5.0:
                         if buys[0][1] <= 1e-9:
                             buys.pop(0)
                         continue
@@ -1279,8 +1279,8 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
         for buy, remaining_qty in buys:
             if remaining_qty <= 1e-9:
                 continue
-            if remaining_qty * float(buy.price) < 1.0:
-                continue  # dust — skip
+            if remaining_qty * float(buy.price) < 5.0:
+                continue  # dust — skip (matches executor's _open_positions filter)
             meta = parse_entry_notes(buy.notes)
             entry_value = float(buy.price) * remaining_qty
             held_h = (datetime.utcnow() - buy.executed_at).total_seconds() / 3600
