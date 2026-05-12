@@ -84,11 +84,11 @@ def _check_exits() -> list[str]:
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
         exit_reason = None
-        # 1) Regime exit — overrides everything
-        if regime_off:
-            exit_reason = "REGIME EXIT (BTC trend broken)"
+        # NOTE: BTC regime check (regime_off) no longer auto-sells — it's now
+        # an informational warning surfaced on the dashboard. User decides
+        # whether to act via the Halt Now button.
         # 2) Stop loss
-        elif meta["stop"] is not None and cur_price <= meta["stop"]:
+        if meta["stop"] is not None and cur_price <= meta["stop"]:
             exit_reason = f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f})"
         # 3) Profit target
         elif meta["target"] is not None and cur_price >= meta["target"]:
@@ -190,9 +190,8 @@ def run_fast_exit_check() -> None:
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
         exit_reason = None
-        if regime_off:
-            exit_reason = "REGIME EXIT (BTC trend broken)"
-        elif meta["stop"] is not None and cur <= meta["stop"]:
+        # regime_off no longer auto-sells (informational warning only)
+        if meta["stop"] is not None and cur <= meta["stop"]:
             exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
         elif meta.get("trail_active"):
             try:

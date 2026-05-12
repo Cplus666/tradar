@@ -390,6 +390,11 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     # Show this as a small badge under account_value in the dashboard.
     out["binance_real_balance"] = binance_real_balance
     out["drift_vs_binance"] = binance_real_balance - out["account_value"]
+    try:
+        from analysis.crypto_strategies import _btc_trend_ok
+        out["btc_regime_ok"] = bool(_btc_trend_ok("4h"))
+    except Exception:
+        out["btc_regime_ok"] = True
 
     # All-time P&L uses the derived account vs the starting principal
     out["all_time_pnl"] = out["account_value"] - out["starting_capital"]

@@ -50,6 +50,9 @@
   {# Connection status — surfaces Binance failures + stale-cache fallback so the
      banner never silently sticks at "loading…" if the network drops. #}
   <div id="pnl-status" class="hidden mb-2 text-xs px-2 py-1 rounded border"></div>
+  <div id="btc-regime-warning" class="hidden mb-2 text-xs px-3 py-2 rounded border border-amber-700 bg-amber-950/40 text-amber-200">
+    ⚠ <strong>BTC trend broken</strong> — BTC closed below its 4h SMA50. Alts typically follow lower. Bot will keep managing open positions normally but consider halting new entries with the <strong>Halt Now</strong> button if you expect further weakness.
+  </div>
   <div class="flex items-center justify-between flex-wrap gap-3">
     <div>
       <div class="text-xs text-zinc-400 uppercase tracking-wide">Account value</div>
@@ -692,6 +695,16 @@
         driftEl.textContent = `drift vs Binance: ${sign}$${d.toFixed(2)}`;
       } else if (driftEl) {
         driftEl.classList.add('hidden');
+      }
+
+      // BTC regime warning
+      const regimeEl = document.getElementById('btc-regime-warning');
+      if (regimeEl) {
+        if (a.btc_regime_ok === false) {
+          regimeEl.classList.remove('hidden');
+        } else {
+          regimeEl.classList.add('hidden');
+        }
       }
 
       // "Last updated" timestamp under the account value — auto-ticks via
