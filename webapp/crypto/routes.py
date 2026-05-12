@@ -1853,7 +1853,7 @@ def settings():
         surge_promote_enabled=_setting("crypto_surge_promote_enabled", "on"),
         surge_roc_15min_pct=_setting("crypto_surge_roc_15min_pct", "2.5"),
         surge_vol_mult=_setting("crypto_surge_vol_mult", "2.0"),
-        surge_trail_pct=_setting("crypto_surge_trail_pct", "1.0"),
+        surge_trail_pct=_setting("crypto_surge_trail_pct", "3.0"),
         health=health,
         strategy_names=STRATEGY_NAMES,
         disabled_strategies=disabled_strategies,

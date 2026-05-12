@@ -59,8 +59,12 @@ def _check_exits() -> list[str]:
       - REGIME EXIT (BTC turns down — exit ALL longs as safety)
     """
     from analysis.crypto_data import load_cached
-    from analysis.crypto_executor import _open_positions, parse_entry_notes, execute_sell
+    from analysis.crypto_executor import (
+        _open_positions, parse_entry_notes, execute_sell,
+        _detect_surge, _set_trail_in_notes,
+    )
     from analysis.crypto_strategies import _btc_trend_ok
+    import pandas as pd
 
     summaries: list[str] = []
     regime_off = not _btc_trend_ok("4h")
@@ -96,7 +100,33 @@ def _check_exits() -> list[str]:
         else:
             triggered, why = _check_strategy_exit(meta["exit_rule"], df)
             if triggered:
-                exit_reason = f"strategy exit: {why}"
+                # RSI overbought = "price rising fast." That's a SURGE signal,
+                # not always a top. If surge gate confirms (ROC + volume),
+                # promote to trail mode instead of exiting — let the move run.
+                rule = (meta.get("exit_rule") or "")
+                if rule.startswith("rsi_overbought") and not meta.get("trail_active"):
+                    if _detect_surge(pos.symbol):
+                        _set_trail_in_notes(pos, cur_price, activate=True)
+                        log.info("RSI-OVERBOUGHT PROMOTED %s @ $%.6f — switched to trail (surge confirmed)",
+                                 pos.symbol, cur_price)
+                        triggered = False
+                if triggered:
+                    exit_reason = f"strategy exit: {why}"
+            # 6) Weakness exit — losing position with decaying momentum.
+            if not exit_reason and meta.get("stop") is not None:
+                try:
+                    entry_price = float(pos.price)
+                    pnl_pct = (cur_price - entry_price) / entry_price * 100
+                except (ZeroDivisionError, TypeError):
+                    pnl_pct = 0.0
+                if pnl_pct < -2.0:
+                    rsi_now = df["rsi14"].iloc[-1] if "rsi14" in df.columns else None
+                    rsi_prev = df["rsi14"].iloc[-2] if "rsi14" in df.columns and len(df) >= 2 else None
+                    if (rsi_now is not None and rsi_prev is not None
+                            and pd.notna(rsi_now) and pd.notna(rsi_prev)
+                            and float(rsi_now) < 45 and float(rsi_now) < float(rsi_prev)):
+                        exit_reason = (f"weakness exit (pnl {pnl_pct:+.2f}% · "
+                                       f"RSI {float(rsi_now):.0f} falling from {float(rsi_prev):.0f})")
 
         if exit_reason:
             mode_tag = "PAPER" if pos.is_paper else "LIVE"
@@ -166,9 +196,9 @@ def run_fast_exit_check() -> None:
             exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
         elif meta.get("trail_active"):
             try:
-                trail_pct = float(_get_setting("crypto_surge_trail_pct") or "1.0")
+                trail_pct = float(_get_setting("crypto_surge_trail_pct") or "3.0")
             except (TypeError, ValueError):
-                trail_pct = 1.0
+                trail_pct = 3.0
             high = max(float(meta.get("trail_high") or cur), cur)
             if high > float(meta.get("trail_high") or 0):
                 _set_trail_in_notes(pos, high)
