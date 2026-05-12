@@ -96,16 +96,17 @@
 
     <h4 class="text-sm font-semibold text-zinc-300">Hard guardrails</h4>
 
-    <div>
-      <label class="block text-xs font-semibold mb-1">Max position size (USD per trade){{ tip("Hard cap. System refuses any intent above this.") }}</label>
-      <input type="number" step="1" min="1" name="crypto_max_position_usd" value="{{ max_position_usd }}"
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
-    </div>
-
-    <div>
-      <label class="block text-xs font-semibold mb-1">Max concurrent open positions{{ tip("No new entries while at cap.") }}</label>
-      <input type="number" step="1" min="1" max="10" name="crypto_max_concurrent" value="{{ max_concurrent }}"
-             class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-32 mono">
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <label class="block text-xs font-semibold mb-1">Max position size (USD per trade){{ tip("Hard cap. System refuses any intent above this.") }}</label>
+        <input type="number" step="1" min="1" name="crypto_max_position_usd" value="{{ max_position_usd }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Max concurrent open positions{{ tip("No new entries while at cap.") }}</label>
+        <input type="number" step="1" min="1" max="10" name="crypto_max_concurrent" value="{{ max_concurrent }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+      </div>
     </div>
 
     <div>
@@ -167,6 +168,30 @@
         </div>
       </div>
       {% endif %}
+    </div>
+
+    {# === SMART ROTATION === #}
+    <hr class="border-zinc-800">
+    <h4 class="font-semibold border-b border-zinc-800 pb-2">Smart rotation{{ tip("When max_concurrent blocks a new high-conviction signal, kick the weakest losing position to make room. Useful when bot misses momentum trades (like PENDLE) because portfolio is full of laggards. Defaults conservatively (max 2/day, 30-min cooldown).") }}</h4>
+
+    <label class="flex items-center gap-2 text-xs font-semibold cursor-pointer">
+      <input type="checkbox" name="crypto_rotation_enabled" value="on"
+             {% if rotation_enabled == 'on' %}checked{% endif %}
+             class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
+      Enable smart rotation
+    </label>
+
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <label class="block text-xs font-semibold mb-1">Max rotations per day{{ tip("Hard cap to prevent churn. Resets at MYT midnight.") }}</label>
+        <input type="number" step="1" min="0" max="10" name="crypto_rotation_max_per_day" value="{{ rotation_max_per_day }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">Min vol ratio to qualify{{ tip("Only rotate FOR signals with 24h_vol ratio ≥ this × normal. Higher = stricter, less false rotation. 5x is conservative.") }}</label>
+        <input type="number" step="0.5" min="1" max="20" name="crypto_rotation_min_vol_ratio" value="{{ rotation_min_vol_ratio }}"
+               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
+      </div>
     </div>
 
     </div>{# === END INNER LEFT COLUMN === #}
@@ -294,30 +319,6 @@
       <div>
         <label class="block text-xs font-semibold mb-1">Trail pullback (%){{ tip("Sell when price drops this % from peak after promotion.") }}</label>
         <input type="number" step="0.1" min="0.5" max="15" name="crypto_surge_trail_pct" value="{{ surge_trail_pct }}"
-               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-      </div>
-    </div>
-
-    {# === SMART ROTATION === #}
-    <hr class="border-zinc-800">
-    <h4 class="font-semibold border-b border-zinc-800 pb-2">Smart rotation{{ tip("When max_concurrent blocks a new high-conviction signal, kick the weakest losing position to make room. Useful when bot misses momentum trades (like PENDLE) because portfolio is full of laggards. Defaults conservatively (max 2/day, 30-min cooldown).") }}</h4>
-
-    <label class="flex items-center gap-2 text-xs font-semibold cursor-pointer">
-      <input type="checkbox" name="crypto_rotation_enabled" value="on"
-             {% if rotation_enabled == 'on' %}checked{% endif %}
-             class="w-4 h-4 rounded bg-zinc-950 border-zinc-700">
-      Enable smart rotation
-    </label>
-
-    <div class="grid grid-cols-2 gap-3">
-      <div>
-        <label class="block text-xs font-semibold mb-1">Max rotations per day{{ tip("Hard cap to prevent churn. Resets at MYT midnight.") }}</label>
-        <input type="number" step="1" min="0" max="10" name="crypto_rotation_max_per_day" value="{{ rotation_max_per_day }}"
-               class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
-      </div>
-      <div>
-        <label class="block text-xs font-semibold mb-1">Min vol ratio to qualify{{ tip("Only rotate FOR signals with 24h_vol ratio ≥ this × normal. Higher = stricter, less false rotation. 5x is conservative.") }}</label>
-        <input type="number" step="0.5" min="1" max="20" name="crypto_rotation_min_vol_ratio" value="{{ rotation_min_vol_ratio }}"
                class="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 w-full mono">
       </div>
     </div>
