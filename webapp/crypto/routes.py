@@ -1749,6 +1749,7 @@ def settings():
         "crypto_ghost_feature_enabled",
         "crypto_surge_promote_enabled",
         "crypto_surge_roc_15min_pct", "crypto_surge_vol_mult", "crypto_surge_trail_pct",
+        "crypto_rotation_enabled", "crypto_rotation_max_per_day", "crypto_rotation_min_vol_ratio",
     )
     if request.method == "POST":
         if request.form.get("settings_form_present") == "1":
@@ -1762,6 +1763,8 @@ def settings():
                 _set_setting("crypto_ghost_feature_enabled", "off")
             if "crypto_surge_promote_enabled" not in request.form:
                 _set_setting("crypto_surge_promote_enabled", "off")
+            if "crypto_rotation_enabled" not in request.form:
+                _set_setting("crypto_rotation_enabled", "off")
         intervals_changed = False
         # Snapshot current trading mode BEFORE applying changes — used to detect transition
         current_mode = _setting("crypto_trading_mode", "paper")
@@ -1854,6 +1857,9 @@ def settings():
         surge_roc_15min_pct=_setting("crypto_surge_roc_15min_pct", "2.5"),
         surge_vol_mult=_setting("crypto_surge_vol_mult", "2.0"),
         surge_trail_pct=_setting("crypto_surge_trail_pct", "3.0"),
+        rotation_enabled=_setting("crypto_rotation_enabled", "off"),
+        rotation_max_per_day=_setting("crypto_rotation_max_per_day", "2"),
+        rotation_min_vol_ratio=_setting("crypto_rotation_min_vol_ratio", "5.0"),
         health=health,
         strategy_names=STRATEGY_NAMES,
         disabled_strategies=disabled_strategies,

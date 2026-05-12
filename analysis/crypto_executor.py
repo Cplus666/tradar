@@ -648,6 +648,9 @@ def update_day_start_and_check_halt(current_value: float, usdt_free: float | Non
         # been finalized into today's snapshot row via past-24h fetch in
         # _write_daily_snapshot, so the so-far counter starts fresh.
         _set_setting("crypto_today_deposits_so_far_usd", "0")
+        # Reset rotation counters at midnight
+        _set_setting("crypto_rotation_count_today", "0")
+        _set_setting("crypto_last_rotation_at", "")
         # Daily snapshot table stores SYNTH value (same number used by the
         # halt + dashboard + ROI graph). Single source of truth.
         try:
@@ -1004,7 +1007,103 @@ def _last_losing_exit_at(symbol: str, is_paper: bool):
     return None
 
 
-def _check_guardrails(intent: dict, mode: str, client=None) -> tuple[bool, str]:
+def _rotation_eligible_signal(intent: dict) -> tuple[bool, str]:
+    """Is this incoming signal high-conviction enough to justify rotation?"""
+    try:
+        min_vol = float(_get_setting("crypto_rotation_min_vol_ratio") or "5.0")
+    except (TypeError, ValueError):
+        min_vol = 5.0
+    reason = intent.get("reason", "")
+    import re
+    m_vol = re.search(r"vol=([\d.]+)x", reason)
+    m_chg = re.search(r"([+-][\d.]+)%", reason)
+    m_rsi = re.search(r"RSI=([\d]+)", reason)
+    if not (m_vol and m_chg and m_rsi):
+        return False, "could not parse signal strength"
+    vol = float(m_vol.group(1)); chg = float(m_chg.group(1)); rsi = int(m_rsi.group(1))
+    if vol < min_vol: return False, f"vol {vol:.1f}x < threshold {min_vol:.1f}x"
+    if chg < 5.0: return False, f"24h change {chg:+.1f}% < 5%"
+    if not (60 <= rsi <= 75): return False, f"RSI {rsi} outside 60-75"
+    return True, f"vol={vol:.1f}x, +{chg:.1f}%, RSI={rsi}"
+
+
+def _rotation_find_victim(is_paper: bool):
+    """Pick the weakest open position eligible to be kicked."""
+    from datetime import datetime as _dt
+    open_pos = _open_positions(is_paper=is_paper)
+    if not open_pos: return None
+    try:
+        client = _binance_client()
+        prices = {t["symbol"]: float(t["price"]) for t in client.get_all_tickers()}
+    except Exception:
+        return None
+    candidates = []
+    for p in open_pos:
+        meta = parse_entry_notes(p.notes)
+        if meta.get("partial_done") or meta.get("trail_active"): continue
+        held = (_dt.utcnow() - p.executed_at).total_seconds() / 60.0
+        if held < 60: continue
+        cur = prices.get(p.symbol)
+        if cur is None: continue
+        qty = float(getattr(p, "_remaining_qty", p.qty))
+        entry = float(p.price)
+        if entry <= 0: continue
+        pnl_usd = (cur - entry) * qty
+        pnl_pct = (cur - entry) / entry * 100
+        if pnl_usd >= -0.50: continue
+        candidates.append((pnl_pct, pnl_usd, p, cur))
+    if not candidates: return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0]
+
+
+def _try_rotation(intent: dict, mode: str) -> tuple[bool, str]:
+    """Attempt smart rotation: sell weakest losing position to make room."""
+    from datetime import datetime as _dt, timedelta as _td
+    if (_get_setting("crypto_rotation_enabled") or "off").lower() != "on":
+        return False, "rotation disabled"
+    if (_get_setting("crypto_today_loss_halted") == "1"
+            or _get_setting("crypto_today_profit_halted") == "1"):
+        return False, "halt active, skipping rotation"
+    try:
+        max_day = int(float(_get_setting("crypto_rotation_max_per_day") or "2"))
+    except (TypeError, ValueError):
+        max_day = 2
+    try:
+        count_today = int(_get_setting("crypto_rotation_count_today") or "0")
+    except (TypeError, ValueError):
+        count_today = 0
+    if count_today >= max_day:
+        return False, f"daily rotation cap reached ({count_today}/{max_day})"
+    last_iso = _get_setting("crypto_last_rotation_at") or ""
+    if last_iso:
+        try:
+            last_dt = _dt.fromisoformat(last_iso)
+            if (_dt.utcnow() - last_dt) < _td(minutes=30):
+                mins_left = int(30 - (_dt.utcnow() - last_dt).total_seconds() / 60)
+                return False, f"rotation cooldown ({mins_left}min left)"
+        except ValueError: pass
+    ok_sig, sig_info = _rotation_eligible_signal(intent)
+    if not ok_sig:
+        return False, f"signal not strong enough: {sig_info}"
+    is_paper = (mode == "paper")
+    victim = _rotation_find_victim(is_paper)
+    if victim is None:
+        return False, "no kickable position"
+    pnl_pct, pnl_usd, pos, cur_price = victim
+    log.info("ROTATION: kicking %s (pnl %+.2f%%, $%+.2f) for %s (%s)",
+             pos.symbol, pnl_pct, pnl_usd, intent["symbol"], sig_info)
+    reason = f"rotation: making room for {intent['symbol']}"
+    res = execute_sell(pos, cur_price, reason)
+    if not res.get("executed"):
+        log.error("ROTATION ABORT: victim sell failed — %s", res.get("reason"))
+        return False, f"victim sell failed: {res.get('reason')}"
+    _set_setting("crypto_rotation_count_today", str(count_today + 1))
+    _set_setting("crypto_last_rotation_at", _dt.utcnow().isoformat())
+    return True, f"kicked {pos.symbol} for {intent['symbol']}"
+
+
+def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: bool = False) -> tuple[bool, str]:
     """Return (ok, reason). Any failure aborts execution."""
     if _get_setting("crypto_kill_switch") == "on":
         return False, "kill switch is ON"
@@ -1034,29 +1133,28 @@ def _check_guardrails(intent: dict, mode: str, client=None) -> tuple[bool, str]:
     is_paper_mode = (mode == "paper")
     max_concurrent = int(_f("crypto_max_concurrent"))
     open_positions = _open_positions(is_paper=is_paper_mode)
-    if len(open_positions) >= max_concurrent:
+    if not rotation_bypass and len(open_positions) >= max_concurrent:
         return False, f"max concurrent reached ({len(open_positions)}/{max_concurrent})"
 
     # Don't double up on the same symbol
     if any(p.symbol == intent["symbol"] for p in open_positions):
         return False, f"already have open position in {intent['symbol']}"
 
-    # Per-coin cooldown after a losing exit. The market regime that produced
-    # the loss is usually still in effect for a few hours; re-entering the
-    # same setup is the SAHARA bug (sold at stop, re-bought 11 min later).
-    try:
-        cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "4")
-    except (TypeError, ValueError):
-        cooldown_h = 4.0
-    if cooldown_h > 0:
-        last_loss = _last_losing_exit_at(intent["symbol"], is_paper_mode)
-        if last_loss is not None:
-            from datetime import datetime as _dt, timedelta as _td
-            elapsed = _dt.utcnow() - last_loss
-            cool_td = _td(hours=cooldown_h)
-            if elapsed < cool_td:
-                mins_left = int((cool_td - elapsed).total_seconds() / 60)
-                return False, f"cooldown after loss on {intent['symbol']} ({mins_left}min remaining)"
+    # Per-coin cooldown after a losing exit (bypassed during rotation).
+    if not rotation_bypass:
+        try:
+            cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "4")
+        except (TypeError, ValueError):
+            cooldown_h = 4.0
+        if cooldown_h > 0:
+            last_loss = _last_losing_exit_at(intent["symbol"], is_paper_mode)
+            if last_loss is not None:
+                from datetime import datetime as _dt, timedelta as _td
+                elapsed = _dt.utcnow() - last_loss
+                cool_td = _td(hours=cooldown_h)
+                if elapsed < cool_td:
+                    mins_left = int((cool_td - elapsed).total_seconds() / 60)
+                    return False, f"cooldown after loss on {intent['symbol']} ({mins_left}min remaining)"
 
     if mode == "live":
         if client is None:
@@ -1115,10 +1213,16 @@ def execute_intent(intent: dict) -> dict:
 
     ok, reason = _check_guardrails(intent, mode, client)
     if not ok:
-        result["mode"] = "skipped"
-        result["reason"] = reason
-        log.warning("intent skipped: %s — %s", intent.get("symbol"), reason)
-        return result
+        if reason.startswith("max concurrent reached"):
+            rotated, rot_reason = _try_rotation(intent, mode)
+            if rotated:
+                log.info("ROTATION SUCCESS: %s — retrying entry on %s", rot_reason, intent.get("symbol"))
+                ok, reason = _check_guardrails(intent, mode, client, rotation_bypass=True)
+        if not ok:
+            result["mode"] = "skipped"
+            result["reason"] = reason
+            log.warning("intent skipped: %s — %s", intent.get("symbol"), reason)
+            return result
 
     if mode == "paper":
         # Simulated fill at entry_price. Write the trade.
