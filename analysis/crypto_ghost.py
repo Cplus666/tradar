@@ -558,7 +558,16 @@ def ghost_summary() -> dict:
                 })
 
     total    = ghost_usdt + pos_value
-    realized = sum(t.pnl for t in all_trades if t.pnl is not None)
+    # Realized P&L for TODAY only (ghost resets at MYT midnight, so prior days'
+    # P&L is already-cleared history that doesn't matter for "is today winning").
+    from datetime import timezone as _tz, timedelta as _td
+    _myt = _tz(_td(hours=8))
+    _today_myt = datetime.utcnow().replace(tzinfo=_tz.utc).astimezone(_myt).date()
+    _midnight_utc = datetime.combine(_today_myt, datetime.min.time()).replace(tzinfo=_myt).astimezone(_tz.utc).replace(tzinfo=None)
+    realized = sum(
+        t.pnl for t in all_trades
+        if t.pnl is not None and t.executed_at >= _midnight_utc
+    )
 
     # Locked = real account USDT after halt (stored at ghost start time)
     locked = _f("crypto_ghost_locked", 0.0) or sum(
