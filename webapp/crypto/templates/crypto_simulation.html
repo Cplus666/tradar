@@ -79,7 +79,7 @@
       <table class="w-full text-xs">
         <thead>
           <tr class="text-zinc-500 border-b border-zinc-800">
-            <th class="text-left py-1 pr-3">Time (MYT)</th>
+            <th class="text-left py-1 pr-3">Date/Time (MYT)</th>
             <th class="text-left pr-3">Symbol</th>
             <th class="text-left pr-3">Side</th>
             <th class="text-right pr-3">Qty</th>
@@ -109,10 +109,13 @@
 const MYT_OFFSET = 8 * 60; // UTC+8 in minutes
 
 function toMYT(isoStr) {
+  // Returns "MM-DD HH:MM" so users can tell which day a trade fired
+  // (was: just HH:MM, ambiguous across midnight resets).
   try {
     const d = new Date(isoStr.endsWith('Z') ? isoStr : isoStr + 'Z');
     const myt = new Date(d.getTime() + MYT_OFFSET * 60000);
-    return myt.toISOString().slice(11, 16);
+    const s = myt.toISOString();
+    return s.slice(5, 10) + ' ' + s.slice(11, 16);
   } catch { return '—'; }
 }
 
