@@ -33,9 +33,10 @@ def _check_strategy_exit(exit_rule: str, df) -> tuple[bool, str]:
         sma50 = last.get("sma50")
         # Require a meaningful break — not a 0.1% wick under SMA50 that recovers
         # next bar (today's PEPE: closed at $4.09e-6 vs SMA50 $4.12e-6, sold,
-        # then bounced back to entry $4.10e-6 within minutes). The 0.5% buffer
-        # mirrors the SMA50_MIN_MARGIN_PCT entry filter — symmetric trend test.
-        SMA50_BREAK_MARGIN_PCT = 0.5
+        # then bounced back to entry $4.10e-6 within minutes). Asymmetric vs
+        # the entry side: entry needs only +0.5% margin (don't be too picky on
+        # good signals), but exit needs -1.0% breach (don't sell on noise).
+        SMA50_BREAK_MARGIN_PCT = 1.0
         if pd.notna(sma50):
             sma50_f = float(sma50)
             threshold = sma50_f * (1 - SMA50_BREAK_MARGIN_PCT / 100.0)
