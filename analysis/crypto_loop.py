@@ -31,8 +31,20 @@ def _check_strategy_exit(exit_rule: str, df) -> tuple[bool, str]:
     close = float(last["Close"])
     if exit_rule == "sma50_break":
         sma50 = last.get("sma50")
-        if pd.notna(sma50) and close < float(sma50):
-            return True, f"SMA50 break (close ${close:.6f} < SMA50 ${float(sma50):.6f})"
+        # Require a meaningful break — not a 0.1% wick under SMA50 that recovers
+        # next bar (today's PEPE: closed at $4.09e-6 vs SMA50 $4.12e-6, sold,
+        # then bounced back to entry $4.10e-6 within minutes). The 1% buffer
+        # mirrors the SMA50_MIN_MARGIN_PCT entry filter — symmetric trend test.
+        SMA50_BREAK_MARGIN_PCT = 1.0
+        if pd.notna(sma50):
+            sma50_f = float(sma50)
+            threshold = sma50_f * (1 - SMA50_BREAK_MARGIN_PCT / 100.0)
+            if close < threshold:
+                breach_pct = (close - sma50_f) / sma50_f * 100
+                return True, (
+                    f"SMA50 break (close ${close:.6f} is {breach_pct:.2f}% under "
+                    f"SMA50 ${sma50_f:.6f}, threshold -{SMA50_BREAK_MARGIN_PCT:.1f}%)"
+                )
     elif exit_rule == "rsi_overbought_70":
         rsi = last.get("rsi14")
         if pd.notna(rsi) and float(rsi) > 70:
@@ -84,9 +96,11 @@ def _check_exits() -> list[str]:
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
         exit_reason = None
-        # NOTE: BTC regime check (regime_off) no longer auto-sells — it's now
-        # an informational warning surfaced on the dashboard. User decides
-        # whether to act via the Halt Now button.
+        # NOTE: BTC regime check (regime_off) used to auto-sell all positions
+        # when BTC closed below its 4h SMA50. The trigger was way too sensitive
+        # (a 0.07% breach would dump everything) and caused real losses on
+        # 2026-05-12. Now regime is INFORMATIONAL ONLY — exposed as a warning
+        # banner on the dashboard. User decides whether to act via Halt Now.
         # 2) Stop loss
         if meta["stop"] is not None and cur_price <= meta["stop"]:
             exit_reason = f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f})"
@@ -103,16 +117,18 @@ def _check_exits() -> list[str]:
                 # RSI overbought = "price rising fast." That's a SURGE signal,
                 # not always a top. If surge gate confirms (ROC + volume),
                 # promote to trail mode instead of exiting — let the move run.
+                # Only exit on RSI overbought when surge has died (volume drying).
                 rule = (meta.get("exit_rule") or "")
                 if rule.startswith("rsi_overbought") and not meta.get("trail_active"):
                     if _detect_surge(pos.symbol):
                         _set_trail_in_notes(pos, cur_price, activate=True)
                         log.info("RSI-OVERBOUGHT PROMOTED %s @ $%.6f — switched to trail (surge confirmed)",
                                  pos.symbol, cur_price)
-                        triggered = False
+                        triggered = False  # don't exit
                 if triggered:
                     exit_reason = f"strategy exit: {why}"
             # 6) Weakness exit — losing position with decaying momentum.
+            # Don't wait for the full -5% stop when momentum is clearly dead.
             if not exit_reason and meta.get("stop") is not None:
                 try:
                     entry_price = float(pos.price)
@@ -190,10 +206,13 @@ def run_fast_exit_check() -> None:
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
         exit_reason = None
-        # regime_off no longer auto-sells (informational warning only)
+        # regime_off no longer auto-sells (too sensitive — see _check_exits comment)
         if meta["stop"] is not None and cur <= meta["stop"]:
             exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
         elif meta.get("trail_active"):
+            # In surge-promoted trail mode: refresh high water mark, exit on
+            # configured pullback. Skips the normal target check entirely
+            # (target was already passed when trail was activated).
             try:
                 trail_pct = float(_get_setting("crypto_surge_trail_pct") or "3.0")
             except (TypeError, ValueError):
@@ -206,6 +225,9 @@ def run_fast_exit_check() -> None:
                 exit_reason = (f"trail stop hit (${cur:.6f} <= ${trail_stop:.6f}, "
                                f"peak ${high:.6f}, trail {trail_pct:.1f}%)")
         elif meta["target"] is not None and cur >= meta["target"]:
+            # Surge gate: if a sudden price+volume surge is in progress, promote
+            # to trail mode instead of exiting. Otherwise exit at target as
+            # before. Surge detection is one extra API call per target hit.
             if _detect_surge(pos.symbol):
                 _set_trail_in_notes(pos, cur, activate=True)
                 log.info("SURGE PROMOTED %s @ $%.6f — runner switched to trail mode", pos.symbol, cur)
@@ -223,12 +245,9 @@ def run_fast_exit_check() -> None:
                 log.warning("fast exit %s [%s] FAILED: %s", pos.symbol, mode, res["reason"])
             continue
 
-        # Partial-take + breakeven-move: only fires if NO full-exit triggered above.
-        # Once price reaches entry × (1 + trigger_pct/100), sell `fraction` of the
-        # position and tighten the stop on the remainder to entry × (1 + buffer_pct/100).
-        # Each position can only fire this once (tracked via partial_done flag in notes).
+        # Partial-take + breakeven-move (only fires if no full-exit triggered above)
         if meta.get("partial_done"):
-            continue  # already done — runner uses tightened stop
+            continue
         try:
             partial_enabled = (_get_setting("crypto_partial_take_enabled") or "on").lower() == "on"
         except Exception:
@@ -236,7 +255,7 @@ def run_fast_exit_check() -> None:
         if not partial_enabled:
             continue
         if meta["stop"] is None or meta["target"] is None:
-            continue  # need both bounds to compute breakeven move sensibly
+            continue
         try:
             trigger_pct = float(_get_setting("crypto_partial_take_trigger_pct") or "4.0")
             fraction    = float(_get_setting("crypto_partial_take_fraction")    or "0.5")
@@ -256,8 +275,11 @@ def run_fast_exit_check() -> None:
     # 15 min of unprotected drawdown when dashboard isn't open. Adding it here
     # gives sub-minute halt response. Cost: 1 extra Binance balance call per
     # fast-exit tick (~1440/day at 60s cadence — well under rate limit).
-    # Narrow exception handling so genuine bugs propagate; only swallow
-    # network/API errors. Persist last failure for health-panel visibility.
+    # Narrow exception handling so genuine bugs (NameError, TypeError, etc.)
+    # propagate up to the scheduler's outer try and fail loudly. Only swallow
+    # network/API errors that legitimately happen on a flaky connection, plus
+    # write the last failure to a setting so the user can see silent failures
+    # in the health panel.
     from binance.exceptions import BinanceAPIException, BinanceRequestException
     from requests.exceptions import RequestException
     from webapp.crypto.routes import get_binance_creds
@@ -271,6 +293,9 @@ def run_fast_exit_check() -> None:
             acct = client.get_account()
             usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
             usdt_free = float(usdt["free"]) if usdt else 0.0
+            # Recompute open positions AFTER the exit loop ran above, so the
+            # halt sees an accurate post-exit snapshot. Reuses the `prices`
+            # dict we already fetched — no extra ticker call.
             open_live = _open_positions(is_paper=False)
             open_value = 0.0
             for p in open_live:
@@ -290,6 +315,7 @@ def run_fast_exit_check() -> None:
                                 risk.get("today_pnl_pct", 0))
                 _set_setting("crypto_last_fast_halt_error", "")
     except (BinanceAPIException, BinanceRequestException, RequestException, ConnectionError, TimeoutError) as e:
+        # Expected transient — log + persist for health-panel visibility, then continue.
         log.error("fast-exit halt check network failure: %s", e)
         try:
             _set_setting("crypto_last_fast_halt_error",
@@ -297,6 +323,7 @@ def run_fast_exit_check() -> None:
         except Exception:
             pass
 
+    # Ghost exit check — runs after real exits, completely non-fatal
     try:
         from analysis.crypto_ghost import run_ghost_exit_check
         run_ghost_exit_check()
@@ -364,8 +391,8 @@ def run_crypto_loop() -> None:
                     f"balance sync: {sync_result.get('real_count', 0)} real, "
                     f"${sync_result.get('total_value_usd', 0):.2f}"
                 )
-                # Snapshot today's start + check daily P&L halt. Runs every
-                # loop so the halt fires even when the dashboard isn't open.
+                # Snapshot today's start + check daily drawdown halt. Runs every
+                # loop so the halt fires even when the dashboard isn't being viewed.
                 try:
                     from analysis.crypto_executor import update_day_start_and_check_halt
                     risk = update_day_start_and_check_halt(sync_result.get("total_value_usd", 0))
@@ -432,6 +459,7 @@ def run_crypto_loop() -> None:
 
         summary_parts.append(f"signals={len(signals)} exec={executed} skip={skipped}")
 
+        # Ghost scan — uses freshly-refreshed klines, completely non-fatal
         try:
             from analysis.crypto_ghost import run_ghost_scan
             run_ghost_scan()
