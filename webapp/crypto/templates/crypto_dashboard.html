@@ -50,6 +50,8 @@
   {# Connection status — surfaces Binance failures + stale-cache fallback so the
      banner never silently sticks at "loading…" if the network drops. #}
   <div id="pnl-status" class="hidden mb-2 text-xs px-2 py-1 rounded border"></div>
+  {# BTC regime warning — informational only. Bot no longer auto-sells when
+     BTC crosses below SMA50; if user wants to act, they click Halt Now. #}
   <div id="btc-regime-warning" class="hidden mb-2 text-xs px-3 py-2 rounded border border-amber-700 bg-amber-950/40 text-amber-200">
     ⚠ <strong>BTC trend broken</strong> — BTC closed below its 4h SMA50. Alts typically follow lower. Bot will keep managing open positions normally but consider halting new entries with the <strong>Halt Now</strong> button if you expect further weakness.
   </div>
@@ -253,9 +255,6 @@
 </div>
 
 <script>
-  // URL template for coin detail page — adapts to /crypto (stock) vs /tradar.
-  const COIN_URL_TPL = "{{ url_for('crypto.coin_detail', symbol='__SYM__') }}";
-
   // ---- Daily realized P&L bar chart (last 30 days) ----
   // State: data is replaceable on each refresh; mode is sticky across refreshes
   // so the user's toggle choice survives the periodic re-fetch.
@@ -546,7 +545,7 @@
       return;
     }
     if (!_hasRenderedLive) {
-      fetchWithTimeout('{{ url_for("crypto.api_dashboard_static") }}', 8000)
+      fetchWithTimeout('/crypto/api/dashboard/static', 8000)
         .then(r => r.json())
         .then(d => { if (!_hasRenderedLive) { applyDashboard(d); } })
         .catch(e => { console.warn('static dashboard failed:', e); });
@@ -697,7 +696,7 @@
         driftEl.classList.add('hidden');
       }
 
-      // BTC regime warning
+      // BTC regime warning — show banner when BTC is below 4h SMA50
       const regimeEl = document.getElementById('btc-regime-warning');
       if (regimeEl) {
         if (a.btc_regime_ok === false) {
@@ -837,13 +836,23 @@
         const stopWasLine = (c.partial_done && c.original_stop != null)
           ? `<div class="text-[10px] text-zinc-500 mono mt-0.5">stop was ${fmtPrice(c.original_stop)} (locked profit on partial)</div>`
           : '';
-        const trailLine = (c.trail_active && c.trail_high != null)
-          ? `<div class="text-[10px] text-amber-400 mono mt-0.5">trail mode: peak ${fmtPrice(c.trail_high)} · sells on pullback</div>`
+        const trailLine = (c.trail_active && c.trail_high != null && c.trail_stop != null)
+          ? (() => {
+              const peak = parseFloat(c.trail_high);
+              const stop = parseFloat(c.trail_stop);
+              const cur  = parseFloat(c.current);
+              const trailPct = parseFloat(c.trail_pct || 3);
+              // buffer = how much price can drop from CURRENT before stop hits
+              const bufferPct = cur > 0 ? ((cur - stop) / cur * 100) : 0;
+              return `<div class="text-[10px] text-amber-400 mono mt-0.5">
+                trail mode: peak ${fmtPrice(peak)} · stop ${fmtPrice(stop)} (-${trailPct.toFixed(1)}% from peak) · buffer ${bufferPct.toFixed(2)}% from now
+              </div>`;
+            })()
           : '';
         return `<div class="border rounded-lg p-3 ${borderCls}">
           <div class="flex items-baseline justify-between mb-2">
             <div>
-              <a href="${COIN_URL_TPL.replace('__SYM__', c.symbol)}" class="font-bold text-lg hover:underline">${c.symbol}</a>
+              <a href="/crypto/coin/${c.symbol}" class="font-bold text-lg hover:underline">${c.symbol}</a>
               ${partialBadge}${trailBadge}
             </div>
             <span class="text-xs text-zinc-500">${c.strategy}</span>

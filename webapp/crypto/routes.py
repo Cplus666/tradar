@@ -340,6 +340,14 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     return out
 
 
+def _trail_pct_setting() -> float:
+    """Return the configured trail-pullback % (e.g. 3.0). Falls back to 3.0."""
+    try:
+        return float(_setting("crypto_surge_trail_pct", "3.0") or "3.0")
+    except (TypeError, ValueError):
+        return 3.0
+
+
 def _open_position_cards(tickers: dict | None = None) -> list:
     """Position cards. If tickers=None, returns DB-only data with current=None.
 
@@ -402,6 +410,11 @@ def _open_position_cards(tickers: dict | None = None) -> list:
             "original_stop": meta.get("original_stop"),
             "trail_active": bool(meta.get("trail_active")),
             "trail_high": meta.get("trail_high"),
+            # Pre-compute trail stop level + current buffer for display clarity.
+            # trail_pct from setting (same value the loop uses to fire exits).
+            "trail_pct": _trail_pct_setting(),
+            "trail_stop": (float(meta["trail_high"]) * (1 - _trail_pct_setting() / 100.0))
+                          if meta.get("trail_active") and meta.get("trail_high") else None,
         })
     out.sort(key=lambda x: -x["pnl_pct"])  # winners first
     return out
