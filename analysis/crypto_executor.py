@@ -577,69 +577,20 @@ def update_day_start_and_check_halt(current_value: float, usdt_free: float | Non
     # (instead of waiting until next MYT midnight to re-sync).
     snap_format = _get_setting("crypto_day_start_format") or ""
 
-    # New MYT day → re-snapshot day_start + clear halt flags.
-    #
-    # PAPER mode: day_start = principal + Σ all-time realized P&L (excludes
-    # unrealized; matches dashboard formula in _account_summary). At midnight
-    # rollover, today_realized was 0 (rolled over by the date check above), so
-    # this equals "yesterday's day_end + yesterday's realized" = next day's open.
-    #
-    # LIVE mode: day_start = current_value (real Binance balance, includes dust
-    # + unrealized). Captures actual portfolio state — needed to catch deposits
-    # that happen mid-rollover.
+    # New MYT day → re-snapshot using ENTRY-BASIS value, not raw Binance balance.
+    # day_start = USDT_at_midnight + Σ(open_qty × entry_price)
+    # This makes today_pnl = realized + unrealized reconcile cleanly because the
+    # same cost basis (entry price) is used on both sides. Raw Binance balance
+    # at midnight bakes in unrealized gains/losses on overnight positions, which
+    # then double-count when those positions are eventually sold.
+    # Falls back to raw current_value if entry-basis can't be computed.
     if snap_date != today_str or snap_value <= 0:
-        if _is_paper_mode_setting():
-            # Compute principal + Σ all-time realized for paper-mode day_start.
-            # Avoid circular import by inlining a minimal FIFO realized calc here.
-            from webapp.models import CryptoTrade
-            try:
-                fee_rate_dsv = float(_get_setting("crypto_fee_rate_per_side") or "0.001")
-            except (TypeError, ValueError):
-                fee_rate_dsv = 0.001
-            paper_trades = (CryptoTrade.query
-                            .filter_by(is_paper=True)
-                            .filter(CryptoTrade.strategy != "manual_liquidation")
-                            .order_by(CryptoTrade.executed_at)
-                            .all())
-            by_sym_dsv = {}
-            for t in paper_trades:
-                by_sym_dsv.setdefault(t.symbol, []).append(t)
-            all_realized = 0.0
-            for sym, ts in by_sym_dsv.items():
-                buys = []
-                for t in ts:
-                    if t.side == "BUY":
-                        buys.append([t, float(t.qty)])
-                    elif t.side == "SELL" and buys:
-                        sell_qty = float(t.qty)
-                        while sell_qty > 1e-9 and buys:
-                            buy, br = buys[0]
-                            consumed = min(br, sell_qty)
-                            buys[0][1] -= consumed
-                            sell_qty -= consumed
-                            bq = float(buy.qty) or 1
-                            sq = float(t.qty) or 1
-                            bv = float(buy.quote_amount or float(buy.price)*float(buy.qty)) * (consumed/bq)
-                            sv = float(t.quote_amount or float(t.price)*float(t.qty)) * (consumed/sq)
-                            all_realized += (sv - bv) - (bv + sv) * fee_rate_dsv
-                            if buys[0][1] <= 1e-9:
-                                buys.pop(0)
-            try:
-                principal = float(_get_setting("crypto_starting_capital_usd") or "0")
-            except (TypeError, ValueError):
-                principal = 0.0
-            day_start_to_save = principal + all_realized
-            day_start_format = "synth"
-        else:
-            # LIVE mode: use ENTRY-BASIS valuation so today_pnl = realized +
-            # unrealized reconciles cleanly. Falls back to raw current_value
-            # if entry-basis can't be computed (no Binance keys, etc).
-            entry_based = _entry_basis_value(usdt_free=usdt_free)
-            day_start_to_save = entry_based if entry_based > 0 else current_value
-            day_start_format = "entry_basis" if entry_based > 0 else "live"
+        snap_for_day = _entry_basis_value(usdt_free=usdt_free)
+        if snap_for_day <= 0:
+            snap_for_day = current_value  # fallback: keep old behavior
         _set_setting("crypto_day_start_date", today_str)
-        _set_setting("crypto_day_start_value_usd", f"{day_start_to_save:.4f}")
-        _set_setting("crypto_day_start_format", day_start_format)
+        _set_setting("crypto_day_start_value_usd", f"{snap_for_day:.4f}")
+        _set_setting("crypto_day_start_format", "entry_basis")
         _set_setting("crypto_today_loss_halted", "0")
         _set_setting("crypto_today_profit_halted", "0")
         _set_setting("crypto_today_loss_overridden", "0")
@@ -651,13 +602,13 @@ def update_day_start_and_check_halt(current_value: float, usdt_free: float | Non
         # Reset rotation counters at midnight
         _set_setting("crypto_rotation_count_today", "0")
         _set_setting("crypto_last_rotation_at", "")
-        # Daily snapshot table stores SYNTH value (same number used by the
-        # halt + dashboard + ROI graph). Single source of truth.
+        # Daily snapshot table stores the same value used by halt + dashboard
+        # + ROI graph. Single source of truth.
         try:
-            _write_daily_snapshot(today_str, day_start_to_save, source=day_start_format, overwrite=True)
+            _write_daily_snapshot(today_str, snap_for_day, source="entry_basis", overwrite=True)
         except Exception as e:
             log.warning("daily snapshot write failed (non-fatal): %s", e)
-        snap_value = day_start_to_save
+        snap_value = snap_for_day
         return {"day_start": snap_value, "drawdown_pct": 0.0,
                 "halt_triggered": False, "enabled": True,
                 "today_pnl_pct": 0.0, "loss_halt_fired": False, "profit_halt_fired": False}
@@ -884,6 +835,65 @@ def _detect_surge(symbol: str) -> bool:
         return False
 
 
+def _signal_still_valid(intent: dict) -> tuple[bool, str]:
+    """Pre-flight freshness check just before live BUY.
+    Signals are computed on the close of the previous bar, but execution may be
+    delayed (regime gate, surge gate, kline lag). Between scan-time and now,
+    price can have fallen back through SMA50 or far below the breakout level,
+    turning a "fresh breakout" into a knife-catch (whipsaw).
+
+    Re-fetches the latest 1h klines from Binance and confirms:
+      1) Current price has not fallen more than freshness_max_drift_pct below
+         the intent's entry_price (default 0.3%).
+      2) If exit_rule is sma50_break, current close is still > SMA50 on 1h.
+
+    Returns (ok, reason).
+    """
+    if (_get_setting("crypto_signal_freshness_enabled") or "on").lower() != "on":
+        return True, "freshness check disabled"
+    try:
+        max_drift_pct = float(_get_setting("crypto_signal_max_drift_pct") or "0.3")
+    except (TypeError, ValueError):
+        max_drift_pct = 0.3
+    symbol = intent.get("symbol")
+    entry_price = float(intent.get("entry_price") or 0)
+    if not symbol or entry_price <= 0:
+        return True, "no symbol/entry to validate"
+    try:
+        from binance.client import Client
+        # 60 1h-bars: enough for SMA50 + 10 bars of headroom.
+        klines = Client().get_klines(symbol=symbol, interval="1h", limit=60)
+    except Exception as e:
+        log.warning("freshness %s: kline fetch failed: %s", symbol, e)
+        return True, "kline fetch failed (allowing)"
+    if not klines or len(klines) < 51:
+        return True, "not enough bars (allowing)"
+    try:
+        closes = [float(k[4]) for k in klines]
+        current = closes[-1]
+        if current <= 0:
+            return True, "bad price (allowing)"
+        drift_pct = (current - entry_price) / entry_price * 100.0
+        if drift_pct < -max_drift_pct:
+            return False, (
+                f"signal stale: price ${_fmt_price(current)} drifted {drift_pct:+.2f}% "
+                f"from entry ${_fmt_price(entry_price)} (max {-max_drift_pct:.2f}%)"
+            )
+        # SMA50 re-check for breakout-style entries
+        exit_rule = (intent.get("exit_rule") or "").lower()
+        if exit_rule == "sma50_break":
+            sma50 = sum(closes[-50:]) / 50.0
+            if current <= sma50:
+                return False, (
+                    f"signal stale: close ${_fmt_price(current)} fell back below "
+                    f"SMA50 ${_fmt_price(sma50)} before entry"
+                )
+        return True, "ok"
+    except (ValueError, IndexError, ZeroDivisionError) as e:
+        log.warning("freshness %s: parse failed: %s", symbol, e)
+        return True, "parse failed (allowing)"
+
+
 def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> None:
     """Update notes to set or refresh trail-mode state. Idempotent."""
     from webapp.models import db
@@ -895,7 +905,7 @@ def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> 
             t = token.strip()
             if t == "trail_active=1":
                 seen_active = True
-                parts.append(t)
+                parts.append(t)  # keep
             elif t.startswith("trail_high=$"):
                 seen_high = True
                 parts.append(f"trail_high=${_fmt_price(high_water)}")
@@ -1008,11 +1018,13 @@ def _last_losing_exit_at(symbol: str, is_paper: bool):
 
 
 def _rotation_eligible_signal(intent: dict) -> tuple[bool, str]:
-    """Is this incoming signal high-conviction enough to justify rotation?"""
+    """Is this incoming signal high-conviction enough to justify rotation?
+    Returns (yes, reason_or_score_string)."""
     try:
         min_vol = float(_get_setting("crypto_rotation_min_vol_ratio") or "5.0")
     except (TypeError, ValueError):
         min_vol = 5.0
+    # The intent's "reason" field is typed like "24h vol=8.0x, +7.1%, RSI=66"
     reason = intent.get("reason", "")
     import re
     m_vol = re.search(r"vol=([\d.]+)x", reason)
@@ -1020,18 +1032,31 @@ def _rotation_eligible_signal(intent: dict) -> tuple[bool, str]:
     m_rsi = re.search(r"RSI=([\d]+)", reason)
     if not (m_vol and m_chg and m_rsi):
         return False, "could not parse signal strength"
-    vol = float(m_vol.group(1)); chg = float(m_chg.group(1)); rsi = int(m_rsi.group(1))
-    if vol < min_vol: return False, f"vol {vol:.1f}x < threshold {min_vol:.1f}x"
-    if chg < 5.0: return False, f"24h change {chg:+.1f}% < 5%"
-    if not (60 <= rsi <= 75): return False, f"RSI {rsi} outside 60-75"
+    vol = float(m_vol.group(1))
+    chg = float(m_chg.group(1))
+    rsi = int(m_rsi.group(1))
+    if vol < min_vol:
+        return False, f"vol {vol:.1f}x < threshold {min_vol:.1f}x"
+    if chg < 5.0:
+        return False, f"24h change {chg:+.1f}% < 5%"
+    if not (60 <= rsi <= 75):
+        return False, f"RSI {rsi} outside 60-75"
     return True, f"vol={vol:.1f}x, +{chg:.1f}%, RSI={rsi}"
 
 
 def _rotation_find_victim(is_paper: bool):
-    """Pick the weakest open position eligible to be kicked."""
-    from datetime import datetime as _dt
+    """Pick the weakest open position eligible to be kicked. Returns the
+    position object or None. Eligibility:
+      - pnl_usd < -$0.50 (clearly losing)
+      - held >= 60 minutes (gave it time)
+      - not partial_done (don't kick post-partial runners)
+      - not trail_active (don't kick surging trades)
+    Picks the LOWEST pnl_pct among eligible."""
+    from datetime import datetime as _dt, timedelta as _td
     open_pos = _open_positions(is_paper=is_paper)
-    if not open_pos: return None
+    if not open_pos:
+        return None
+    # Need current prices for pnl calc
     try:
         client = _binance_client()
         prices = {t["symbol"]: float(t["price"]) for t in client.get_all_tickers()}
@@ -1040,31 +1065,41 @@ def _rotation_find_victim(is_paper: bool):
     candidates = []
     for p in open_pos:
         meta = parse_entry_notes(p.notes)
-        if meta.get("partial_done") or meta.get("trail_active"): continue
+        if meta.get("partial_done") or meta.get("trail_active"):
+            continue
         held = (_dt.utcnow() - p.executed_at).total_seconds() / 60.0
-        if held < 60: continue
+        if held < 60:
+            continue
         cur = prices.get(p.symbol)
-        if cur is None: continue
+        if cur is None:
+            continue
         qty = float(getattr(p, "_remaining_qty", p.qty))
         entry = float(p.price)
-        if entry <= 0: continue
+        if entry <= 0:
+            continue
         pnl_usd = (cur - entry) * qty
         pnl_pct = (cur - entry) / entry * 100
-        if pnl_usd >= -0.50: continue
+        if pnl_usd >= -0.50:
+            continue
         candidates.append((pnl_pct, pnl_usd, p, cur))
-    if not candidates: return None
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])  # most negative first
+    return candidates[0]  # (pnl_pct, pnl_usd, position, cur_price)
 
 
 def _try_rotation(intent: dict, mode: str) -> tuple[bool, str]:
-    """Attempt smart rotation: sell weakest losing position to make room."""
+    """Attempt smart rotation: sell weakest losing position to make room for
+    a high-conviction new signal. Returns (rotated, reason).
+    Caller must have already confirmed max_concurrent blocked the entry."""
     from datetime import datetime as _dt, timedelta as _td
     if (_get_setting("crypto_rotation_enabled") or "off").lower() != "on":
         return False, "rotation disabled"
+    # Halt active → don't rotate (bot already paused for a reason)
     if (_get_setting("crypto_today_loss_halted") == "1"
             or _get_setting("crypto_today_profit_halted") == "1"):
         return False, "halt active, skipping rotation"
+    # Max rotations per day
     try:
         max_day = int(float(_get_setting("crypto_rotation_max_per_day") or "2"))
     except (TypeError, ValueError):
@@ -1075,6 +1110,7 @@ def _try_rotation(intent: dict, mode: str) -> tuple[bool, str]:
         count_today = 0
     if count_today >= max_day:
         return False, f"daily rotation cap reached ({count_today}/{max_day})"
+    # 30-min cooldown between rotations
     last_iso = _get_setting("crypto_last_rotation_at") or ""
     if last_iso:
         try:
@@ -1082,29 +1118,36 @@ def _try_rotation(intent: dict, mode: str) -> tuple[bool, str]:
             if (_dt.utcnow() - last_dt) < _td(minutes=30):
                 mins_left = int(30 - (_dt.utcnow() - last_dt).total_seconds() / 60)
                 return False, f"rotation cooldown ({mins_left}min left)"
-        except ValueError: pass
+        except ValueError:
+            pass
+    # Signal strength gate
     ok_sig, sig_info = _rotation_eligible_signal(intent)
     if not ok_sig:
         return False, f"signal not strong enough: {sig_info}"
+    # Find victim
     is_paper = (mode == "paper")
     victim = _rotation_find_victim(is_paper)
     if victim is None:
-        return False, "no kickable position"
+        return False, "no kickable position (all profitable, recent, or protected)"
     pnl_pct, pnl_usd, pos, cur_price = victim
     log.info("ROTATION: kicking %s (pnl %+.2f%%, $%+.2f) for %s (%s)",
              pos.symbol, pnl_pct, pnl_usd, intent["symbol"], sig_info)
+    # Execute SELL on victim with rotation marker
     reason = f"rotation: making room for {intent['symbol']}"
     res = execute_sell(pos, cur_price, reason)
     if not res.get("executed"):
         log.error("ROTATION ABORT: victim sell failed — %s", res.get("reason"))
         return False, f"victim sell failed: {res.get('reason')}"
+    # Record rotation event
     _set_setting("crypto_rotation_count_today", str(count_today + 1))
     _set_setting("crypto_last_rotation_at", _dt.utcnow().isoformat())
     return True, f"kicked {pos.symbol} for {intent['symbol']}"
 
 
 def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: bool = False) -> tuple[bool, str]:
-    """Return (ok, reason). Any failure aborts execution."""
+    """Return (ok, reason). Any failure aborts execution.
+    rotation_bypass: when True, skip max_concurrent and loss_cooldown (used
+    after a successful rotation sell freed a slot for this specific entry)."""
     if _get_setting("crypto_kill_switch") == "on":
         return False, "kill switch is ON"
 
@@ -1140,7 +1183,11 @@ def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: 
     if any(p.symbol == intent["symbol"] for p in open_positions):
         return False, f"already have open position in {intent['symbol']}"
 
-    # Per-coin cooldown after a losing exit (bypassed during rotation).
+    # Per-coin cooldown after a losing exit. The market regime that produced
+    # the loss is usually still in effect for a few hours; re-entering the
+    # same setup is the SAHARA bug (sold at stop, re-bought 11 min later).
+    # Skipped when rotation_bypass is set — rotation already established the
+    # new entry is high-conviction and should override cooldown on different coin.
     if not rotation_bypass:
         try:
             cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "4")
@@ -1213,10 +1260,13 @@ def execute_intent(intent: dict) -> dict:
 
     ok, reason = _check_guardrails(intent, mode, client)
     if not ok:
+        # Smart rotation: if max_concurrent is the blocker, try to kick a weak
+        # losing position for a high-conviction new signal (PENDLE-style miss).
         if reason.startswith("max concurrent reached"):
             rotated, rot_reason = _try_rotation(intent, mode)
             if rotated:
                 log.info("ROTATION SUCCESS: %s — retrying entry on %s", rot_reason, intent.get("symbol"))
+                # Retry guardrails with bypass — slot is now free, cooldown waived
                 ok, reason = _check_guardrails(intent, mode, client, rotation_bypass=True)
         if not ok:
             result["mode"] = "skipped"
@@ -1255,6 +1305,16 @@ def execute_intent(intent: dict) -> dict:
     except Exception as e:
         result["mode"] = "skipped"
         result["reason"] = f"symbol info check failed: {e}"
+        return result
+
+    # Pre-flight freshness: signal was computed on a previous bar; if the market
+    # moved against us between scan and now (regime/surge gating delay), the
+    # breakout might already be invalidated. Skip to avoid whipsaw losses.
+    fresh_ok, fresh_reason = _signal_still_valid(intent)
+    if not fresh_ok:
+        result["mode"] = "skipped"
+        result["reason"] = fresh_reason
+        log.warning("freshness skip %s: %s", intent["symbol"], fresh_reason)
         return result
 
     try:
