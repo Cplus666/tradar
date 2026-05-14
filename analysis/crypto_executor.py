@@ -1332,9 +1332,23 @@ def execute_intent(intent: dict) -> dict:
     if not fills:
         result["reason"] = "order placed but no fills reported"
         return result
-    total_qty = sum(float(f["qty"]) for f in fills)
+    gross_qty = sum(float(f["qty"]) for f in fills)
     total_quote = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-    avg_price = total_quote / total_qty if total_qty else 0.0
+    avg_price = total_quote / gross_qty if gross_qty else 0.0
+
+    # Subtract commission paid in the base asset — Binance skims the fee from
+    # the purchased qty by default (e.g., DOGE buy gets 521 filled but 0.521
+    # taken as fee → wallet shows 520.479). Use the actual `commission` /
+    # `commissionAsset` fields from each fill rather than guessing.
+    base_asset = intent["symbol"].replace("USDT", "")
+    fee_in_base = sum(
+        float(f.get("commission", 0))
+        for f in fills if f.get("commissionAsset") == base_asset
+    )
+    total_qty = gross_qty - fee_in_base
+    if fee_in_base > 0:
+        log.info("BUY %s: gross=%.8f - fee=%.8f (%s) = net=%.8f",
+                 intent["symbol"], gross_qty, fee_in_base, base_asset, total_qty)
 
     # Re-anchor stop/target to the actual fill price (not scan-time entry_price).
     # This prevents inverted stops when the order fills at a meaningfully different price.
@@ -1461,8 +1475,18 @@ def execute_sell(position, current_price: float, exit_reason: str,
             result["reason"] = "sell placed but no fills reported"
             return result
         total_qty = sum(float(f["qty"]) for f in fills)
-        total_quote = sum(float(f["qty"]) * float(f["price"]) for f in fills)
-        avg_price = total_quote / total_qty if total_qty else 0.0
+        gross_quote = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+        # USDT commission on SELL is skimmed from the proceeds — record what we
+        # actually received, not the gross.
+        fee_in_usdt = sum(
+            float(f.get("commission", 0))
+            for f in fills if f.get("commissionAsset") == "USDT"
+        )
+        total_quote = gross_quote - fee_in_usdt
+        avg_price = gross_quote / total_qty if total_qty else 0.0
+        if fee_in_usdt > 0:
+            log.info("SELL %s: gross_quote=%.4f - fee=%.4f USDT = net=%.4f",
+                     position.symbol, gross_quote, fee_in_usdt, total_quote)
 
         sell = CryptoTrade(
             symbol=position.symbol, side="SELL", qty=total_qty, price=avg_price,
