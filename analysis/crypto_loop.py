@@ -96,6 +96,13 @@ def _check_exits() -> list[str]:
             bar_seconds = 4 * 3600  # 4h
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
+        # Reconcile any on-exchange trail stop-limit that already filled
+        if meta.get("trail_active"):
+            from analysis.crypto_executor import reconcile_trail_order
+            if reconcile_trail_order(pos):
+                summaries.append(f"{pos.symbol} trail order filled on exchange")
+                continue
+
         exit_reason = None
         # NOTE: BTC regime check (regime_off) used to auto-sell all positions
         # when BTC closed below its 4h SMA50. The trigger was way too sensitive
@@ -211,6 +218,14 @@ def run_fast_exit_check() -> None:
         strat = (pos.strategy or "").lower()
         bar_seconds = 3600 if ("1h" in strat or "momentum" in strat or "oversold" in strat) else 14400
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
+
+        # Reconcile any trail stop-limit order that already filled on the
+        # exchange (avoids us trying to double-sell or holding a phantom row)
+        if meta.get("trail_active"):
+            from analysis.crypto_executor import reconcile_trail_order
+            if reconcile_trail_order(pos):
+                summaries.append(f"{pos.symbol} trail order filled on exchange")
+                continue  # position is now sold; nothing else to do this cycle
 
         exit_reason = None
         # regime_off no longer auto-sells (too sensitive — see _check_exits comment)

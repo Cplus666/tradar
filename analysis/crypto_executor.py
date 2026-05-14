@@ -894,27 +894,222 @@ def _signal_still_valid(intent: dict) -> tuple[bool, str]:
         return True, "parse failed (allowing)"
 
 
+def _round_to_tick(price: float, tick_size: str) -> str:
+    """Round a price DOWN to a valid multiple of Binance's tickSize. Decimal-safe.
+
+    quantize() only adjusts decimal places — it doesn't snap to multiples. For
+    DOGE with tick=0.00001, the price must be an integer multiple of 0.00001
+    (so 0.11479 is valid, 0.11479950 is NOT, even though both have ≤8 decimals).
+    """
+    from decimal import Decimal, ROUND_DOWN
+    tick = Decimal(tick_size)
+    p = Decimal(str(price))
+    snapped = (p / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+    # quantize to tick's decimal places (canonicalize formatting)
+    snapped = snapped.quantize(tick)
+    return format(snapped, "f")
+
+
+def _cancel_trail_order(client, symbol: str, order_id: str) -> bool:
+    """Cancel an existing trail stop-limit order. Returns True if cancelled or
+    already gone (filled/cancelled previously). Returns False on hard failure."""
+    if not order_id:
+        return True
+    try:
+        client.cancel_order(symbol=symbol, orderId=int(order_id))
+        log.info("trail: cancelled stop-limit order %s on %s", order_id, symbol)
+        return True
+    except Exception as e:
+        # "Unknown order sent" = already filled or already cancelled — OK
+        msg = str(e).lower()
+        if "unknown order" in msg or "-2011" in msg:
+            return True
+        log.warning("trail: cancel order %s on %s failed: %s", order_id, symbol, e)
+        return False
+
+
+def _place_trail_stop_limit(position, trail_high: float) -> str | None:
+    """Place a Binance STOP_LOSS_LIMIT order to handle the trail exit on the
+    exchange (avoids market-order slippage during stop cascades).
+
+      stopPrice  = trail_high × 0.97   (trigger)
+      price      = trail_high × 0.965  (limit — accept up to 0.5% below trigger)
+
+    Returns the new orderId (str) on success, or None on failure / no-op.
+    Caller is responsible for cancelling any prior trail order first.
+    """
+    if position.is_paper:
+        return None  # paper mode — no real order
+    from webapp.crypto.routes import get_binance_creds
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return None
+        client = _binance_client(key, secret)
+
+        symbol = position.symbol
+        info = client.get_symbol_info(symbol)
+        if not info or info.get("status") != "TRADING":
+            return None
+        price_filter = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
+        lot_filter   = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+        tick_size = price_filter["tickSize"]
+        step_size = lot_filter["stepSize"]
+
+        # Use actual held balance — partial-take / fee skim may have shrunk qty
+        base_asset = symbol.replace("USDT", "")
+        acct = client.get_account()
+        bal = next((b for b in acct["balances"] if b["asset"] == base_asset), None)
+        free = float(bal["free"]) if bal else 0.0
+        if free <= 0:
+            log.warning("trail: %s no free balance to protect", symbol)
+            return None
+        qty_str = _quantity_to_step_string(free, step_size)
+        if float(qty_str) <= 0:
+            return None
+
+        stop_price = _round_to_tick(trail_high * 0.97, tick_size)
+        limit_price = _round_to_tick(trail_high * 0.965, tick_size)
+
+        order = client.create_order(
+            symbol=symbol,
+            side="SELL",
+            type="STOP_LOSS_LIMIT",
+            timeInForce="GTC",
+            quantity=qty_str,
+            stopPrice=stop_price,
+            price=limit_price,
+        )
+        oid = str(order.get("orderId", ""))
+        log.info("trail: %s placed STOP_LIMIT qty=%s stop=$%s limit=$%s orderId=%s",
+                 symbol, qty_str, stop_price, limit_price, oid)
+        return oid or None
+    except Exception as e:
+        log.warning("trail: place stop-limit on %s failed: %s", position.symbol, e)
+        return None
+
+
+def reconcile_trail_order(position) -> bool:
+    """If the on-exchange trail stop-limit has filled, write the SELL trade
+    record into our DB and return True. Caller should then skip further
+    processing of this position in this cycle. Returns False if the order is
+    still open / pending / cancelled / not present (position remains live)."""
+    from webapp.models import CryptoTrade, db
+    if position.is_paper:
+        return False
+    # Extract trail_order_id from notes
+    order_id = None
+    for tok in (position.notes or "").split("·"):
+        s = tok.strip()
+        if s.startswith("trail_order_id="):
+            order_id = s.split("=", 1)[1].strip()
+            break
+    if not order_id:
+        return False
+    from webapp.crypto.routes import get_binance_creds
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return False
+        client = _binance_client(key, secret)
+        order = client.get_order(symbol=position.symbol, orderId=int(order_id))
+    except Exception as e:
+        log.warning("reconcile_trail %s order %s: query failed: %s",
+                    position.symbol, order_id, e)
+        return False
+    status = (order.get("status") or "").upper()
+    if status != "FILLED":
+        return False
+    # Order filled on exchange — reconcile into DB
+    executed_qty = float(order.get("executedQty") or 0)
+    cumm_quote   = float(order.get("cummulativeQuoteQty") or 0)
+    if executed_qty <= 0:
+        return False
+    avg_price = cumm_quote / executed_qty
+    # Subtract USDT commission (matches our updated execute_sell convention)
+    # cummulativeQuoteQty already nets out commission for SELL fills paid in USDT.
+    sell = CryptoTrade(
+        symbol=position.symbol, side="SELL", qty=executed_qty, price=avg_price,
+        quote_amount=cumm_quote, executed_at=datetime.utcnow(),
+        status="filled", is_paper=False, strategy=position.strategy,
+        binance_order_id=str(order.get("orderId", "")),
+        notes=f"LIVE EXIT · trail stop-limit filled on exchange (orderId={order_id})",
+    )
+    db.session.add(sell)
+    db.session.commit()
+    entry_price = float(position.price)
+    pnl_pct = (avg_price - entry_price) / entry_price * 100
+    log.info("RECONCILED trail order %s on %s — SELL %s @ $%.6f (P&L %+.2f%%)",
+             order_id, position.symbol, executed_qty, avg_price, pnl_pct)
+    return True
+
+
 def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> None:
-    """Update notes to set or refresh trail-mode state. Idempotent."""
+    """Update notes to set or refresh trail-mode state. Idempotent.
+
+    Side effect (LIVE only): places/replaces a Binance STOP_LOSS_LIMIT order at
+    trail_high × 0.97 (trigger) / × 0.965 (limit). Throttled — only replaces the
+    on-exchange order if the new high is >= 0.5% above the prior trail_high.
+    """
     from webapp.models import db
     parts: list[str] = []
     seen_active = False
     seen_high = False
+    prior_trail_high: float | None = None
+    prior_order_id: str | None = None
     if position.notes:
         for token in position.notes.split("·"):
             t = token.strip()
             if t == "trail_active=1":
                 seen_active = True
-                parts.append(t)  # keep
+                parts.append(t)
             elif t.startswith("trail_high=$"):
                 seen_high = True
+                try:
+                    prior_trail_high = float(t.split("=$", 1)[1])
+                except (ValueError, IndexError):
+                    prior_trail_high = None
                 parts.append(f"trail_high=${_fmt_price(high_water)}")
+            elif t.startswith("trail_order_id="):
+                try:
+                    prior_order_id = t.split("=", 1)[1].strip()
+                except IndexError:
+                    prior_order_id = None
+                # don't append; we may rewrite with a new ID below
             elif t:
                 parts.append(t)
-    if activate and not seen_active:
+    activating_now = activate and not seen_active
+    if activating_now:
         parts.append("trail_active=1")
     if not seen_high:
         parts.append(f"trail_high=${_fmt_price(high_water)}")
+
+    # On-exchange order management:
+    #  - place new order when first activating
+    #  - place new order if trail is active but no order exists (backfill case)
+    #  - replace when high moves up at least 0.5% (avoid hammering Binance)
+    new_order_id = prior_order_id
+    if not position.is_paper:
+        needs_refresh = activating_now or (seen_active and not prior_order_id)
+        if prior_trail_high and prior_trail_high > 0:
+            uplift_pct = (high_water - prior_trail_high) / prior_trail_high * 100
+            if uplift_pct >= 0.5:
+                needs_refresh = True
+        if needs_refresh:
+            from webapp.crypto.routes import get_binance_creds
+            try:
+                key, secret = get_binance_creds()
+                if key and secret and prior_order_id:
+                    client = _binance_client(key, secret)
+                    _cancel_trail_order(client, position.symbol, prior_order_id)
+            except Exception as e:
+                log.warning("trail: pre-place cancel sequence failed on %s: %s",
+                            position.symbol, e)
+            new_order_id = _place_trail_stop_limit(position, high_water) or new_order_id
+
+    if new_order_id:
+        parts.append(f"trail_order_id={new_order_id}")
+
     position.notes = " · ".join(parts)
     db.session.commit()
 
