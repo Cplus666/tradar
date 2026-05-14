@@ -23,6 +23,12 @@ import pandas as pd
 from analysis.crypto_data import load_cached
 from analysis.indicators import attach
 
+# Minimum margin above SMA50 to call something a real "above-trend" entry.
+# Without this, ADA/PEPE-style paper-thin breakouts (entered at +0.0% margin)
+# get wicked by routine noise within minutes. 1% buffer eliminates that whole
+# class of fake-breakout trades while still allowing most real breakouts to fire.
+SMA50_MIN_MARGIN_PCT = 1.0
+
 log = logging.getLogger("crypto_strategies")
 
 
@@ -69,10 +75,11 @@ def crypto_breakout_4h(df: pd.DataFrame, symbol: str) -> dict | None:
 
     # Required: above prior high, but only by <=5% (catch fresh breakouts, not chases)
     gap = (close - prior_high) / prior_high * 100
+    sma50_margin_pct = (close - sma50) / sma50 * 100 if sma50 > 0 else -999
     if not (
         0 < gap <= 5
         and vr > 1.5
-        and close > sma50
+        and sma50_margin_pct >= SMA50_MIN_MARGIN_PCT
         and rsi < 72
         and chg_24h < 25
     ):
@@ -118,7 +125,13 @@ def momentum_surge_4h(df: pd.DataFrame, symbol: str) -> dict | None:
     vol_ratio_24h = vol_24h / vol_avg_24h if vol_avg_24h else 0
 
     # Cap 24h % at 20% — above that is chasing a parabola, EV turns negative
-    if not (vol_ratio_24h > 3.0 and 5 < chg_24h_pct < 20 and rsi < 75 and close > sma50):
+    sma50_margin_pct = (close - sma50) / sma50 * 100 if sma50 > 0 else -999
+    if not (
+        vol_ratio_24h > 3.0
+        and 5 < chg_24h_pct < 20
+        and rsi < 75
+        and sma50_margin_pct >= SMA50_MIN_MARGIN_PCT
+    ):
         return None
 
     atr = float(last["atr14"])
@@ -171,9 +184,10 @@ def pullback_uptrend_4h(df: pd.DataFrame, symbol: str) -> dict | None:
 
     sma50_rising = sma50 > sma50_5_ago
     near_ema20 = abs(close - ema20) / ema20 < 0.02
+    sma50_margin_pct = (close - sma50) / sma50 * 100 if sma50 > 0 else -999
 
     if not (
-        close > sma50 and sma50_rising
+        sma50_margin_pct >= SMA50_MIN_MARGIN_PCT and sma50_rising
         and bars_since_high <= 6  # high made recently
         and 5 <= pullback_pct <= 15  # real pullback, not sideways or crash
         and 35 <= rsi <= 50
@@ -271,10 +285,11 @@ def crypto_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     chg_24h = (close - float(d["Close"].iloc[-25])) / float(d["Close"].iloc[-25]) * 100
 
     gap = (close - prior_high) / prior_high * 100
+    sma50_margin_pct = (close - sma50) / sma50 * 100 if sma50 > 0 else -999
     if not (
         0 < gap <= 3              # very fresh breakout only
         and vr > 1.5
-        and close > sma50
+        and sma50_margin_pct >= SMA50_MIN_MARGIN_PCT
         and rsi < 75
         and chg_24h < 25
     ):
