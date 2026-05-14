@@ -126,11 +126,23 @@ def momentum_surge_4h(df: pd.DataFrame, symbol: str) -> dict | None:
 
     # Cap 24h % at 20% — above that is chasing a parabola, EV turns negative
     sma50_margin_pct = (close - sma50) / sma50 * 100 if sma50 > 0 else -999
+
+    # Trend-direction check: 24h % can be +19% even when the last 8h have been
+    # a steady bleed (today's AIUSDT — pumped +30% then crashed -22% off high
+    # before bot bought). Require the most recent close to be the HIGHEST of
+    # the last 3 closes — confirms the surge is still going UP right now,
+    # not reversing post-pump.
+    c_now = close
+    c_prev = float(d["Close"].iloc[-2])
+    c_prev2 = float(d["Close"].iloc[-3])
+    trend_intact = c_now > c_prev and c_now > c_prev2
+
     if not (
         vol_ratio_24h > 3.0
         and 5 < chg_24h_pct < 20
         and rsi < 75
         and sma50_margin_pct >= SMA50_MIN_MARGIN_PCT
+        and trend_intact
     ):
         return None
 
