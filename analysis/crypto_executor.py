@@ -932,8 +932,12 @@ def _place_trail_stop_limit(position, trail_high: float) -> str | None:
     """Place a Binance STOP_LOSS_LIMIT order to handle the trail exit on the
     exchange (avoids market-order slippage during stop cascades).
 
-      stopPrice  = trail_high × 0.97   (trigger)
-      price      = trail_high × 0.965  (limit — accept up to 0.5% below trigger)
+      stopPrice  = trail_high × (1 - trail_pct/100)         (trigger)
+      price      = stopPrice  × (1 - 0.5/100)               (0.5% below trigger)
+
+    trail_pct is read from setting `crypto_surge_trail_pct` (default 3.0) — the
+    same value the in-loop trail check uses, so on-exchange and in-loop levels
+    stay in sync when the setting changes.
 
     Returns the new orderId (str) on success, or None on failure / no-op.
     Caller is responsible for cancelling any prior trail order first.
@@ -968,8 +972,14 @@ def _place_trail_stop_limit(position, trail_high: float) -> str | None:
         if float(qty_str) <= 0:
             return None
 
-        stop_price = _round_to_tick(trail_high * 0.97, tick_size)
-        limit_price = _round_to_tick(trail_high * 0.965, tick_size)
+        try:
+            trail_pct = float(_get_setting("crypto_surge_trail_pct") or "3.0")
+        except (TypeError, ValueError):
+            trail_pct = 3.0
+        stop_mult  = 1 - trail_pct / 100.0
+        limit_mult = stop_mult * 0.995   # 0.5% below trigger
+        stop_price  = _round_to_tick(trail_high * stop_mult,  tick_size)
+        limit_price = _round_to_tick(trail_high * limit_mult, tick_size)
 
         order = client.create_order(
             symbol=symbol,
