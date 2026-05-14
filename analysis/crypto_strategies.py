@@ -280,12 +280,14 @@ def crypto_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     ):
         return None
 
-    atr = float(last["atr14"])
+    # Fixed-percent stops/targets — ATR-based was too tight for low-vol majors
+    # like BNB (2-bar ATR=$5 = 0.7% stop → wicked by random noise). 5%/8% gives
+    # the trade room to breathe through normal pullbacks while keeping R:R ~1.6.
     return {
         "date": d.index[-1], "symbol": symbol, "strategy": "breakout_1h", "side": "BUY",
         "entry_price": close,
-        "stop_price": close - 2.0 * atr,    # tighter than 4h (smaller moves)
-        "target_price": close + 3.0 * atr,
+        "stop_price": close * 0.95,         # -5%
+        "target_price": close * 1.08,       # +8%
         "max_hold_bars": 12,                 # 12h max — short timeframe = quick exit
         "exit_rule": "sma50_break",
         "reason": f"1h fresh breakout +{gap:.1f}% over prior high, vol={vr:.1f}x, RSI={rsi:.0f}",
@@ -295,13 +297,29 @@ def crypto_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
 def support_bounce_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     """Bull-flag pattern: rising coin pulls back to a support level, tests it
     multiple times, then bounces with conviction. Catches the SAGA-style
-    continuation where breakout/momentum strategies miss it."""
+    continuation where breakout/momentum strategies miss it.
+
+    Filters:
+      - Recent rise: 12h change >= +8% (real prior leg)
+      - Support detected: 3+ wick lows clustered within ±1.5% tolerance
+        across the last 12 1h-bars
+      - Consolidation: range of last 6 bars within ±4% (tight coil)
+      - Bounce: latest closed 1h bar is GREEN with volume >= 1.5x 20-bar avg
+      - Not overbought: RSI 50-72 (room to run, not exhausted)
+      - Above SMA50 (longer trend intact)
+
+    Stop: 3% below the support cluster low
+    Target: recent swing high (the leg origin we're bouncing back toward)
+    Hold: 18 bars (~18h)
+    """
     if df is None or df.empty or len(df) < 30:
         return None
     d = attach(df)
     last = d.iloc[-1]
     close = float(last["Close"])
     open_ = float(last["Open"])
+
+    # 1) Recent rise — need a leg up to retrace from
     if len(d) < 13:
         return None
     close_12h_ago = float(d.iloc[-13]["Close"])
@@ -310,21 +328,29 @@ def support_bounce_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     rise_12h_pct = (close - close_12h_ago) / close_12h_ago * 100
     if rise_12h_pct < 8.0:
         return None
+
+    # 2) Above SMA50 — trend still intact
     if pd.isna(last.get("sma50")) or close <= float(last["sma50"]):
         return None
+
+    # 3) Support cluster — find lowest low in last 12 bars and count touches
     window = d.iloc[-12:]
     lows = window["Low"].astype(float).tolist()
     support_low = min(lows)
-    tolerance = 0.015
+    tolerance = 0.015  # ±1.5%
     touches = sum(1 for lo in lows if abs(lo - support_low) / support_low <= tolerance)
     if touches < 3:
         return None
+
+    # 4) Consolidation — range of last 6 bars compressed
     last_6 = d.iloc[-6:]
     high6 = float(last_6["High"].max())
     low6 = float(last_6["Low"].min())
     range_pct = (high6 - low6) / low6 * 100 if low6 > 0 else 999
     if range_pct > 5.0:
-        return None
+        return None  # too wide = not yet consolidating
+
+    # 5) Bounce signal — latest closed bar GREEN with volume
     if close <= open_:
         return None
     if pd.notna(last.get("vol_sma20")) and float(last["vol_sma20"]) > 0:
@@ -333,16 +359,23 @@ def support_bounce_1h(df: pd.DataFrame, symbol: str) -> dict | None:
             return None
     else:
         return None
+
+    # 6) RSI gate — not too cold (no real momentum) or too hot (chase territory)
     if pd.isna(last.get("rsi14")):
         return None
     rsi = float(last["rsi14"])
     if rsi < 50 or rsi > 72:
         return None
-    stop = support_low * 0.97
+
+    # Levels
+    stop = support_low * 0.97  # 3% below support cluster
+    # Target = swing high of the prior leg (highest high in last 24 bars,
+    # capped at +8% if too far away to be realistic in 18h hold)
     swing_high = float(d["High"].iloc[-24:].max())
     target = min(swing_high, close * 1.08)
     if target <= close * 1.02:
-        return None
+        return None  # not enough upside to be worth the risk
+
     return {
         "date": d.index[-1], "symbol": symbol, "strategy": "support_bounce", "side": "BUY",
         "entry_price": close, "stop_price": stop, "target_price": target,
