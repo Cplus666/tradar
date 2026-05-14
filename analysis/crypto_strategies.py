@@ -292,6 +292,65 @@ def crypto_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     }
 
 
+def support_bounce_1h(df: pd.DataFrame, symbol: str) -> dict | None:
+    """Bull-flag pattern: rising coin pulls back to a support level, tests it
+    multiple times, then bounces with conviction. Catches the SAGA-style
+    continuation where breakout/momentum strategies miss it."""
+    if df is None or df.empty or len(df) < 30:
+        return None
+    d = attach(df)
+    last = d.iloc[-1]
+    close = float(last["Close"])
+    open_ = float(last["Open"])
+    if len(d) < 13:
+        return None
+    close_12h_ago = float(d.iloc[-13]["Close"])
+    if close_12h_ago <= 0:
+        return None
+    rise_12h_pct = (close - close_12h_ago) / close_12h_ago * 100
+    if rise_12h_pct < 8.0:
+        return None
+    if pd.isna(last.get("sma50")) or close <= float(last["sma50"]):
+        return None
+    window = d.iloc[-12:]
+    lows = window["Low"].astype(float).tolist()
+    support_low = min(lows)
+    tolerance = 0.015
+    touches = sum(1 for lo in lows if abs(lo - support_low) / support_low <= tolerance)
+    if touches < 3:
+        return None
+    last_6 = d.iloc[-6:]
+    high6 = float(last_6["High"].max())
+    low6 = float(last_6["Low"].min())
+    range_pct = (high6 - low6) / low6 * 100 if low6 > 0 else 999
+    if range_pct > 5.0:
+        return None
+    if close <= open_:
+        return None
+    if pd.notna(last.get("vol_sma20")) and float(last["vol_sma20"]) > 0:
+        vol_ratio = float(last["Volume"]) / float(last["vol_sma20"])
+        if vol_ratio < 1.5:
+            return None
+    else:
+        return None
+    if pd.isna(last.get("rsi14")):
+        return None
+    rsi = float(last["rsi14"])
+    if rsi < 50 or rsi > 72:
+        return None
+    stop = support_low * 0.97
+    swing_high = float(d["High"].iloc[-24:].max())
+    target = min(swing_high, close * 1.08)
+    if target <= close * 1.02:
+        return None
+    return {
+        "date": d.index[-1], "symbol": symbol, "strategy": "support_bounce", "side": "BUY",
+        "entry_price": close, "stop_price": stop, "target_price": target,
+        "max_hold_bars": 18, "exit_rule": "stop_target_time",
+        "reason": f"support ${support_low:.5f} held {touches}x, +{rise_12h_pct:.1f}%/12h, RSI={rsi:.0f}",
+    }
+
+
 # Registry: each strategy declares its native timeframe.
 # scan_crypto() loads the right kline data per strategy.
 STRATEGIES_BY_TIMEFRAME = {
@@ -303,6 +362,7 @@ STRATEGIES_BY_TIMEFRAME = {
     },
     "1h": {
         "breakout_1h": crypto_breakout_1h,
+        "support_bounce": support_bounce_1h,
     },
 }
 

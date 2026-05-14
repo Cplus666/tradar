@@ -37,6 +37,7 @@ STRATEGY_NAMES = (
     "momentum_surge",
     "pullback_uptrend",
     "oversold_meanrev",
+    "support_bounce",
 )
 
 
