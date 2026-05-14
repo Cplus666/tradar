@@ -23,11 +23,10 @@ import pandas as pd
 from analysis.crypto_data import load_cached
 from analysis.indicators import attach
 
-# Minimum margin above SMA50 to call something a real "above-trend" entry.
-# Without this, ADA/PEPE-style paper-thin breakouts (entered at +0.0% margin)
-# get wicked by routine noise within minutes. 1% buffer eliminates that whole
-# class of fake-breakout trades while still allowing most real breakouts to fire.
-SMA50_MIN_MARGIN_PCT = 1.0
+# Minimum margin above SMA50 for entries. 0.5% blocks paper-thin "barely-above"
+# fake breakouts (entry at +0.0% margin = no buffer for noise) while still
+# allowing fresh breakouts that have just cleared the trend by a real amount.
+SMA50_MIN_MARGIN_PCT = 0.5
 
 log = logging.getLogger("crypto_strategies")
 
