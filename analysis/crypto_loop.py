@@ -102,17 +102,23 @@ def _check_exits() -> list[str]:
         # (a 0.07% breach would dump everything) and caused real losses on
         # 2026-05-12. Now regime is INFORMATIONAL ONLY — exposed as a warning
         # banner on the dashboard. User decides whether to act via Halt Now.
-        # 2) Stop loss
-        if meta["stop"] is not None and cur_price <= meta["stop"]:
+        # 2) Stop loss — SKIPPED when in trail mode (trail_stop takes over).
+        # Otherwise the static stop would fire before the trail logic gets to
+        # run, defeating the whole point of trail mode (let winners ride).
+        if (not meta.get("trail_active")
+                and meta["stop"] is not None
+                and cur_price <= meta["stop"]):
             exit_reason = f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f})"
-        # 3) Profit target
-        elif meta["target"] is not None and cur_price >= meta["target"]:
+        # 3) Profit target — also skipped in trail mode (trail rides past target)
+        elif (not meta.get("trail_active")
+                and meta["target"] is not None
+                and cur_price >= meta["target"]):
             exit_reason = f"target hit (${cur_price:.6f} >= ${meta['target']:.6f})"
         # 4) Time stop
         elif bars_held >= meta["max_hold"]:
             exit_reason = f"time stop ({bars_held}/{meta['max_hold']} bars)"
-        # 5) Strategy-specific exit
-        else:
+        # 5) Strategy-specific exit — SKIPPED in trail mode (trail owns all exits)
+        elif not meta.get("trail_active"):
             triggered, why = _check_strategy_exit(meta["exit_rule"], df)
             if triggered:
                 # RSI overbought = "price rising fast." That's a SURGE signal,
@@ -208,7 +214,10 @@ def run_fast_exit_check() -> None:
 
         exit_reason = None
         # regime_off no longer auto-sells (too sensitive — see _check_exits comment)
-        if meta["stop"] is not None and cur <= meta["stop"]:
+        # Static stop is SKIPPED in trail mode (trail_stop handles downside).
+        if (not meta.get("trail_active")
+                and meta["stop"] is not None
+                and cur <= meta["stop"]):
             exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
         elif meta.get("trail_active"):
             # In surge-promoted trail mode: refresh high water mark, exit on
