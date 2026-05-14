@@ -19,14 +19,26 @@
 {%- endmacro %}
 <div class="flex items-baseline gap-3 mb-4">
   {# Symbol → Binance trade page (e.g. ICPUSDT → ICP_USDT). Strip the 'USDT' suffix
-     and rejoin with underscore. Always opens in new tab. #}
+     and rejoin with underscore. Always opens in new tab. When the symbol is in
+     BREAK/HALT status, Binance has suspended trading and the trade page is dead —
+     show plain symbol + SUSPENDED badge instead of a broken link. #}
   <h1 class="text-2xl font-semibold mono">
-    <a href="https://www.binance.com/en/trade/{{ symbol[:-4] }}_USDT?type=spot"
-       target="_blank" rel="noopener"
-       class="hover:text-amber-400 transition-colors"
-       title="Open on Binance">
-      {{ symbol }} <span class="text-xs text-zinc-500 align-middle">↗</span>
-    </a>
+    {% if symbol_status == "TRADING" %}
+      <a href="https://www.binance.com/en/trade/{{ symbol[:-4] }}_USDT?type=spot"
+         target="_blank" rel="noopener"
+         class="hover:text-amber-400 transition-colors"
+         title="Open on Binance">
+        {{ symbol }} <span class="text-xs text-zinc-500 align-middle">↗</span>
+      </a>
+    {% else %}
+      <span class="text-zinc-400" title="Binance trading status: {{ symbol_status }}">
+        {{ symbol }}
+      </span>
+      <span class="text-xs px-2 py-0.5 ml-2 rounded bg-red-900/60 text-red-200 font-medium align-middle"
+            title="Binance has suspended trading on this symbol. Bot will not place orders.">
+        ⚠ SUSPENDED ({{ symbol_status }})
+      </span>
+    {% endif %}
   </h1>
   <div class="text-2xl mono num font-semibold">{{ fmt_price(readout.last) }}</div>
   <div class="text-lg mono num {% if readout.chg_pct > 0 %}pos{% elif readout.chg_pct < 0 %}neg{% endif %}">

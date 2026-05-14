@@ -10,20 +10,7 @@ from flask import Blueprint, abort, flash, jsonify, redirect, render_template, r
 
 from webapp.models import CryptoCoin, CryptoHolding, CryptoRun, CryptoTrade, Setting, db
 
-bp = Blueprint("crypto", __name__, url_prefix="/tradar", template_folder="templates")
-
-
-@bp.app_template_filter("dt")
-def fmt_dt(value):
-    """UTC datetime → 'YYYY-MM-DD HH:MM MYT' display. DB stores naive UTC."""
-    if not value:
-        return ""
-    from datetime import timezone, timedelta
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    myt = value.astimezone(timezone(timedelta(hours=8)))
-    return myt.strftime("%Y-%m-%d %H:%M MYT")
-
+bp = Blueprint("crypto", __name__, url_prefix="/crypto", template_folder="templates")
 
 KEY_SETTING = "binance_api_key"
 SECRET_SETTING = "binance_api_secret"
@@ -92,16 +79,6 @@ def get_binance_creds() -> tuple[str | None, str | None]:
     return (db_key or None), (db_secret or None)
 
 
-def _displayed_is_paper() -> bool:
-    """Returns True if dashboard / journal / activity should show paper trades,
-    False for live trades. Determined by the current trading mode setting.
-
-    Without this helper, hardcoded `is_paper=False` filters everywhere caused
-    paper-mode tradar to show empty dashboards (the bug fixed 2026-05-09)."""
-    from analysis.crypto_executor import _is_paper_mode_setting
-    return _is_paper_mode_setting()
-
-
 def _has_binance_keys() -> bool:
     k, s = get_binance_creds()
     return bool(k and s)
@@ -118,24 +95,17 @@ def _mask(s: str | None) -> str:
 def _account_summary(prefetched_tickers: dict | None = None) -> dict:
     """Total account value, today's P&L (realized + unrealized), win rate.
 
-    Works in BOTH live and paper mode:
-      - Live: pulls usdt_free from Binance get_account(); positions filtered is_paper=False
-      - Paper: derives usdt_free from trade history (starting_capital - open_cost
-        + realized_pnl); positions filtered is_paper=True; tickers from public
-        get_all_tickers (no auth needed)
-
     Today = since 00:00 MYT today. Pass prefetched_tickers to avoid duplicate fetch.
     """
     from datetime import timezone, timedelta
-    from analysis.crypto_executor import (
-        _open_positions, parse_entry_notes, _is_paper_mode_setting,
-        _principal_at_day,
-    )
+    from analysis.crypto_executor import _open_positions, parse_entry_notes
+
+    # `starting_capital` here = total contributed capital up to now (initial +
+    # deposits − withdrawals through prior days). Used for all_time_pnl which
+    # should ONLY reflect trading P&L, not contributions. _principal_at_day(today)
+    # excludes today's own deposits (they're in tomorrow's rollover).
+    from analysis.crypto_executor import _principal_at_day
     from datetime import timezone as _tz_init, timedelta as _td_init
-
-    is_paper = _is_paper_mode_setting()
-    pos_filter = True if is_paper else False
-
     _init_today_iso = (datetime.utcnow().replace(tzinfo=_tz_init.utc)
                        .astimezone(_tz_init(_td_init(hours=8))).date().isoformat())
     out = {
@@ -147,67 +117,40 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         "all_time_pnl": 0.0,
     }
 
-    # Get tickers — always works without auth (public endpoint)
-    client = None
-    if prefetched_tickers is not None:
-        all_tickers = prefetched_tickers
-    else:
-        try:
-            client = _binance_client()  # no key needed for tickers
-            all_tickers = {t["symbol"]: float(t["price"]) for t in client.get_all_tickers()}
-        except Exception:
-            all_tickers = {}
-
-    # USDT free balance — different sources for live vs paper
-    if is_paper:
-        # Paper mode: synthesize cash from trade history.
-        # usdt_free = starting_capital + Σ(sells − sell_fee) − Σ(buys + buy_fee)
-        # In paper mode this CAN go negative (bot trades larger than starting
-        # capital); don't clamp — account_value math depends on the true value
-        # so that account_value = usdt_free + open_value reconciles with
-        # starting_capital + realized + unrealized.
-        from webapp.models import CryptoTrade
-        trades = (CryptoTrade.query
-                  .filter_by(is_paper=True)
-                  .order_by(CryptoTrade.executed_at)
-                  .all())
-        try:
-            fee_rate_init = float(_setting("crypto_fee_rate_per_side", "0.001"))
-        except (TypeError, ValueError):
-            fee_rate_init = 0.001
-        cash = float(out["starting_capital"])
-        for t in trades:
-            quote = float(t.quote_amount or float(t.price) * float(t.qty))
-            fee = quote * fee_rate_init
-            if t.side == "BUY":
-                cash -= (quote + fee)
-            elif t.side == "SELL":
-                cash += (quote - fee)
-        out["usdt_free"] = cash  # may be negative; that's correct in paper mode
-    else:
-        # Live mode: pull from Binance
-        try:
-            key, secret = get_binance_creds()
-            if not key or not secret:
-                return out  # no keys + live mode = can't proceed
-            client = _binance_client(key, secret)
-            acct = client.get_account()
-            usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
-            out["usdt_free"] = float(usdt["free"]) if usdt else 0.0
-            # Sync holdings table — only meaningful in live mode
-            try:
-                from analysis.binance_sync import persist_holdings_from_data
-                persist_holdings_from_data(acct.get("balances", []), all_tickers)
-            except Exception:
-                pass
-        except Exception:
+    # Live USDT balance + ticker prices for open positions
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
             return out
+        client = _binance_client(key, secret)
+        acct = client.get_account()
+        usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
+        out["usdt_free"] = float(usdt["free"]) if usdt else 0.0
+    except Exception:
+        return out
 
-    open_pos = _open_positions(is_paper=pos_filter)
+    open_pos = _open_positions(is_paper=False)
     open_value = 0.0
     today_unrealized = 0.0
     myt_now = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
     today_start_utc = (myt_now.replace(hour=0, minute=0, second=0, microsecond=0)).astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Use prefetched tickers if caller provided (avoids duplicate Binance call)
+    if prefetched_tickers is not None:
+        all_tickers = prefetched_tickers
+    else:
+        try:
+            all_tickers = {t["symbol"]: float(t["price"]) for t in client.get_all_tickers()}
+        except Exception:
+            all_tickers = {}
+
+    # Sync the holdings table to whatever we just fetched live — keeps /crypto/holdings
+    # in lock-step with the dashboard. Cheap: no extra API calls, just DB writes.
+    try:
+        from analysis.binance_sync import persist_holdings_from_data
+        persist_holdings_from_data(acct.get("balances", []), all_tickers)
+    except Exception:
+        pass  # never let this break the dashboard
 
     # Fee rate — used to net both today's realized P&L and unrealized P&L
     # so dashboard numbers match journal + daily ROI chart conventions.
@@ -234,11 +177,11 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         today_unrealized += gross - fee
     out["open_count"] = len(open_pos)
     out["open_value"] = open_value
-    # Real balance from Binance (live) or synthesized cash + open value (paper).
-    # We expose this separately as `binance_real_balance` for the drift indicator.
-    # The displayed `account_value` will be the DERIVED value (day_start + realized
-    # + unrealized) so it always reconciles with cards. See the day-start block below.
+    # Real Binance balance (saved as binance_real_balance for the drift indicator).
+    # The DISPLAYED account_value will be the DERIVED value below so it always
+    # reconciles with cards exactly. Drift is shown as a small badge.
     binance_real_balance = out["usdt_free"] + open_value
+    out["account_value"] = binance_real_balance  # default; overridden in derived block
 
     # NOTE: _account_summary used to call update_day_start_and_check_halt here,
     # but that triggered halt sells inside a function whose first job is to
@@ -272,7 +215,7 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
 
     # Today's realized P&L: pair BUY-SELL where SELL closed today
     from webapp.models import CryptoTrade
-    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == _displayed_is_paper()).order_by(CryptoTrade.executed_at).all()
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -289,9 +232,12 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
             if t.side == "BUY":
                 buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
-                # One SELL = one round-trip = one W/L tick. Old code counted
-                # each FIFO buy-lot consumption as a separate W/L → multi-lot
-                # SELL produced phantom extra wins/losses.
+                # Accumulate P&L across all FIFO lots this SELL consumes —
+                # one SELL event = ONE round-trip = ONE win-or-loss tick,
+                # regardless of how many buy lots it spans. (Old code counted
+                # each FIFO iteration as a separate W/L, so a sell that
+                # consumed 0.09 leftover dust + 14.01 today's buy registered
+                # as 2 losses instead of 1.)
                 sell_qty_remaining = float(t.qty)
                 sell_event_pnl = 0.0
                 sell_event_today = (t.executed_at >= today_start_utc)
@@ -345,67 +291,48 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         out["today_win_rate"] = today_wins / (today_wins + today_losses) * 100
 
     # === UNIFIED DERIVED-MATH BLOCK (task #76) =================================
-    # Goal: cards must add up EXACTLY to today_unrealized; account_value must
-    # always equal day_start + today_realized + today_unrealized. The real
-    # Binance balance (which can drift due to dust price moves, untracked
-    # fees, deposits) is shown separately as a small drift indicator so the
-    # user sees reality without it polluting the main P&L numbers.
-    #
-    # Live mode: day_start = real Binance balance snapshotted at MYT 00:00
-    # Paper mode: day_start = derived from trade history (no Binance call)
+    # Cards must add up EXACTLY to today_unrealized; account_value must equal
+    # day_start + today_realized + today_unrealized. Real Binance balance can
+    # drift from this (dust price moves, untracked fees, deposits) — shown
+    # separately as a small drift indicator.
 
     out["today_unrealized"] = today_unrealized            # always = sum(card.pnl_usd)
     today_total = today_realized + today_unrealized       # always reconciles
     out["today_total"] = today_total
 
-    # Day-start: differs by mode per user's mental model
-    #   PAPER: day_start = principal + Σ realized BEFORE today.
-    #     Excludes overnight unrealized — open positions "carry" their unrealized
-    #     forward as today_unrealized until they close. When they finally close,
-    #     the FULL P&L (including overnight portion) becomes realized that day.
-    #     Math: account_value = day_start + today_realized + today_unrealized
-    #     reconciles correctly.
-    #   LIVE: day_start = real Binance balance snapshotted at MYT 00:00.
-    #     Captures actual portfolio value (incl. overnight unrealized + dust).
-    if is_paper:
-        # Always derive from formula — never trust stored snapshot for paper
-        # because midnight rollover stores `current_value` (with unrealized)
-        # which contradicts user's "no unrealized in day_start" intent.
-        out["day_start_value"] = out["starting_capital"] + (all_realized - today_realized)
-    else:
+    # Day-start: trust the stored Binance midnight snapshot (set at MYT 00:00).
+    stored_day_start = 0.0
+    try:
+        stored_day_start = float(_setting("crypto_day_start_value_usd", "0") or 0)
+    except (TypeError, ValueError):
         stored_day_start = 0.0
-        try:
-            stored_day_start = float(_setting("crypto_day_start_value_usd", "0") or 0)
-        except (TypeError, ValueError):
-            stored_day_start = 0.0
-        if stored_day_start <= 0:
-            stored_day_start = out["starting_capital"] + (all_realized - today_realized)
-        out["day_start_value"] = stored_day_start
+    if stored_day_start <= 0:
+        stored_day_start = out["starting_capital"] + (all_realized - today_realized)
+    out["day_start_value"] = stored_day_start
 
-    # account_value (DISPLAYED) = derived. Always reconciles with cards.
+    # Account value (DISPLAYED) = derived. Always reconciles with cards.
     out["account_value"] = out["day_start_value"] + today_total
 
-    # Drift = how much real Binance differs from our derived account.
-    # Positive = Binance has MORE than dashboard says (dust appreciated, etc.)
+    # Drift = Binance reality - dashboard derived value.
+    # Positive = Binance has MORE (dust appreciated, untracked deposit, etc.)
     # Negative = Binance has LESS (we're overestimating — should not happen often)
-    # Show this as a small badge under account_value in the dashboard.
+    # Display as a small badge under account_value so user sees reality.
     out["binance_real_balance"] = binance_real_balance
     out["drift_vs_binance"] = binance_real_balance - out["account_value"]
+    # BTC trend regime — informational warning only. Bot no longer auto-sells
+    # when this flips; user decides whether to halt via the Halt Now button.
     try:
         from analysis.crypto_strategies import _btc_trend_ok
         out["btc_regime_ok"] = bool(_btc_trend_ok("4h"))
     except Exception:
         out["btc_regime_ok"] = True
 
-    # All-time P&L uses the derived account vs the starting principal
     out["all_time_pnl"] = out["account_value"] - out["starting_capital"]
     # === END UNIFIED DERIVED-MATH BLOCK ========================================
 
-    # P&L percentages — divide by day_start_value (positive number)
-    day_start_for_pct = out["day_start_value"]
-    if day_start_for_pct and day_start_for_pct > 0:
-        out["today_total_pct"] = today_total / day_start_for_pct * 100
-        out["today_pnl_pct"] = today_total / day_start_for_pct * 100
+    if stored_day_start > 0:
+        out["today_total_pct"] = today_total / stored_day_start * 100
+        out["today_pnl_pct"] = today_total / stored_day_start * 100
         out["drawdown_pct"] = -out["today_pnl_pct"] if out["today_pnl_pct"] < 0 else 0.0
     else:
         out["today_total_pct"] = None
@@ -425,7 +352,7 @@ def _open_position_cards(tickers: dict | None = None) -> list:
     except (TypeError, ValueError):
         fee_rate = 0.001
     out = []
-    for p in _open_positions(is_paper=_displayed_is_paper()):
+    for p in _open_positions(is_paper=False):
         meta = parse_entry_notes(p.notes)
         cur = (tickers or {}).get(p.symbol)
         if cur is None:
@@ -489,7 +416,7 @@ def _strategy_breakdown() -> list:
         fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
     except (TypeError, ValueError):
         fee_rate = 0.001
-    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == _displayed_is_paper()).order_by(CryptoTrade.executed_at).all()
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -590,7 +517,7 @@ def _daily_pnl(days: int = 30) -> list:
     # Pull ALL real (non-paper) trades — buys may predate the window.
     # Manual liquidations are excluded so they don't pollute strategy P&L.
     trades = (CryptoTrade.query
-              .filter(CryptoTrade.is_paper == _displayed_is_paper())
+              .filter(CryptoTrade.is_paper == False)
               .order_by(CryptoTrade.executed_at)
               .all())
 
@@ -918,7 +845,7 @@ def api_manual_buy(symbol: str):
 def api_sell_position(trade_id: int):
     """Manually sell an open position by trade ID. Returns JSON result."""
     from analysis.crypto_executor import _open_positions, execute_sell
-    open_pos = {p.id: p for p in _open_positions(is_paper=_displayed_is_paper())}
+    open_pos = {p.id: p for p in _open_positions(is_paper=False)}
     pos = open_pos.get(trade_id)
     if not pos:
         return jsonify({"ok": False, "reason": "position not found or already closed"}), 404
@@ -956,7 +883,7 @@ def api_partial_sell_position(trade_id: int):
     if not (0 < fraction < 1):
         return jsonify({"ok": False, "reason": f"fraction must be between 0 and 1 (got {fraction})"}), 400
 
-    open_pos = {p.id: p for p in _open_positions(is_paper=_displayed_is_paper())}
+    open_pos = {p.id: p for p in _open_positions(is_paper=False)}
     pos = open_pos.get(trade_id)
     if not pos:
         return jsonify({"ok": False, "reason": "position not found or already closed"}), 404
@@ -1000,7 +927,7 @@ def api_dashboard_static():
         fee_rate = float(_setting("crypto_fee_rate_per_side", "0.001"))
     except (TypeError, ValueError):
         fee_rate = 0.001
-    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == _displayed_is_paper()).order_by(CryptoTrade.executed_at).all()
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -1016,7 +943,8 @@ def api_dashboard_static():
             if t.side == "BUY":
                 buys.append([t, float(t.qty)])
             elif t.side == "SELL" and buys:
-                # See _account_summary above — one SELL = one W/L tick.
+                # See routes.py:_account_summary for why W/L is counted per
+                # SELL event, not per FIFO consumption iteration.
                 sell_qty_remaining = float(t.qty)
                 sell_event_pnl = 0.0
                 sell_event_today = (t.executed_at >= today_start_utc)
@@ -1137,7 +1065,7 @@ def api_recent_trades():
     since_id = int(flask_request.args.get("since_id", 0))
     trades = (
         CryptoTrade.query
-        .filter(CryptoTrade.id > since_id, CryptoTrade.is_paper == _displayed_is_paper())
+        .filter(CryptoTrade.id > since_id, CryptoTrade.is_paper == False)
         .order_by(CryptoTrade.id)
         .limit(20).all()
     )
@@ -1198,7 +1126,7 @@ def _build_journal_entries(include_live_prices: bool = True) -> dict:
     except (TypeError, ValueError):
         fee_rate = 0.001
 
-    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == _displayed_is_paper()).order_by(CryptoTrade.executed_at).all()
+    trades = CryptoTrade.query.filter(CryptoTrade.is_paper == False).order_by(CryptoTrade.executed_at).all()
     by_sym: dict = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
@@ -1438,7 +1366,7 @@ def holdings():
     total = sum((r.value_usd or 0) for r in rows)
     # Map asset (e.g. "DOGE") → open position trade ID, so the holdings page can show a Sell button
     open_pos_by_asset = {}
-    for p in _open_positions(is_paper=_displayed_is_paper()):
+    for p in _open_positions(is_paper=False):
         # Strip the trading-quote suffix to get the base asset (DOGEUSDT → DOGE)
         if p.symbol.endswith("USDT"):
             asset = p.symbol[:-4]
@@ -1450,13 +1378,11 @@ def holdings():
                 "strategy": p.strategy,
                 "partial_done": meta.get("partial_done", False),
             }
-    from analysis.crypto_executor import _is_paper_mode_setting
     return render_template(
         "crypto_holdings.html",
         rows=rows, total=total,
         has_keys=_has_binance_keys(),
         open_pos_by_asset=open_pos_by_asset,
-        is_paper_mode=_is_paper_mode_setting(),
     )
 
 
@@ -1607,7 +1533,7 @@ def coin_detail(symbol: str):
 
     # Existing position? Use the proper net-quantity logic (BUYs - SELLs, dust-filtered)
     from analysis.crypto_executor import _open_positions
-    open_pos = next((p for p in _open_positions(is_paper=_displayed_is_paper()) if p.symbol == symbol), None)
+    open_pos = next((p for p in _open_positions(is_paper=False) if p.symbol == symbol), None)
     has_position = open_pos is not None
     position_info = None
     if open_pos:
@@ -1652,7 +1578,7 @@ def coin_detail(symbol: str):
 
     trades_in_window = (
         CryptoTrade.query
-        .filter(CryptoTrade.symbol == symbol, CryptoTrade.is_paper == _displayed_is_paper())
+        .filter(CryptoTrade.symbol == symbol, CryptoTrade.is_paper == False)
         .filter(CryptoTrade.executed_at >= chart_start_ts)
         .order_by(CryptoTrade.executed_at)
         .all()
@@ -1674,6 +1600,18 @@ def coin_detail(symbol: str):
             "ts_iso": t.executed_at.isoformat() + "Z",
         })
 
+    # Binance trading status — BREAK/HALT means trading suspended on Binance;
+    # the trade-page link would land on a dead/redirect page. Render a badge
+    # instead of a clickable link so user knows why.
+    symbol_status = "TRADING"  # safe default if API fails
+    try:
+        from binance.client import Client
+        info = Client().get_symbol_info(symbol)
+        if info:
+            symbol_status = info.get("status") or "TRADING"
+    except Exception:
+        pass
+
     return render_template(
         "crypto_coin.html",
         symbol=symbol,
@@ -1682,6 +1620,7 @@ def coin_detail(symbol: str):
         readout=readout,
         has_position=has_position,
         position=position_info,
+        symbol_status=symbol_status,
     )
 
 
@@ -2205,85 +2144,6 @@ def api_halts_end_and_rearm():
     logging.getLogger("crypto").warning(summary)
     return jsonify({"ok": True, "kind": kind, "new_threshold_pct": new_pct,
                     "old_threshold_pct": old_pct})
-
-
-@bp.route("/api/paper/deposit", methods=["POST"])
-def api_paper_deposit():
-    """Paper-mode deposit/withdraw form submission.
-
-    Single text input — accepts signed numbers (+ deposit, − withdrawal).
-    Increments today's snapshot row's deposits_during_day_usd by the entered
-    amount, then recomputes synth so dashboard + halt threshold immediately
-    reflect the new principal.
-
-    Per-event detail is NOT preserved — only the aggregated daily total
-    persists. Submit twice (e.g., +$50 then +$30) and today's row reads $80.
-    Mistake recovery: enter the inverse amount (e.g., -$80) to zero it out.
-
-    Live-mode users should use the 'Refresh deposit/withdraw' button instead,
-    which queries Binance directly. This endpoint refuses in live mode to
-    avoid muddying the live deposit ledger with manually-entered values.
-    """
-    from analysis.crypto_executor import (
-        _compute_synth_day_start_today,
-        _set_setting,
-        _is_paper_mode_setting,
-    )
-    from webapp.models import CryptoDailySnapshot, db
-    from datetime import timezone, timedelta
-
-    if not _is_paper_mode_setting():
-        flash("Paper-deposit form is paper-mode only. Live users: use the 'Refresh deposit/withdraw' button.", "error")
-        return redirect(url_for("crypto.settings"))
-
-    raw = (request.form.get("amount") or "").strip()
-    try:
-        amount = float(raw)
-    except (TypeError, ValueError):
-        flash(f"Invalid amount '{raw}' — enter a number, e.g. 100 or -50.", "error")
-        return redirect(url_for("crypto.settings"))
-    if abs(amount) < 0.01:
-        flash("Amount too small (need ≥ $0.01 absolute). Skipped.", "warn")
-        return redirect(url_for("crypto.settings"))
-
-    MYT = timezone(timedelta(hours=8))
-    today_iso = (datetime.utcnow().replace(tzinfo=timezone.utc)
-                 .astimezone(MYT).date().isoformat())
-
-    # Update today's row in the snapshot table. Increment, don't replace —
-    # so multiple submissions accumulate (e.g., user splits a $200 deposit
-    # into two $100 entries).
-    row = CryptoDailySnapshot.query.get(today_iso)
-    if row is None:
-        row = CryptoDailySnapshot(
-            date=today_iso,
-            total_value_usd=0.0,
-            deposits_during_day_usd=amount,
-            source="synth",
-        )
-        db.session.add(row)
-    else:
-        prior = float(row.deposits_during_day_usd or 0.0)
-        row.deposits_during_day_usd = prior + amount
-    db.session.commit()
-
-    try:
-        synth = _compute_synth_day_start_today()
-        _set_setting("crypto_day_start_value_usd", f"{synth:.4f}")
-        _set_setting("crypto_day_start_format", "synth")
-        row = CryptoDailySnapshot.query.get(today_iso)
-        if row is not None:
-            row.total_value_usd = float(synth)
-            db.session.commit()
-    except Exception as e:
-        flash(f"Paper deposit recorded ({amount:+.2f}) but synth recompute failed: {e}", "warn")
-        return redirect(url_for("crypto.settings"))
-
-    new_total = float(row.deposits_during_day_usd or 0.0) if row else amount
-    sign = "+" if amount >= 0 else ""
-    flash(f"Paper {('deposit' if amount > 0 else 'withdrawal')} {sign}{amount:.2f} recorded. "
-          f"Today's row total: ${new_total:+.2f}. Synth day-start: ${synth:.2f}.", "ok")
-    return redirect(url_for("crypto.settings"))
 
 
 @bp.route("/api/deposits/refresh", methods=["POST"])
