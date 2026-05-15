@@ -236,20 +236,29 @@ def oversold_meanrev_4h(df: pd.DataFrame, symbol: str) -> dict | None:
       - RSI(2) < 5 (severely oversold)
       - Close > SMA200 (still in long-term uptrend)
       - Above SMA50 wouldn't apply here — we're buying a dip BELOW SMA50 sometimes
+      - BOUNCE CONFIRMED: latest bar is green AND higher low than prior bar
+        (don't catch falling knives — wait for the first bounce candle)
 
     NOTE: requires 200 bars (~33 days) of history.
     """
     if df is None or df.empty or len(df) < 200:
         return None
     d = attach(df).dropna(subset=["rsi2", "sma200", "low5", "atr14"])
-    if d.empty:
+    if d.empty or len(d) < 2:
         return None
     last = d.iloc[-1]
+    prev = d.iloc[-2]
     close = float(last["Close"])
+    open_ = float(last["Open"])
+    low = float(last["Low"])
+    prev_low = float(prev["Low"])
     rsi2 = float(last["rsi2"])
     sma200 = float(last["sma200"])
 
-    if not (rsi2 < 5 and close > sma200):
+    # Bounce confirmation: bar must be green (close > open) AND higher low
+    bounce_confirmed = close > open_ and low > prev_low
+
+    if not (rsi2 < 5 and close > sma200 and bounce_confirmed):
         return None
 
     atr = float(last["atr14"])
