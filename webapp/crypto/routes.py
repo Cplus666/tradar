@@ -875,6 +875,79 @@ def api_sell_position(trade_id: int):
     })
 
 
+@bp.route("/api/position/<int:trade_id>/enable-trail", methods=["POST"])
+def api_enable_trail(trade_id: int):
+    """Enable trail mode on a position. Sets trail_active=1 with trail_high =
+    current price, and places a Binance STOP_LOSS_LIMIT order so the trail
+    is enforced exchange-side."""
+    from analysis.crypto_executor import (
+        _open_positions, _set_trail_in_notes, parse_entry_notes,
+    )
+    open_pos = {p.id: p for p in _open_positions(is_paper=False)}
+    pos = open_pos.get(trade_id)
+    if not pos:
+        return jsonify({"ok": False, "reason": "position not found"}), 404
+    meta = parse_entry_notes(pos.notes)
+    if meta.get("trail_active"):
+        return jsonify({"ok": False, "reason": "already in trail mode"}), 400
+    try:
+        from binance.client import Client
+        cur = float(Client().get_ticker(symbol=pos.symbol)["lastPrice"])
+    except Exception as e:
+        return jsonify({"ok": False, "reason": f"price lookup failed: {e}"}), 500
+    try:
+        _set_trail_in_notes(pos, cur, activate=True)
+        return jsonify({"ok": True, "reason": f"trail activated at ${cur:.6f}"})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": f"activation failed: {e}"}), 500
+
+
+@bp.route("/api/position/<int:trade_id>/disable-trail", methods=["POST"])
+def api_disable_trail(trade_id: int):
+    """Disable trail mode on a position. Cancels the Binance STOP_LOSS_LIMIT
+    order and removes trail_active / trail_high / trail_order_id tokens.
+    Position reverts to default stop/target/strategy_exit behavior."""
+    from analysis.crypto_executor import (
+        _open_positions, _binance_client, _cancel_trail_order, parse_entry_notes,
+    )
+    from webapp.models import db
+    open_pos = {p.id: p for p in _open_positions(is_paper=False)}
+    pos = open_pos.get(trade_id)
+    if not pos:
+        return jsonify({"ok": False, "reason": "position not found"}), 404
+    meta = parse_entry_notes(pos.notes)
+    if not meta.get("trail_active"):
+        return jsonify({"ok": False, "reason": "not in trail mode"}), 400
+    # Cancel the Binance trail order if present
+    trail_oid = None
+    for tok in (pos.notes or "").split("·"):
+        s = tok.strip()
+        if s.startswith("trail_order_id="):
+            trail_oid = s.split("=", 1)[1].strip()
+            break
+    cancel_msg = ""
+    if trail_oid:
+        try:
+            key, secret = get_binance_creds()
+            client = _binance_client(key, secret)
+            ok = _cancel_trail_order(client, pos.symbol, trail_oid)
+            cancel_msg = f"order {trail_oid} cancelled" if ok else f"cancel {trail_oid} failed"
+        except Exception as e:
+            cancel_msg = f"cancel error: {e}"
+    # Strip trail tokens from notes
+    parts = []
+    for tok in (pos.notes or "").split("·"):
+        s = tok.strip()
+        if s in ("trail_active=1",): continue
+        if s.startswith("trail_high=$"): continue
+        if s.startswith("trail_order_id="): continue
+        if s.startswith("manual_trail="): continue
+        if s: parts.append(s)
+    pos.notes = " · ".join(parts)
+    db.session.commit()
+    return jsonify({"ok": True, "reason": f"trail disabled · {cancel_msg}"})
+
+
 @bp.route("/api/partial-sell-position/<int:trade_id>", methods=["POST"])
 def api_partial_sell_position(trade_id: int):
     """Manually trigger a partial profit-take on an open position."""

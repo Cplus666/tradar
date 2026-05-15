@@ -877,8 +877,33 @@
             <span class="font-bold mono num ${pnlCls}">${pnlStr}</span>
             <span class="text-xs text-zinc-500">held ${c.held_h.toFixed(1)}h · time-stop in ${c.time_to_stop_h.toFixed(1)}h</span>
           </div>
+          <div class="flex gap-2 mt-2">
+            ${c.trail_active
+              ? `<button onclick="toggleTrail(${c.id}, false)" class="text-[11px] px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-amber-300 rounded border border-amber-800">Disable Trail</button>`
+              : `<button onclick="toggleTrail(${c.id}, true)"  class="text-[11px] px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-amber-300 rounded border border-zinc-700">Enable Trail</button>`}
+          </div>
         </div>`;
       }).join('');
+    }
+  }
+
+  // ---- Trail toggle (enable/disable per position) ----
+  async function toggleTrail(tradeId, enable) {
+    const verb = enable ? 'enable' : 'disable';
+    if (!confirm(`${enable ? 'Enable' : 'Disable'} trail mode on this position?`)) return;
+    try {
+      const path = enable
+        ? `/crypto/api/position/${tradeId}/enable-trail`
+        : `/crypto/api/position/${tradeId}/disable-trail`;
+      const res = await fetch(path, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        loadDashboard();  // refresh to show new state
+      } else {
+        alert(`Could not ${verb} trail: ${data.reason}`);
+      }
+    } catch (e) {
+      alert(`Network error: ${e}`);
     }
   }
 
