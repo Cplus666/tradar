@@ -1206,8 +1206,11 @@ def process_reentry_orders() -> int:
                 should_cancel = True; cancel_reason = "24h elapsed"
             elif cur > sell_px * 1.05:
                 should_cancel = True; cancel_reason = f"new high (cur ${cur} > sell ${sell_px} × 1.05)"
-            elif cur < sell_px * 0.88:
-                should_cancel = True; cancel_reason = f"deep crash (cur ${cur} < sell ${sell_px} × 0.88)"
+            # NOTE: 'deep crash' check removed — for a LIMIT BUY at $X, if price
+            # falls past $X * 0.88, the order would have already filled at $X
+            # on the way down. The check was dead code. Downside protection
+            # comes from the position's stop loss (set when fill triggers
+            # process_reentry_orders to write the trade row).
             else:
                 # BTC regime check — only every ~10 cycles (cheap by hour)
                 try:
