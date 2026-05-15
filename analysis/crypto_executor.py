@@ -909,6 +909,13 @@ def execute_sell_limit(position, current_price: float, exit_reason: str,
             result.update({"executed": True, "trade_id": sell.id,
                            "fill_price": avg_price, "fill_qty": total_qty,
                            "order_id": oid, "reason": f"limit fill @ ${avg_price:.6f}"})
+            # Smart re-entry hook (profitable exits only — checked inside)
+            try:
+                entry_price = float(position.price)
+                pnl_pct = (avg_price - entry_price) / entry_price * 100
+                maybe_setup_reentry(position, avg_price, pnl_pct)
+            except Exception as e:
+                log.warning("reentry setup (limit) failed for %s: %s", position.symbol, e)
         else:
             # Order placed but not filled yet — caller tracks via order_id
             result.update({"executed": False, "order_id": oid,
@@ -958,6 +965,279 @@ def _detect_surge(symbol: str) -> bool:
     except (ValueError, IndexError) as e:
         log.warning("surge detect %s: parse failed: %s", symbol, e)
         return False
+
+
+def _compute_reentry_level(sell_price: float, original_entry: float,
+                            current_price: float, df_1h=None) -> float | None:
+    """Pick the best re-entry level: highest of several support candidates that
+    is still BELOW current price. Returns None if no valid level found.
+
+    Candidates considered:
+      - sell_price          (psychological anchor — where we exited)
+      - original_entry      (cost basis of the trade we just closed)
+      - EMA20 (1h)          (dynamic short-term support)
+      - low5 × 1.005        (recent swing low)
+    The highest level that is still below current is the most natural pullback
+    target — closer to current = more likely to be tested.
+    """
+    candidates = [sell_price, original_entry]
+    if df_1h is not None and len(df_1h) >= 20:
+        try:
+            ema20 = float(df_1h["Close"].astype(float).tail(20).ewm(span=20).mean().iloc[-1])
+            low5 = float(df_1h["Low"].astype(float).tail(5).min()) * 1.005
+            candidates.extend([ema20, low5])
+        except Exception:
+            pass
+    valid = [c for c in candidates if c is not None and 0 < c < current_price]
+    if not valid:
+        return None
+    return max(valid)  # highest support below current = closest test
+
+
+def _place_reentry_limit(symbol: str, limit_price: float, size_usd: float) -> str | None:
+    """Place a GTC LIMIT BUY order at the computed re-entry level. Returns
+    orderId on success, None on failure."""
+    from webapp.crypto.routes import get_binance_creds
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return None
+        client = _binance_client(key, secret)
+
+        info = client.get_symbol_info(symbol)
+        if not info or info.get("status") != "TRADING":
+            log.info("reentry: %s not TRADING — skip", symbol)
+            return None
+
+        # Capital check — need at least size_usd in free USDT
+        acct = client.get_account()
+        usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
+        free_usdt = float(usdt["free"]) if usdt else 0.0
+        if free_usdt < size_usd:
+            log.info("reentry: %s skipped — USDT free $%.2f < $%.2f",
+                     symbol, free_usdt, size_usd)
+            return None
+
+        pf = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
+        lf = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+        tick_size, step_size = pf["tickSize"], lf["stepSize"]
+
+        price_str = _round_to_tick(limit_price, tick_size)
+        qty = size_usd / float(price_str)
+        qty_str = _quantity_to_step_string(qty, step_size)
+        if float(qty_str) <= 0:
+            return None
+
+        order = client.create_order(
+            symbol=symbol, side="BUY", type="LIMIT",
+            timeInForce="GTC", quantity=qty_str, price=price_str,
+        )
+        oid = str(order.get("orderId", ""))
+        log.info("REENTRY LIMIT %s qty=%s @ $%s orderId=%s",
+                 symbol, qty_str, price_str, oid)
+        return oid or None
+    except Exception as e:
+        log.warning("reentry place %s failed: %s", symbol, e)
+        return None
+
+
+def maybe_setup_reentry(closed_position, sell_price: float, sell_pnl_pct: float) -> None:
+    """After a profitable exit, evaluate whether to set up a re-entry limit
+    order on Binance. Called from execute_sell (and other exit paths) after
+    a SELL trade row is written.
+
+    Conditions to fire:
+      - sell_pnl_pct >= 2.0% (only meaningful winners)
+      - macro intact (BTC > SMA50)
+      - feature enabled in settings
+      - no active re-entry already pending for this symbol
+    """
+    if (_get_setting("crypto_reentry_enabled") or "on").lower() != "on":
+        return
+    if sell_pnl_pct < 2.0:
+        return  # not a meaningful winner
+    if closed_position.is_paper:
+        return  # paper mode skips
+    symbol = closed_position.symbol
+
+    # Skip if a re-entry order for this symbol is already pending
+    import json
+    pending_raw = _get_setting("crypto_reentry_orders") or "[]"
+    try:
+        pending = json.loads(pending_raw)
+    except Exception:
+        pending = []
+    if any(p.get("symbol") == symbol for p in pending):
+        log.info("reentry %s skipped — already have pending order", symbol)
+        return
+
+    # Macro check: BTC above SMA50 on 4h
+    try:
+        from analysis.crypto_data import load_cached
+        from analysis.crypto_strategies import _btc_trend_ok
+        btc_df = load_cached("BTCUSDT", "4h")
+        if btc_df is None or btc_df.empty or not _btc_trend_ok(btc_df):
+            log.info("reentry %s skipped — BTC regime not OK", symbol)
+            return
+    except Exception as e:
+        log.warning("reentry %s: btc check failed: %s", symbol, e)
+        return
+
+    # Compute re-entry level
+    try:
+        from analysis.crypto_data import load_cached
+        from binance.client import Client
+        cur_price = float(Client().get_ticker(symbol=symbol)["lastPrice"])
+        df_1h = load_cached(symbol, "1h")
+        original_entry = float(closed_position.price)
+        level = _compute_reentry_level(sell_price, original_entry, cur_price, df_1h)
+        if level is None:
+            log.info("reentry %s skipped — no valid level (cur $%.6f, sell $%.6f)",
+                     symbol, cur_price, sell_price)
+            return
+    except Exception as e:
+        log.warning("reentry %s: level compute failed: %s", symbol, e)
+        return
+
+    # Size: 75% of max_position_usd (smaller bet on second entry)
+    try:
+        max_pos = _f("crypto_max_position_usd")
+    except Exception:
+        max_pos = 60.0
+    size_usd = max_pos * 0.75
+
+    oid = _place_reentry_limit(symbol, level, size_usd)
+    if not oid:
+        return
+
+    # Persist to watchlist for cancellation/fill tracking
+    pending.append({
+        "symbol": symbol,
+        "order_id": oid,
+        "limit_price": level,
+        "sell_price": sell_price,
+        "size_usd": size_usd,
+        "placed_at": datetime.utcnow().isoformat(),
+        "original_entry": float(closed_position.price),
+        "original_strategy": closed_position.strategy,
+    })
+    _set_setting("crypto_reentry_orders", json.dumps(pending))
+    log.info("reentry %s LIMIT placed at $%.6f (size $%.2f, orderId %s)",
+             symbol, level, size_usd, oid)
+
+
+def process_reentry_orders() -> int:
+    """Called from the main loop. Polls each pending re-entry order:
+      - If FILLED: writes a trade record so bot can manage it; removes from list
+      - If CANCELLED externally: removes from list
+      - If 24h elapsed, +5% new high since sell, -12% crash, or BTC regime broke:
+        cancels on Binance, removes from list
+    Returns number of changes made."""
+    from webapp.models import CryptoTrade, db
+    import json
+    pending_raw = _get_setting("crypto_reentry_orders") or "[]"
+    try:
+        pending = json.loads(pending_raw)
+    except Exception:
+        pending = []
+    if not pending:
+        return 0
+
+    from webapp.crypto.routes import get_binance_creds
+    from binance.client import Client
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return 0
+        client = _binance_client(key, secret)
+    except Exception:
+        return 0
+
+    pub = Client()
+    new_pending = []
+    changes = 0
+    for p in pending:
+        symbol = p["symbol"]
+        oid = int(p["order_id"])
+        try:
+            order = client.get_order(symbol=symbol, orderId=oid)
+            status = (order.get("status") or "").upper()
+
+            if status == "FILLED":
+                executed_qty = float(order.get("executedQty") or 0)
+                cumm_quote   = float(order.get("cummulativeQuoteQty") or 0)
+                if executed_qty > 0:
+                    avg_price = cumm_quote / executed_qty
+                    notes = (
+                        f"LIVE · stop=${avg_price*0.95:.6g} · target=${avg_price*1.06:.6g} · "
+                        f"max_hold=12 · exit=stop_target_time · reentry_pullback · "
+                        f"orig_sell=${p['sell_price']} · orig_strategy={p.get('original_strategy', '?')}"
+                    )
+                    trade = CryptoTrade(
+                        symbol=symbol, side="BUY", qty=executed_qty,
+                        price=avg_price, quote_amount=cumm_quote,
+                        executed_at=datetime.utcnow(), status="filled",
+                        is_paper=False, strategy="reentry_pullback",
+                        binance_order_id=str(oid), notes=notes,
+                    )
+                    db.session.add(trade)
+                    db.session.commit()
+                    log.info("REENTRY FILLED %s qty=%s @ $%.6f - bot now manages",
+                             symbol, executed_qty, avg_price)
+                    changes += 1
+                continue  # don't re-add to pending
+
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                log.info("reentry %s order %s already %s — clearing tracker",
+                         symbol, oid, status)
+                changes += 1
+                continue
+
+            # Status NEW or PARTIALLY_FILLED — check cancel triggers
+            from datetime import timedelta as _td
+            placed_at = datetime.fromisoformat(p["placed_at"])
+            elapsed_h = (datetime.utcnow() - placed_at).total_seconds() / 3600
+            cur = float(pub.get_ticker(symbol=symbol)["lastPrice"])
+            sell_px = float(p["sell_price"])
+
+            should_cancel = False
+            cancel_reason = ""
+            if elapsed_h >= 24:
+                should_cancel = True; cancel_reason = "24h elapsed"
+            elif cur > sell_px * 1.05:
+                should_cancel = True; cancel_reason = f"new high (cur ${cur} > sell ${sell_px} × 1.05)"
+            elif cur < sell_px * 0.88:
+                should_cancel = True; cancel_reason = f"deep crash (cur ${cur} < sell ${sell_px} × 0.88)"
+            else:
+                # BTC regime check — only every ~10 cycles (cheap by hour)
+                try:
+                    from analysis.crypto_data import load_cached
+                    from analysis.crypto_strategies import _btc_trend_ok
+                    btc_df = load_cached("BTCUSDT", "4h")
+                    if btc_df is not None and not _btc_trend_ok(btc_df):
+                        should_cancel = True; cancel_reason = "BTC regime broke"
+                except Exception:
+                    pass
+
+            if should_cancel:
+                try:
+                    client.cancel_order(symbol=symbol, orderId=oid)
+                except Exception as e:
+                    if "unknown order" not in str(e).lower():
+                        log.warning("reentry cancel %s failed: %s", oid, e)
+                log.info("REENTRY CANCEL %s order %s: %s", symbol, oid, cancel_reason)
+                changes += 1
+                continue
+
+            # Keep watching
+            new_pending.append(p)
+        except Exception as e:
+            log.warning("reentry process %s order %s: %s", symbol, oid, e)
+            new_pending.append(p)
+
+    if changes > 0:
+        _set_setting("crypto_reentry_orders", json.dumps(new_pending))
+    return changes
 
 
 def _signal_still_valid(intent: dict) -> tuple[bool, str]:
@@ -1835,6 +2115,11 @@ def execute_sell(position, current_price: float, exit_reason: str,
         })
         log.info("LIVE SELL %s qty=%.8f @ $%.6f (%s) P&L=%+.2f%%  orderId=%s",
                  position.symbol, total_qty, avg_price, exit_reason, pnl_pct, order.get("orderId"))
+        # Set up smart re-entry limit if exit was profitable + macro OK
+        try:
+            maybe_setup_reentry(position, avg_price, pnl_pct)
+        except Exception as e:
+            log.warning("reentry setup failed for %s: %s", position.symbol, e)
         return result
     except Exception as e:
         result["reason"] = f"live sell failed: {e}"

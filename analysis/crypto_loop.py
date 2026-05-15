@@ -507,6 +507,16 @@ def run_crypto_loop() -> None:
         except Exception as e:
             log_lines.append(f"balance sync skipped: {e}")
 
+        # Smart re-entry processing: poll pending re-entry limit orders, fill
+        # them into trade rows when they hit, cancel stale ones.
+        try:
+            from analysis.crypto_executor import process_reentry_orders
+            n_changes = process_reentry_orders()
+            if n_changes > 0:
+                log_lines.append(f"reentry orders: {n_changes} change(s)")
+        except Exception as e:
+            log_lines.append(f"reentry processing skipped: {e}")
+
         # 4) Exits
         exits = _check_paper_exits()
         log_lines.extend(exits)
