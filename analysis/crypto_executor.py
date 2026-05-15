@@ -909,11 +909,15 @@ def execute_sell_limit(position, current_price: float, exit_reason: str,
             result.update({"executed": True, "trade_id": sell.id,
                            "fill_price": avg_price, "fill_qty": total_qty,
                            "order_id": oid, "reason": f"limit fill @ ${avg_price:.6f}"})
-            # Smart re-entry hook (profitable exits only — checked inside)
+            # Smart re-entry hook — use max(peak, final) pnl so partial winners
+            # still qualify even if the final close was barely positive.
             try:
                 entry_price = float(position.price)
                 pnl_pct = (avg_price - entry_price) / entry_price * 100
-                maybe_setup_reentry(position, avg_price, pnl_pct)
+                meta_for_peak = parse_entry_notes(position.notes)
+                peak_pct = float(meta_for_peak.get("peak_pnl_pct") or 0.0)
+                effective_pnl = max(peak_pct, pnl_pct)
+                maybe_setup_reentry(position, avg_price, effective_pnl)
             except Exception as e:
                 log.warning("reentry setup (limit) failed for %s: %s", position.symbol, e)
         else:
@@ -2130,9 +2134,15 @@ def execute_sell(position, current_price: float, exit_reason: str,
         })
         log.info("LIVE SELL %s qty=%.8f @ $%.6f (%s) P&L=%+.2f%%  orderId=%s",
                  position.symbol, total_qty, avg_price, exit_reason, pnl_pct, order.get("orderId"))
-        # Set up smart re-entry limit if exit was profitable + macro OK
+        # Set up smart re-entry limit if exit was profitable + macro OK.
+        # Use max(peak_pnl, final_pnl) so partial-then-stopped trades still
+        # qualify as winners (today's RAD: peak +5%, final +0.29% — without
+        # this fix the partial profit gets ignored for re-entry decision).
         try:
-            maybe_setup_reentry(position, avg_price, pnl_pct)
+            meta_for_peak = parse_entry_notes(position.notes)
+            peak_pct = float(meta_for_peak.get("peak_pnl_pct") or 0.0)
+            effective_pnl = max(peak_pct, pnl_pct)
+            maybe_setup_reentry(position, avg_price, effective_pnl)
         except Exception as e:
             log.warning("reentry setup failed for %s: %s", position.symbol, e)
         return result

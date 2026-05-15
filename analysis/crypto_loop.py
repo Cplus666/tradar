@@ -143,24 +143,15 @@ def _check_exits() -> list[str]:
         # 2026-05-12. Now regime is INFORMATIONAL ONLY — exposed as a warning
         # banner on the dashboard. User decides whether to act via Halt Now.
         # 2) Stop loss — SKIPPED when in trail mode (trail_stop takes over).
-        # Otherwise the static stop would fire before the trail logic gets to
-        # run, defeating the whole point of trail mode (let winners ride).
-        # Smart stop: when stop is breached, check trend before exiting. If
-        # trend is still up (3-bar > 6-bar SMA AND drawdown <= 50% peak), hold.
+        # Sell immediately when stop hits (no trend hold). Still tracks peak_pnl
+        # for the re-entry pnl threshold (so partial-then-stopped trades count
+        # as winners if the partial captured >=2%).
         if (not meta.get("trail_active")
                 and meta["stop"] is not None
                 and cur_price <= meta["stop"]):
             from analysis.crypto_executor import update_peak_pnl
-            entry_price = float(pos.price)
-            cur_pnl_pct = (cur_price - entry_price) / entry_price * 100
-            peak_pct = update_peak_pnl(pos, cur_price)
-            intact, why = _trend_intact(df, peak_pct, cur_pnl_pct)
-            if intact:
-                log.info("SMART STOP HOLD %s: stop $%.6f hit at $%.6f BUT trend intact (%s)",
-                         pos.symbol, meta["stop"], cur_price, why)
-            else:
-                exit_reason = (f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f}) "
-                               f"AND trend broken: {why}")
+            update_peak_pnl(pos, cur_price)
+            exit_reason = f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f})"
         # 3) Profit target — also skipped in trail mode (trail rides past target)
         elif (not meta.get("trail_active")
                 and meta["target"] is not None
@@ -281,25 +272,14 @@ def run_fast_exit_check() -> None:
         exit_reason = None
         # regime_off no longer auto-sells (too sensitive — see _check_exits comment)
         # Static stop is SKIPPED in trail mode (trail_stop handles downside).
-        # Smart stop with trend check (mirror of _check_exits).
+        # Sell immediately when stop hits (no trend hold). Track peak_pnl for
+        # the re-entry pnl threshold.
         if (not meta.get("trail_active")
                 and meta["stop"] is not None
                 and cur <= meta["stop"]):
             from analysis.crypto_executor import update_peak_pnl
-            from analysis.crypto_data import load_cached
-            entry_price = float(pos.price)
-            cur_pnl_pct = (cur - entry_price) / entry_price * 100
-            peak_pct = update_peak_pnl(pos, cur)
-            # Need recent bars for trend check — use cached 1h
-            tf = "1h" if ("1h" in strat or "momentum" in strat or "oversold" in strat) else "4h"
-            df_trend = load_cached(pos.symbol, tf)
-            intact, why = _trend_intact(df_trend, peak_pct, cur_pnl_pct)
-            if intact:
-                log.info("SMART STOP HOLD %s [fast]: stop $%.6f hit at $%.6f BUT trend intact (%s)",
-                         pos.symbol, meta["stop"], cur, why)
-            else:
-                exit_reason = (f"stop hit (${cur:.6f} <= ${meta['stop']:.6f}) "
-                               f"AND trend broken: {why}")
+            update_peak_pnl(pos, cur)
+            exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
         elif meta.get("trail_active"):
             # In surge-promoted trail mode: refresh high water mark, exit on
             # configured pullback. Skips the normal target check entirely
