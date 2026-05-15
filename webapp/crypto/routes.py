@@ -934,11 +934,13 @@ def api_disable_trail(trade_id: int):
             cancel_msg = f"order {trail_oid} cancelled" if ok else f"cancel {trail_oid} failed"
         except Exception as e:
             cancel_msg = f"cancel error: {e}"
-    # Strip trail tokens from notes
+    # Strip trail tokens AND the partial_done flag (which was auto-set when
+    # trail activated to block partial-take). Disabling trail returns the
+    # position to default behavior including partial-take eligibility.
     parts = []
     for tok in (pos.notes or "").split("·"):
         s = tok.strip()
-        if s in ("trail_active=1",): continue
+        if s in ("trail_active=1", "partial_done=1"): continue
         if s.startswith("trail_high=$"): continue
         if s.startswith("trail_order_id="): continue
         if s.startswith("manual_trail="): continue

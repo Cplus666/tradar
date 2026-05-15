@@ -1468,11 +1468,16 @@ def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> 
     Side effect (LIVE only): places/replaces a Binance STOP_LOSS_LIMIT order at
     trail_high × 0.97 (trigger) / × 0.965 (limit). Throttled — only replaces the
     on-exchange order if the new high is >= 0.5% above the prior trail_high.
+
+    Also sets partial_done=1 when activating trail mode — partial-take would
+    otherwise still fire at +4% and tighten the stop, defeating the trail
+    purpose. In trail mode, the trail_stop IS the only exit (plus time-stop).
     """
     from webapp.models import db
     parts: list[str] = []
     seen_active = False
     seen_high = False
+    seen_partial = False
     prior_trail_high: float | None = None
     prior_order_id: str | None = None
     if position.notes:
@@ -1480,6 +1485,9 @@ def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> 
             t = token.strip()
             if t == "trail_active=1":
                 seen_active = True
+                parts.append(t)
+            elif t == "partial_done=1":
+                seen_partial = True
                 parts.append(t)
             elif t.startswith("trail_high=$"):
                 seen_high = True
@@ -1501,6 +1509,10 @@ def _set_trail_in_notes(position, high_water: float, activate: bool = False) -> 
         parts.append("trail_active=1")
     if not seen_high:
         parts.append(f"trail_high=${_fmt_price(high_water)}")
+    # Block partial-take whenever trail is active (or being activated). Without
+    # this, +4% partial would tighten the stop AND make the trail meaningless.
+    if (activating_now or seen_active) and not seen_partial:
+        parts.append("partial_done=1")
 
     # On-exchange order management:
     #  - place new order when first activating
