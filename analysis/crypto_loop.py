@@ -20,6 +20,39 @@ from webapp.models import CryptoRun, CryptoTrade, db
 log = logging.getLogger("crypto_loop")
 
 
+def _trend_intact(df, peak_pnl_pct: float, current_pnl_pct: float) -> tuple[bool, str]:
+    """Smart-stop trend filter. Returns (is_intact, reason).
+
+    Stop is treated as ADVISORY when:
+      1) Recent momentum is up: 3-bar avg close > 6-bar avg close
+      2) Position is still holding most of its peak gain (drawdown <= 50% of peak)
+
+    If both pass → "stop hit but trend intact, hold" (no sell).
+    If either fails → real reversal, exit normally.
+    """
+    import pandas as pd
+    if df is None or df.empty or len(df) < 6:
+        return False, "insufficient bars"
+    closes = df["Close"].astype(float).tail(6).tolist()
+    sma3 = sum(closes[-3:]) / 3.0
+    sma6 = sum(closes) / 6.0
+    momentum_up = sma3 > sma6
+    # Drawdown check: holding at least 50% of peak gain (only if peak was > 1%)
+    if peak_pnl_pct > 1.0:
+        threshold = peak_pnl_pct * 0.5
+        drawdown_ok = current_pnl_pct >= threshold
+    else:
+        # No meaningful peak yet — don't apply drawdown filter
+        drawdown_ok = True
+    if momentum_up and drawdown_ok:
+        return True, (f"sma3=${sma3:.6f}>sma6=${sma6:.6f} & "
+                      f"pnl{current_pnl_pct:+.2f}%>=peak/2 ({peak_pnl_pct/2:.2f}%)")
+    why = []
+    if not momentum_up: why.append(f"sma3=${sma3:.6f}<sma6=${sma6:.6f}")
+    if not drawdown_ok: why.append(f"pnl{current_pnl_pct:+.2f}%<peak/2 ({peak_pnl_pct/2:.2f}%)")
+    return False, " & ".join(why)
+
+
 def _check_strategy_exit(exit_rule: str, df) -> tuple[bool, str]:
     """Per-strategy exit signals using current indicators."""
     import pandas as pd
@@ -73,7 +106,7 @@ def _check_exits() -> list[str]:
     """
     from analysis.crypto_data import load_cached
     from analysis.crypto_executor import (
-        _open_positions, parse_entry_notes, execute_sell,
+        _open_positions, parse_entry_notes, execute_sell, execute_sell_limit,
         _detect_surge, _set_trail_in_notes,
     )
     from analysis.crypto_strategies import _btc_trend_ok
@@ -112,10 +145,22 @@ def _check_exits() -> list[str]:
         # 2) Stop loss — SKIPPED when in trail mode (trail_stop takes over).
         # Otherwise the static stop would fire before the trail logic gets to
         # run, defeating the whole point of trail mode (let winners ride).
+        # Smart stop: when stop is breached, check trend before exiting. If
+        # trend is still up (3-bar > 6-bar SMA AND drawdown <= 50% peak), hold.
         if (not meta.get("trail_active")
                 and meta["stop"] is not None
                 and cur_price <= meta["stop"]):
-            exit_reason = f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f})"
+            from analysis.crypto_executor import update_peak_pnl
+            entry_price = float(pos.price)
+            cur_pnl_pct = (cur_price - entry_price) / entry_price * 100
+            peak_pct = update_peak_pnl(pos, cur_price)
+            intact, why = _trend_intact(df, peak_pct, cur_pnl_pct)
+            if intact:
+                log.info("SMART STOP HOLD %s: stop $%.6f hit at $%.6f BUT trend intact (%s)",
+                         pos.symbol, meta["stop"], cur_price, why)
+            else:
+                exit_reason = (f"stop hit (${cur_price:.6f} <= ${meta['stop']:.6f}) "
+                               f"AND trend broken: {why}")
         # 3) Profit target — also skipped in trail mode (trail rides past target)
         elif (not meta.get("trail_active")
                 and meta["target"] is not None
@@ -160,11 +205,17 @@ def _check_exits() -> list[str]:
 
         if exit_reason:
             mode_tag = "PAPER" if pos.is_paper else "LIVE"
-            res = execute_sell(pos, cur_price, exit_reason)
+            # Stop-triggered exits use LIMIT (avoids market-sell slippage on
+            # cascade); other exits use MARKET (target hit = price rising,
+            # need to fill instantly to lock the gain).
+            if exit_reason.startswith("stop hit") and not pos.is_paper:
+                res = execute_sell_limit(pos, cur_price, exit_reason)
+            else:
+                res = execute_sell(pos, cur_price, exit_reason)
             if res["executed"]:
                 summaries.append(f"{pos.symbol} [{mode_tag}]: {res['reason']}")
             else:
-                summaries.append(f"{pos.symbol} [{mode_tag}]: SELL FAILED — {res['reason']}")
+                summaries.append(f"{pos.symbol} [{mode_tag}]: SELL — {res['reason']}")
     return summaries
 
 
@@ -230,10 +281,25 @@ def run_fast_exit_check() -> None:
         exit_reason = None
         # regime_off no longer auto-sells (too sensitive — see _check_exits comment)
         # Static stop is SKIPPED in trail mode (trail_stop handles downside).
+        # Smart stop with trend check (mirror of _check_exits).
         if (not meta.get("trail_active")
                 and meta["stop"] is not None
                 and cur <= meta["stop"]):
-            exit_reason = f"stop hit (${cur:.6f} <= ${meta['stop']:.6f})"
+            from analysis.crypto_executor import update_peak_pnl
+            from analysis.crypto_data import load_cached
+            entry_price = float(pos.price)
+            cur_pnl_pct = (cur - entry_price) / entry_price * 100
+            peak_pct = update_peak_pnl(pos, cur)
+            # Need recent bars for trend check — use cached 1h
+            tf = "1h" if ("1h" in strat or "momentum" in strat or "oversold" in strat) else "4h"
+            df_trend = load_cached(pos.symbol, tf)
+            intact, why = _trend_intact(df_trend, peak_pct, cur_pnl_pct)
+            if intact:
+                log.info("SMART STOP HOLD %s [fast]: stop $%.6f hit at $%.6f BUT trend intact (%s)",
+                         pos.symbol, meta["stop"], cur, why)
+            else:
+                exit_reason = (f"stop hit (${cur:.6f} <= ${meta['stop']:.6f}) "
+                               f"AND trend broken: {why}")
         elif meta.get("trail_active"):
             # In surge-promoted trail mode: refresh high water mark, exit on
             # configured pullback. Skips the normal target check entirely
@@ -262,12 +328,17 @@ def run_fast_exit_check() -> None:
             exit_reason = f"time stop ({bars_held}/{meta['max_hold']} bars)"
 
         if exit_reason:
-            res = execute_sell(pos, cur, exit_reason)
+            # Stop-triggered exits use LIMIT (avoids slippage cascades);
+            # target/trail/time exits use MARKET (prefer instant fill).
+            if exit_reason.startswith("stop hit") and not pos.is_paper:
+                res = execute_sell_limit(pos, cur, exit_reason)
+            else:
+                res = execute_sell(pos, cur, exit_reason)
             mode = "LIVE" if not pos.is_paper else "PAPER"
             if res["executed"]:
                 log.info("fast exit %s [%s]: %s", pos.symbol, mode, res["reason"])
             else:
-                log.warning("fast exit %s [%s] FAILED: %s", pos.symbol, mode, res["reason"])
+                log.warning("fast exit %s [%s] outcome: %s", pos.symbol, mode, res["reason"])
             continue
 
         # Partial-take + breakeven-move (only fires if no full-exit triggered above)

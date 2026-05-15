@@ -766,6 +766,7 @@ def parse_entry_notes(notes: str | None) -> dict:
         "stop": None, "target": None, "max_hold": 24, "exit_rule": "stop_target_time",
         "partial_done": False, "original_stop": None,
         "trail_active": False, "trail_high": None,
+        "peak_pnl_pct": 0.0,
     }
     if not notes:
         return out
@@ -792,7 +793,131 @@ def parse_entry_notes(notes: str | None) -> dict:
         elif token.startswith("trail_high=$"):
             try: out["trail_high"] = float(token.replace("trail_high=$", ""))
             except ValueError: pass
+        elif token.startswith("peak_pnl_pct="):
+            try: out["peak_pnl_pct"] = float(token.replace("peak_pnl_pct=", ""))
+            except ValueError: pass
     return out
+
+
+def update_peak_pnl(position, current_price: float) -> float:
+    """Track the highest unrealized P&L this position has reached. Used by the
+    smart-stop trend check (a 'still-up' trend requires holding most of the
+    peak gain — if we hit +10% then dropped to +1%, that's reversal, not just
+    a wick). Returns the (possibly updated) peak."""
+    from webapp.models import db
+    entry = float(position.price)
+    if entry <= 0:
+        return 0.0
+    cur_pnl_pct = (current_price - entry) / entry * 100
+    meta = parse_entry_notes(position.notes)
+    prior_peak = float(meta.get("peak_pnl_pct") or 0.0)
+    new_peak = max(prior_peak, cur_pnl_pct)
+    # Only write if it actually moved (avoid DB churn)
+    if new_peak > prior_peak + 0.1:
+        parts = []
+        seen = False
+        for tok in (position.notes or "").split("·"):
+            s = tok.strip()
+            if s.startswith("peak_pnl_pct="):
+                parts.append(f"peak_pnl_pct={new_peak:.2f}")
+                seen = True
+            elif s:
+                parts.append(s)
+        if not seen:
+            parts.append(f"peak_pnl_pct={new_peak:.2f}")
+        position.notes = " · ".join(parts)
+        db.session.commit()
+    return new_peak
+
+
+def execute_sell_limit(position, current_price: float, exit_reason: str,
+                       limit_offset_pct: float = 0.3) -> dict:
+    """Sell using a LIMIT order instead of MARKET. Limit price = current * (1 - offset%).
+
+    Behavior:
+      - Places GTC LIMIT SELL at limit price
+      - Fills immediately if best-bid >= limit (normal case → minimal slippage)
+      - Sits on book if price drops past limit (gap/crash → no fill yet)
+      - Caller is expected to escalate to market sell after a timeout if unfilled
+
+    Returns same shape as execute_sell, plus result['order_id'] for tracking."""
+    from webapp.crypto.routes import get_binance_creds
+    from webapp.models import CryptoTrade, db
+
+    is_paper = position.is_paper
+    result = {"executed": False, "mode": "paper" if is_paper else "live",
+              "reason": "", "trade_id": None, "fill_price": None,
+              "fill_qty": None, "order_id": None}
+
+    if is_paper:
+        # Paper: simulate as immediate fill at current price
+        return execute_sell(position, current_price, exit_reason)
+
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            result["reason"] = "no API keys"
+            return result
+        client = _binance_client(key, secret)
+
+        info = client.get_symbol_info(position.symbol)
+        pf = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
+        lf = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+        tick_size, step_size = pf["tickSize"], lf["stepSize"]
+
+        base_asset = position.symbol.replace("USDT", "")
+        acct = client.get_account()
+        bal = next((b for b in acct["balances"] if b["asset"] == base_asset), None)
+        free = float(bal["free"]) if bal else 0.0
+        if free <= 0:
+            result["reason"] = f"no balance ({base_asset})"
+            return result
+
+        qty_str = _quantity_to_step_string(free, step_size)
+        limit_price = current_price * (1 - limit_offset_pct / 100.0)
+        limit_str = _round_to_tick(limit_price, tick_size)
+
+        order = client.create_order(
+            symbol=position.symbol, side="SELL", type="LIMIT",
+            timeInForce="GTC", quantity=qty_str, price=limit_str,
+        )
+        oid = str(order.get("orderId", ""))
+        status = (order.get("status") or "").upper()
+        log.info("LIMIT SELL %s qty=%s @ $%s (offset %.2f%% from $%.6f) status=%s orderId=%s",
+                 position.symbol, qty_str, limit_str, limit_offset_pct, current_price, status, oid)
+
+        # If filled immediately, write the trade record now
+        if status == "FILLED":
+            fills = order.get("fills", [])
+            total_qty = sum(float(f["qty"]) for f in fills)
+            gross_quote = sum(float(f["qty"]) * float(f["price"]) for f in fills)
+            fee_in_usdt = sum(
+                float(f.get("commission", 0))
+                for f in fills if f.get("commissionAsset") == "USDT"
+            )
+            net_quote = gross_quote - fee_in_usdt
+            avg_price = gross_quote / total_qty if total_qty else 0.0
+            sell = CryptoTrade(
+                symbol=position.symbol, side="SELL", qty=total_qty, price=avg_price,
+                quote_amount=net_quote, executed_at=datetime.utcnow(),
+                status="filled", is_paper=False, strategy=position.strategy,
+                binance_order_id=oid,
+                notes=f"LIVE EXIT (LIMIT) · {exit_reason}",
+            )
+            db.session.add(sell)
+            db.session.commit()
+            result.update({"executed": True, "trade_id": sell.id,
+                           "fill_price": avg_price, "fill_qty": total_qty,
+                           "order_id": oid, "reason": f"limit fill @ ${avg_price:.6f}"})
+        else:
+            # Order placed but not filled yet — caller tracks via order_id
+            result.update({"executed": False, "order_id": oid,
+                           "reason": f"limit placed @ ${limit_str} ({status})"})
+        return result
+    except Exception as e:
+        result["reason"] = f"limit sell failed: {e}"
+        log.exception("execute_sell_limit %s failed", position.symbol)
+        return result
 
 
 def _detect_surge(symbol: str) -> bool:
