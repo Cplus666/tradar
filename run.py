@@ -27,4 +27,9 @@ app = create_app()
 if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "7551"))
-    app.run(host=host, port=port, debug=True)
+    # threaded=True: serve multiple HTTP requests concurrently. Without this,
+    # Flask's dev server processes one request at a time — during a scheduler
+    # cycle (which can take 150-220s), all incoming requests time out.
+    # User-visible symptom: tradar.lkaudio.com appears "down" even though Flask
+    # is running fine. Recv-Q grows, requests queue, browsers give up.
+    app.run(host=host, port=port, debug=True, threaded=True)
