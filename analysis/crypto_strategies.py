@@ -468,6 +468,13 @@ STRATEGY_PRIORITY = {
 }
 
 
+_REGIME_TOLERANT_STRATEGIES = {"breakout_4h", "breakout_1h", "momentum_surge"}
+# When BTC is below SMA50 (regime off), these strategies CAN still fire IF the
+# individual coin shows strong relative strength (own SMA50 margin >= this %).
+# 3% chosen to ensure the coin is meaningfully decoupled from BTC weakness.
+RELATIVE_STRENGTH_MIN_PCT = 3.0
+
+
 def scan_crypto(coins: list[str], interval: str = "4h") -> tuple[list[dict], list[dict]]:
     """Scan all coins through all strategies across ALL timeframes.
 
@@ -475,34 +482,63 @@ def scan_crypto(coins: list[str], interval: str = "4h") -> tuple[list[dict], lis
     are read from STRATEGIES_BY_TIMEFRAME registry. Each strategy gets the kline
     data matching its declared timeframe.
 
+    Regime-aware:
+      - If BTC > SMA50 (regime OK): all strategies eligible
+      - If BTC < SMA50 (regime broken): only "regime-tolerant" strategies (breakout/
+        momentum_surge) eligible, AND the coin must show its own SMA50 margin
+        >= RELATIVE_STRENGTH_MIN_PCT (meaningfully decoupled from BTC weakness)
+
     Signals sorted by quality (strategy priority, then R:R desc).
     Executor refuses duplicates by symbol, so best signal per symbol wins.
     """
     signals: list[dict] = []
     blocked: list[dict] = []
 
-    # Regime check uses 4h BTC trend regardless of strategy timeframe
-    if not _btc_trend_ok("4h"):
-        blocked.append({"symbol": "ALL", "reason": "BTC below SMA50 — regime off, no longs"})
-        return signals, blocked
+    regime_ok = _btc_trend_ok("4h")
+    if not regime_ok:
+        blocked.append({"symbol": "ALL", "reason":
+            f"BTC below SMA50 — regime off; only regime-tolerant strategies "
+            f"({','.join(sorted(_REGIME_TOLERANT_STRATEGIES))}) with own SMA50 "
+            f"margin >= {RELATIVE_STRENGTH_MIN_PCT}% will fire"})
 
     for sym in coins:
         coin_fired = False
+        # Cache coin's SMA50 margin (use 1h for any timeframe — close enough proxy)
+        rel_strength_pct = None
+        if not regime_ok:
+            df_rs = load_cached(sym, "1h")
+            if df_rs is not None and not df_rs.empty and len(df_rs) >= 50:
+                closes = df_rs["Close"].astype(float)
+                cur = float(closes.iloc[-1])
+                sma50 = float(closes.tail(50).mean())
+                if sma50 > 0:
+                    rel_strength_pct = (cur - sma50) / sma50 * 100
+
         for tf, strats in STRATEGIES_BY_TIMEFRAME.items():
             df = load_cached(sym, tf)
             if df is None or df.empty:
                 continue
             for strat_name, fn in strats.items():
+                # Regime gate: when off, only tolerant strategies + strong RS
+                if not regime_ok:
+                    if strat_name not in _REGIME_TOLERANT_STRATEGIES:
+                        continue
+                    if rel_strength_pct is None or rel_strength_pct < RELATIVE_STRENGTH_MIN_PCT:
+                        continue
                 try:
                     sig = fn(df, sym)
                     if sig and _sane_rr(sig):
+                        # Tag regime-tolerant fires so they're visible in logs/notes
+                        if not regime_ok:
+                            sig["reason"] = (sig.get("reason", "") +
+                                             f" · regime-off (RS +{rel_strength_pct:.1f}%)")
                         signals.append(sig)
                         coin_fired = True
                     elif sig:
                         blocked.append({"symbol": sym, "reason": f"{strat_name}: rejected by R:R sanity"})
                 except Exception as e:
                     log.warning("%s/%s error: %s", sym, strat_name, e)
-        if not coin_fired:
+        if not coin_fired and regime_ok:
             blocked.append({"symbol": sym, "reason": "no setup matched on any timeframe"})
 
     def sort_key(s):
