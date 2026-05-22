@@ -2117,6 +2117,34 @@ def execute_intent(intent: dict) -> dict:
         log.warning("freshness skip %s: %s", intent["symbol"], fresh_reason)
         return result
 
+    # Intra-bar dump filter: the strategy reads CLOSED bars only, so it can
+    # miss a sharp reversal happening in the current bar (ALLO 21:00 1h bar
+    # was -4% RED while the 4h-closed trend still looked bullish — strategy
+    # fired anyway, bot caught the falling knife). Block ANY entry when the
+    # latest 1h bar is currently > -2% (dumping).
+    strat_check = (intent.get("strategy") or "").lower()
+    if strat_check in _SMART_LIMIT_STRATEGIES:
+        try:
+            from binance.client import Client
+            kl = Client().get_klines(symbol=intent["symbol"], interval="1h", limit=1)
+            if kl:
+                o = float(kl[0][1])
+                c = float(kl[0][4])
+                if o > 0:
+                    bar_pct = (c - o) / o * 100
+                    if bar_pct < -2.0:
+                        result["mode"] = "skipped"
+                        result["reason"] = (
+                            f"intra-bar dump: current 1h bar {bar_pct:+.2f}% "
+                            f"(open ${o:.6g} → close ${c:.6g}) — knife-catch guard"
+                        )
+                        log.warning("intra-bar dump skip %s: %s",
+                                    intent["symbol"], result["reason"])
+                        return result
+        except Exception as e:
+            log.warning("intra-bar dump check %s failed (allowing): %s",
+                        intent["symbol"], e)
+
     # Smart-limit entry path: for momentum/breakout signals, don't market-buy
     # at the top of the surge bar. Place a LIMIT BUY at a smart pullback level
     # and let it fill on the inevitable retest. Stale after 30 min or if price
