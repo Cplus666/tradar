@@ -58,10 +58,23 @@ def _add_usdt(delta: float) -> None:
     _set("crypto_ghost_usdt", f"{_ghost_usdt() + delta:.6f}")
 
 
-# ── kill ghost ─────────────────────────────────────────────────────────────
+# ── start ghost ────────────────────────────────────────────────────────────
 
 def kill_ghost(reason: str = "user resumed trading") -> int:
-    """Close all open ghost positions when user resumes real trading."""
+    """Close all open ghost positions AND fully disable the ghost. Called when
+    user overrides/ends a halt so the ghost stops tracking entirely (since the
+    real bot has resumed).
+
+    Without disabling crypto_ghost_enabled, run_ghost_scan would keep firing
+    new ghost trades on every loop cycle — defeating the purpose.
+
+    Resetting crypto_ghost_day allows maybe_seed_from_today_halt to re-seed
+    a NEW ghost if another halt fires later today (matches user expectation:
+    "if I resume from halt today ghost should go off, and if halt again,
+    then ghost reappear").
+
+    Returns the number of positions closed.
+    """
     if _get("crypto_ghost_feature_enabled", "on") != "on":
         return 0
     from webapp.models import CryptoGhostPosition, db
@@ -75,10 +88,15 @@ def kill_ghost(reason: str = "user resumed trading") -> int:
     except Exception:
         db.session.rollback()
         return 0
+    # Fully disable the ghost subsystem so run_ghost_scan stops firing.
+    _set("crypto_ghost_enabled", "0")
+    # Clear ghost_day so maybe_seed_from_today_halt can re-seed if another
+    # halt fires later today. Without this clear, the seed function would
+    # see ghost_day == today and skip re-seeding (one-seed-per-day guard).
+    _set("crypto_ghost_day", "")
+    log.info("kill_ghost: closed %d positions, disabled ghost (%s)", n, reason)
     return n
 
-
-# ── start ghost ────────────────────────────────────────────────────────────
 
 def start_ghost(sold_positions: list[dict], starting_usdt: float) -> None:
     """Clone sold positions into the ghost portfolio at halt-exit prices.
