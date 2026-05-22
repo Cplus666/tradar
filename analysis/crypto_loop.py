@@ -497,6 +497,16 @@ def run_crypto_loop() -> None:
         except Exception as e:
             log_lines.append(f"reentry processing skipped: {e}")
 
+        # Smart-entry processing: poll pending fresh-signal limit orders,
+        # fill them on pullback or cancel after 30 min / chase guard.
+        try:
+            from analysis.crypto_executor import process_smart_entry_orders
+            n_se = process_smart_entry_orders()
+            if n_se > 0:
+                log_lines.append(f"smart-entry orders: {n_se} change(s)")
+        except Exception as e:
+            log_lines.append(f"smart-entry processing skipped: {e}")
+
         # 4) Exits
         exits = _check_paper_exits()
         log_lines.extend(exits)

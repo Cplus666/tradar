@@ -1247,6 +1247,177 @@ def process_reentry_orders() -> int:
     return changes
 
 
+_SMART_LIMIT_STRATEGIES = {"momentum_surge", "breakout_4h", "breakout_1h"}
+
+
+def _compute_smart_entry_level(symbol: str, current_price: float) -> float | None:
+    """Pick a smart LIMIT BUY price for a momentum/breakout signal.
+
+    Returns the HIGHEST of these candidates that is still BELOW current price:
+      - EMA14 on 1h (short-term dynamic support)
+      - lowest LOW of the last 6 1h-bars (recent support test)
+      - current_price × 0.98 (-2% pullback floor)
+
+    The highest below-current value is the most plausible pullback level
+    price would test. Returns None if no valid level (e.g., current is already
+    BELOW all candidates — coin is already dumping, don't try to catch).
+    """
+    from analysis.crypto_data import load_cached
+    df_1h = load_cached(symbol, "1h")
+    if df_1h is None or df_1h.empty or len(df_1h) < 14:
+        return None
+    try:
+        closes = df_1h["Close"].astype(float)
+        lows = df_1h["Low"].astype(float)
+        ema14 = float(closes.tail(14).ewm(span=14).mean().iloc[-1])
+        swing_low_6h = float(lows.tail(6).min()) * 1.003  # tiny buffer above the low
+        pullback_2pct = current_price * 0.98
+    except Exception as e:
+        log.warning("smart entry %s: failed to compute candidates: %s", symbol, e)
+        return None
+    candidates = [c for c in (ema14, swing_low_6h, pullback_2pct)
+                  if c is not None and 0 < c < current_price]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _place_smart_entry_limit(intent: dict, smart_price: float, size_usd: float) -> str | None:
+    """Place a GTC LIMIT BUY order at the computed smart entry level."""
+    from webapp.crypto.routes import get_binance_creds
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return None
+        client = _binance_client(key, secret)
+        symbol = intent["symbol"]
+        info = client.get_symbol_info(symbol)
+        if not info or info.get("status") != "TRADING":
+            return None
+        # Capital check
+        acct = client.get_account()
+        usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
+        free_usdt = float(usdt["free"]) if usdt else 0.0
+        if free_usdt < size_usd:
+            log.info("smart entry %s: USDT free $%.2f < $%.2f", symbol, free_usdt, size_usd)
+            return None
+        pf = next(f for f in info["filters"] if f["filterType"] == "PRICE_FILTER")
+        lf = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+        tick, step = pf["tickSize"], lf["stepSize"]
+        price_str = _round_to_tick(smart_price, tick)
+        qty = size_usd / float(price_str)
+        qty_str = _quantity_to_step_string(qty, step)
+        if float(qty_str) <= 0:
+            return None
+        order = client.create_order(
+            symbol=symbol, side="BUY", type="LIMIT",
+            timeInForce="GTC", quantity=qty_str, price=price_str,
+        )
+        return str(order.get("orderId", "")) or None
+    except Exception as e:
+        log.warning("smart entry place %s failed: %s", intent.get("symbol"), e)
+        return None
+
+
+def process_smart_entry_orders() -> int:
+    """Poll pending smart-entry LIMIT BUY orders:
+      - FILLED: write trade record + apply intent's stop/target
+      - 30+ min elapsed: cancel
+      - Price ran +3% past signal (we're chasing now): cancel
+    Returns count of changes.
+    """
+    from webapp.models import CryptoTrade, db
+    import json
+    raw = _get_setting("crypto_smart_entry_orders") or "[]"
+    try:
+        pending = json.loads(raw)
+    except Exception:
+        pending = []
+    if not pending:
+        return 0
+    from webapp.crypto.routes import get_binance_creds
+    from binance.client import Client
+    try:
+        key, secret = get_binance_creds()
+        if not key or not secret:
+            return 0
+        client = _binance_client(key, secret)
+    except Exception:
+        return 0
+    pub = Client()
+    new_pending = []
+    changes = 0
+    for p in pending:
+        sym = p["symbol"]
+        oid = int(p["order_id"])
+        try:
+            order = client.get_order(symbol=sym, orderId=oid)
+            status = (order.get("status") or "").upper()
+
+            if status == "FILLED":
+                qty = float(order.get("executedQty") or 0)
+                quote = float(order.get("cummulativeQuoteQty") or 0)
+                if qty > 0:
+                    avg_price = quote / qty
+                    intent = p["intent"]
+                    # Adjust stop/target based on actual fill (better than scan price)
+                    fill_pct_below_scan = (intent["entry_price"] - avg_price) / intent["entry_price"]
+                    stop = avg_price * (1 - (intent["entry_price"] - intent["stop_price"]) / intent["entry_price"])
+                    target = avg_price * (1 + (intent["target_price"] - intent["entry_price"]) / intent["entry_price"])
+                    notes = (
+                        f"LIVE · stop=${stop:.6g} · target=${target:.6g} · "
+                        f"max_hold={intent['max_hold_bars']} · exit={intent['exit_rule']} · "
+                        f"{intent.get('reason','')} · smart_entry (limit @${p['limit_price']:.6g})"
+                    )
+                    trade = CryptoTrade(
+                        symbol=sym, side="BUY", qty=qty, price=avg_price,
+                        quote_amount=quote, executed_at=datetime.utcnow(),
+                        status="filled", is_paper=False, strategy=intent["strategy"],
+                        binance_order_id=str(oid), notes=notes,
+                    )
+                    db.session.add(trade)
+                    db.session.commit()
+                    log.info("SMART ENTRY FILLED %s qty=%s @ $%.6f", sym, qty, avg_price)
+                    changes += 1
+                continue
+
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                log.info("smart entry %s order %s %s — clearing", sym, oid, status)
+                changes += 1
+                continue
+
+            # Still NEW — check cancel conditions
+            placed_at = datetime.fromisoformat(p["placed_at"])
+            elapsed_min = (datetime.utcnow() - placed_at).total_seconds() / 60
+            cur = float(pub.get_ticker(symbol=sym)["lastPrice"])
+            signal_price = float(p["signal_price"])
+
+            cancel = False
+            reason = ""
+            if elapsed_min >= 30:
+                cancel = True; reason = "30min elapsed"
+            elif cur > signal_price * 1.03:
+                cancel = True; reason = f"chase guard (cur ${cur} > signal ${signal_price} × 1.03)"
+
+            if cancel:
+                try:
+                    client.cancel_order(symbol=sym, orderId=oid)
+                except Exception as e:
+                    if "unknown order" not in str(e).lower():
+                        log.warning("smart entry cancel %s failed: %s", oid, e)
+                log.info("SMART ENTRY CANCEL %s order %s: %s", sym, oid, reason)
+                changes += 1
+                continue
+            new_pending.append(p)
+        except Exception as e:
+            log.warning("smart entry process %s order %s: %s", sym, oid, e)
+            new_pending.append(p)
+
+    if changes > 0:
+        _set_setting("crypto_smart_entry_orders", json.dumps(new_pending))
+    return changes
+
+
 def _signal_still_valid(intent: dict) -> tuple[bool, str]:
     """Pre-flight freshness check just before live BUY.
     Signals are computed on the close of the previous bar, but execution may be
@@ -1945,6 +2116,57 @@ def execute_intent(intent: dict) -> dict:
         result["reason"] = fresh_reason
         log.warning("freshness skip %s: %s", intent["symbol"], fresh_reason)
         return result
+
+    # Smart-limit entry path: for momentum/breakout signals, don't market-buy
+    # at the top of the surge bar. Place a LIMIT BUY at a smart pullback level
+    # and let it fill on the inevitable retest. Stale after 30 min or if price
+    # runs +3% past signal.
+    strat = (intent.get("strategy") or "").lower()
+    smart_limit_on = (_get_setting("crypto_smart_entry_enabled") or "on").lower() == "on"
+    if smart_limit_on and strat in _SMART_LIMIT_STRATEGIES:
+        try:
+            from binance.client import Client
+            cur_px = float(Client().get_ticker(symbol=intent["symbol"])["lastPrice"])
+        except Exception:
+            cur_px = float(intent["entry_price"])
+        smart_level = _compute_smart_entry_level(intent["symbol"], cur_px)
+        if smart_level is not None and smart_level < cur_px:
+            oid = _place_smart_entry_limit(intent, smart_level, intent["size_usd"])
+            if oid:
+                import json
+                raw = _get_setting("crypto_smart_entry_orders") or "[]"
+                try:
+                    pending = json.loads(raw)
+                except Exception:
+                    pending = []
+                # Drop any duplicate pending for same symbol (executor already
+                # checks open positions; this guards the pending list itself)
+                pending = [p for p in pending if p.get("symbol") != intent["symbol"]]
+                pending.append({
+                    "symbol": intent["symbol"],
+                    "order_id": oid,
+                    "limit_price": smart_level,
+                    "signal_price": cur_px,
+                    "placed_at": datetime.utcnow().isoformat(),
+                    "intent": {
+                        "symbol": intent["symbol"],
+                        "strategy": intent["strategy"],
+                        "entry_price": intent["entry_price"],
+                        "stop_price": intent["stop_price"],
+                        "target_price": intent["target_price"],
+                        "max_hold_bars": intent["max_hold_bars"],
+                        "exit_rule": intent["exit_rule"],
+                        "reason": intent.get("reason", ""),
+                    },
+                })
+                _set_setting("crypto_smart_entry_orders", json.dumps(pending))
+                log.info("SMART ENTRY LIMIT %s @ $%.6f (signal $%.6f) orderId=%s",
+                         intent["symbol"], smart_level, cur_px, oid)
+                result.update({"executed": False, "mode": "limit_placed",
+                               "reason": f"smart-limit placed @ ${smart_level:.6f}",
+                               "order_id": oid})
+                return result
+            # else: place failed (capital/symbol/etc) — fall through to market
 
     try:
         order = client.create_order(
