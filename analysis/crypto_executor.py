@@ -515,10 +515,19 @@ def _compute_synth_day_start_today() -> float:
 
 def _entry_basis_value(usdt_free: float | None = None) -> float:
     """Day-start value using ENTRY-PRICE basis for open positions:
-        day_start = usdt_free + Σ(remaining_qty × entry_price) for live positions
+        day_start = usdt_total + Σ(remaining_qty × entry_price) for live positions
+    where usdt_total = free + locked. Locked USDT (sitting in pending limit BUY
+    orders the user placed) is still real money — it'll either fill into a
+    position or get returned to free on cancel. Counting only `free` made the
+    day_start understate the account by the amount locked.
+
     This makes today_pnl = realized + unrealized reconcile cleanly because both
     sides use the same cost basis. Caller may pass usdt_free if already known
-    (avoids an extra Binance API call). Returns 0 if Binance unreachable."""
+    (avoids an extra Binance API call); when caller passes it, the caller is
+    responsible for using TOTAL (free + locked), not just free.
+
+    Returns 0 if Binance unreachable.
+    """
     if usdt_free is None:
         try:
             from webapp.crypto.routes import get_binance_creds
@@ -528,7 +537,9 @@ def _entry_basis_value(usdt_free: float | None = None) -> float:
             client = _binance_client(key, secret)
             acct = client.get_account()
             usdt = next((b for b in acct["balances"] if b["asset"] == "USDT"), None)
-            usdt_free = float(usdt["free"]) if usdt else 0.0
+            # Use free + locked: locked USDT in pending limit BUY orders is still
+            # part of the account value (Binance shows it in "Est. Total Value").
+            usdt_free = (float(usdt["free"]) + float(usdt["locked"])) if usdt else 0.0
         except Exception:
             return 0.0
     entry_basis = 0.0
@@ -2145,56 +2156,81 @@ def execute_intent(intent: dict) -> dict:
             log.warning("intra-bar dump check %s failed (allowing): %s",
                         intent["symbol"], e)
 
-    # Smart-limit entry path: for momentum/breakout signals, don't market-buy
-    # at the top of the surge bar. Place a LIMIT BUY at a smart pullback level
-    # and let it fill on the inevitable retest. Stale after 30 min or if price
-    # runs +3% past signal.
+    # Strength-adaptive entry: for momentum/breakout signals, decide between
+    # MARKET (catch the move) and LIMIT (wait for pullback) based on the
+    # current 1h bar's strength. If the bar is strongly green (>=1.5%),
+    # the move is real and we want to catch it — MARKET buy full size.
+    # Otherwise place a smart-limit at pullback level. This handles the NEAR
+    # case (strong trend, limit never fills) AND the ALLO case (dump bar,
+    # blocked entirely by the earlier intra-bar dump filter).
     strat = (intent.get("strategy") or "").lower()
     smart_limit_on = (_get_setting("crypto_smart_entry_enabled") or "on").lower() == "on"
     if smart_limit_on and strat in _SMART_LIMIT_STRATEGIES:
+        # Check latest 1h bar strength to decide market vs limit
+        is_strong_continuation = False
         try:
             from binance.client import Client
-            cur_px = float(Client().get_ticker(symbol=intent["symbol"])["lastPrice"])
-        except Exception:
-            cur_px = float(intent["entry_price"])
-        smart_level = _compute_smart_entry_level(intent["symbol"], cur_px)
-        if smart_level is not None and smart_level < cur_px:
-            oid = _place_smart_entry_limit(intent, smart_level, intent["size_usd"])
-            if oid:
-                import json
-                raw = _get_setting("crypto_smart_entry_orders") or "[]"
-                try:
-                    pending = json.loads(raw)
-                except Exception:
-                    pending = []
-                # Drop any duplicate pending for same symbol (executor already
-                # checks open positions; this guards the pending list itself)
-                pending = [p for p in pending if p.get("symbol") != intent["symbol"]]
-                pending.append({
-                    "symbol": intent["symbol"],
-                    "order_id": oid,
-                    "limit_price": smart_level,
-                    "signal_price": cur_px,
-                    "placed_at": datetime.utcnow().isoformat(),
-                    "intent": {
+            kl1h = Client().get_klines(symbol=intent["symbol"], interval="1h", limit=1)
+            if kl1h:
+                bar_o = float(kl1h[0][1])
+                bar_c = float(kl1h[0][4])
+                if bar_o > 0:
+                    bar_pct = (bar_c - bar_o) / bar_o * 100
+                    if bar_pct >= 1.5:
+                        is_strong_continuation = True
+                        log.info("STRONG CONTINUATION %s: 1h bar +%.2f%% — using MARKET buy",
+                                 intent["symbol"], bar_pct)
+        except Exception as e:
+            log.warning("strength check %s failed (defaulting to limit): %s",
+                        intent["symbol"], e)
+
+        if is_strong_continuation:
+            # Strong bar: skip smart-limit, fall through to MARKET buy below
+            pass
+        else:
+            # Weak/neutral bar: place smart-limit at pullback level
+            try:
+                from binance.client import Client
+                cur_px = float(Client().get_ticker(symbol=intent["symbol"])["lastPrice"])
+            except Exception:
+                cur_px = float(intent["entry_price"])
+            smart_level = _compute_smart_entry_level(intent["symbol"], cur_px)
+            if smart_level is not None and smart_level < cur_px:
+                oid = _place_smart_entry_limit(intent, smart_level, intent["size_usd"])
+                if oid:
+                    import json
+                    raw = _get_setting("crypto_smart_entry_orders") or "[]"
+                    try:
+                        pending = json.loads(raw)
+                    except Exception:
+                        pending = []
+                    # Drop any duplicate pending for same symbol
+                    pending = [p for p in pending if p.get("symbol") != intent["symbol"]]
+                    pending.append({
                         "symbol": intent["symbol"],
-                        "strategy": intent["strategy"],
-                        "entry_price": intent["entry_price"],
-                        "stop_price": intent["stop_price"],
-                        "target_price": intent["target_price"],
-                        "max_hold_bars": intent["max_hold_bars"],
-                        "exit_rule": intent["exit_rule"],
-                        "reason": intent.get("reason", ""),
-                    },
-                })
-                _set_setting("crypto_smart_entry_orders", json.dumps(pending))
-                log.info("SMART ENTRY LIMIT %s @ $%.6f (signal $%.6f) orderId=%s",
-                         intent["symbol"], smart_level, cur_px, oid)
-                result.update({"executed": False, "mode": "limit_placed",
-                               "reason": f"smart-limit placed @ ${smart_level:.6f}",
-                               "order_id": oid})
-                return result
-            # else: place failed (capital/symbol/etc) — fall through to market
+                        "order_id": oid,
+                        "limit_price": smart_level,
+                        "signal_price": cur_px,
+                        "placed_at": datetime.utcnow().isoformat(),
+                        "intent": {
+                            "symbol": intent["symbol"],
+                            "strategy": intent["strategy"],
+                            "entry_price": intent["entry_price"],
+                            "stop_price": intent["stop_price"],
+                            "target_price": intent["target_price"],
+                            "max_hold_bars": intent["max_hold_bars"],
+                            "exit_rule": intent["exit_rule"],
+                            "reason": intent.get("reason", ""),
+                        },
+                    })
+                    _set_setting("crypto_smart_entry_orders", json.dumps(pending))
+                    log.info("SMART ENTRY LIMIT %s @ $%.6f (signal $%.6f) orderId=%s",
+                             intent["symbol"], smart_level, cur_px, oid)
+                    result.update({"executed": False, "mode": "limit_placed",
+                                   "reason": f"smart-limit placed @ ${smart_level:.6f}",
+                                   "order_id": oid})
+                    return result
+                # else: place failed (capital/symbol/etc) — fall through to market
 
     try:
         order = client.create_order(
