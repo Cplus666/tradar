@@ -2019,9 +2019,9 @@ def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: 
     # new entry is high-conviction and should override cooldown on different coin.
     if not rotation_bypass:
         try:
-            cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "4")
+            cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "24")
         except (TypeError, ValueError):
-            cooldown_h = 4.0
+            cooldown_h = 24.0
         if cooldown_h > 0:
             last_loss = _last_losing_exit_at(intent["symbol"], is_paper_mode)
             if last_loss is not None:
@@ -2031,6 +2031,22 @@ def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: 
                 if elapsed < cool_td:
                     mins_left = int((cool_td - elapsed).total_seconds() / 60)
                     return False, f"cooldown after loss on {intent['symbol']} ({mins_left}min remaining)"
+
+    # KNIFE-CATCH GUARD: skip if coin is currently >=7% off its 24h high.
+    # Today's ME bought at $0.1059 when 24h high was $0.1195 (-11% off peak) —
+    # bot caught a falling knife mid-decline. This filter blocks that pattern.
+    try:
+        from binance.client import Client
+        t24 = Client().get_ticker(symbol=intent["symbol"])
+        high_24h = float(t24["highPrice"])
+        cur_24h = float(t24["lastPrice"])
+        if high_24h > 0 and cur_24h > 0:
+            off_peak_pct = (cur_24h - high_24h) / high_24h * 100
+            if off_peak_pct <= -7.0:
+                return False, (f"knife-catch guard: cur ${cur_24h} is "
+                               f"{off_peak_pct:+.1f}% off 24h high ${high_24h}")
+    except Exception:
+        pass  # don't block on API failure
 
     if mode == "live":
         if client is None:
