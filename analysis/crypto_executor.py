@@ -1069,7 +1069,7 @@ def maybe_setup_reentry(closed_position, sell_price: float, sell_pnl_pct: float)
     """
     if (_get_setting("crypto_reentry_enabled") or "on").lower() != "on":
         return
-    if sell_pnl_pct < 2.0:
+    if sell_pnl_pct < 1.9:
         return  # not a meaningful winner
     if closed_position.is_paper:
         return  # paper mode skips
