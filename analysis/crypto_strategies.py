@@ -419,6 +419,78 @@ def support_bounce_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     }
 
 
+def prebreakout_consolidation_1h(df: pd.DataFrame, symbol: str) -> dict | None:
+    """Catch tight consolidation NEAR recent high — enter BEFORE breakout.
+
+    Fixes the "always buy at peak" problem of breakout strategies. Instead of
+    waiting for close > prior 20-bar high (which means breakout already
+    happened), enter when price is TIGHTLY COILED just below resistance,
+    suggesting accumulation about to break.
+
+    Filters:
+      - Recent rise: 12h change >= +5% (real prior leg, momentum building)
+      - Range tight: last 6 1h bars close-to-close range <= 3.5% (tight coil)
+      - Near top: current close within 2% of 20-bar high (close to breakout)
+      - Above SMA50 by ≥0.5% (uptrend intact)
+      - RSI 50-72 (not exhausted, not too cool)
+      - Volume not dead: last 6 bars avg vol >= 0.8× prior 20-bar avg
+
+    Stop: 3% below current (tight — consolidation should hold)
+    Target: 5% above current (measured move from coil)
+    """
+    if df is None or df.empty or len(df) < 30:
+        return None
+    d = attach(df).dropna(subset=["sma50", "rsi14", "high20"])
+    if len(d) < 13:
+        return None
+    last = d.iloc[-1]
+    close = float(last["Close"])
+
+    # 1) 12h prior rise
+    rise_12h = (close - float(d.iloc[-13]["Close"])) / float(d.iloc[-13]["Close"]) * 100
+    if rise_12h < 5.0:
+        return None
+
+    # 2) Tight 6-bar range
+    last6_closes = d["Close"].tail(6).astype(float)
+    range_pct = (last6_closes.max() - last6_closes.min()) / last6_closes.min() * 100
+    if range_pct > 3.5:
+        return None
+
+    # 3) Within 2% of 20-bar high
+    high20 = float(last["high20"])
+    near_top = (high20 - close) / high20 * 100
+    if near_top > 2.0:
+        return None
+
+    # 4) Above SMA50 by ≥0.5%
+    sma50 = float(last["sma50"])
+    if sma50 <= 0 or (close - sma50) / sma50 * 100 < 0.5:
+        return None
+
+    # 5) RSI sweet spot
+    rsi = float(last["rsi14"])
+    if not (50 <= rsi <= 72):
+        return None
+
+    # 6) Volume not dead
+    recent_vol = d["Volume"].tail(6).astype(float).mean()
+    prior_vol = d["Volume"].tail(26).head(20).astype(float).mean()
+    if prior_vol > 0 and recent_vol < prior_vol * 0.8:
+        return None
+
+    return {
+        "date": d.index[-1], "symbol": symbol,
+        "strategy": "prebreakout_consol", "side": "BUY",
+        "entry_price": close,
+        "stop_price": close * 0.97,    # -3%
+        "target_price": close * 1.05,  # +5%
+        "max_hold_bars": 8,             # 8 hours — quick decision
+        "exit_rule": "stop_target_time",
+        "reason": f"prebreakout: {range_pct:.1f}% range, +{rise_12h:.1f}%/12h, {near_top:.1f}% from high",
+    }
+
+
 # Registry: each strategy declares its native timeframe.
 # scan_crypto() loads the right kline data per strategy.
 STRATEGIES_BY_TIMEFRAME = {
@@ -431,6 +503,7 @@ STRATEGIES_BY_TIMEFRAME = {
     "1h": {
         "breakout_1h": crypto_breakout_1h,
         "support_bounce": support_bounce_1h,
+        "prebreakout_consol": prebreakout_consolidation_1h,
     },
 }
 
