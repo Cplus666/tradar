@@ -1980,6 +1980,13 @@ def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: 
     if _get_setting("crypto_kill_switch") == "on":
         return False, "kill switch is ON"
 
+    # Symbol blacklist — user-banned coins (never buy regardless of signal).
+    blacklist_csv = _get_setting("crypto_symbol_blacklist") or ""
+    if blacklist_csv:
+        blacklist = {s.strip().upper() for s in blacklist_csv.split(",") if s.strip()}
+        if intent["symbol"].upper() in blacklist:
+            return False, f"{intent['symbol']} is blacklisted (user-banned)"
+
     # Daily auto-resume halts: today's P&L breached loss/profit threshold;
     # all positions were sold, no new entries until next MYT midnight.
     if _get_setting("crypto_today_loss_halted") == "1":
@@ -2019,9 +2026,9 @@ def _check_guardrails(intent: dict, mode: str, client=None, *, rotation_bypass: 
     # new entry is high-conviction and should override cooldown on different coin.
     if not rotation_bypass:
         try:
-            cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "24")
+            cooldown_h = float(_get_setting("crypto_loss_cooldown_hours") or "4")
         except (TypeError, ValueError):
-            cooldown_h = 24.0
+            cooldown_h = 4.0
         if cooldown_h > 0:
             last_loss = _last_losing_exit_at(intent["symbol"], is_paper_mode)
             if last_loss is not None:
