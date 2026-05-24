@@ -1088,10 +1088,8 @@ def maybe_setup_reentry(closed_position, sell_price: float, sell_pnl_pct: float)
 
     # Macro check: BTC above SMA50 on 4h
     try:
-        from analysis.crypto_data import load_cached
         from analysis.crypto_strategies import _btc_trend_ok
-        btc_df = load_cached("BTCUSDT", "4h")
-        if btc_df is None or btc_df.empty or not _btc_trend_ok(btc_df):
+        if not _btc_trend_ok("4h"):
             log.info("reentry %s skipped — BTC regime not OK", symbol)
             return
     except Exception as e:
