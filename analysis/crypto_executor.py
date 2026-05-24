@@ -1003,10 +1003,15 @@ def _compute_reentry_level(sell_price: float, original_entry: float,
             candidates.extend([ema20, low5])
         except Exception:
             pass
-    valid = [c for c in candidates if c is not None and 0 < c < current_price]
+    # Require at least 1% PULLBACK from sell_price (and from current).
+    # Without this, when stop fires AT current price, formula would pick
+    # sell_price as the limit → fills immediately = no pullback discount.
+    # The whole point of re-entry is "wait for retest", so enforce minimum gap.
+    max_acceptable = min(current_price, sell_price) * 0.99
+    valid = [c for c in candidates if c is not None and 0 < c <= max_acceptable]
     if not valid:
         return None
-    return max(valid)  # highest support below current = closest test
+    return max(valid)  # highest support below threshold = closest test
 
 
 def _place_reentry_limit(symbol: str, limit_price: float, size_usd: float) -> str | None:
