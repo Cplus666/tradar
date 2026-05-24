@@ -1086,12 +1086,27 @@ def maybe_setup_reentry(closed_position, sell_price: float, sell_pnl_pct: float)
         log.info("reentry %s skipped — already have pending order", symbol)
         return
 
-    # Macro check: BTC above SMA50 on 4h
+    # Macro check: allow re-entry if BTC > SMA50 OR coin shows its own
+    # relative strength (≥3% above own SMA50). Matches the regime-tolerant
+    # scan logic — consistent across fresh signals and re-entries.
     try:
         from analysis.crypto_strategies import _btc_trend_ok
+        from analysis.crypto_data import load_cached
         if not _btc_trend_ok("4h"):
-            log.info("reentry %s skipped — BTC regime not OK", symbol)
-            return
+            # BTC weak — check coin's own RS as fallback
+            coin_df = load_cached(symbol, "1h")
+            rs_ok = False
+            if coin_df is not None and not coin_df.empty and len(coin_df) >= 50:
+                closes = coin_df["Close"].astype(float)
+                cur = float(closes.iloc[-1])
+                sma50 = float(closes.tail(50).mean())
+                if sma50 > 0:
+                    rs_pct = (cur - sma50) / sma50 * 100
+                    rs_ok = rs_pct >= 3.0
+            if not rs_ok:
+                log.info("reentry %s skipped — BTC weak AND coin RS < 3%%", symbol)
+                return
+            log.info("reentry %s: BTC weak but coin RS >= 3%% — proceeding", symbol)
     except Exception as e:
         log.warning("reentry %s: btc check failed: %s", symbol, e)
         return
