@@ -491,6 +491,61 @@ def prebreakout_consolidation_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     }
 
 
+def slow_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
+    """Low-volume breakout with multi-bar confirmation. Catches coins like ONDO
+    that grind up on weak volume — standard breakout_1h requires vol > 1.5×
+    which rejects these. This variant accepts vol >= 1.0× BUT requires the
+    breakout to hold for 2 consecutive bars (proof it's real, not a wick).
+
+    Filters:
+      - Last 2 1h bars BOTH closed above prior 20-bar high (sustained breakout)
+      - Volume >= 1.0× avg (relaxed — quality not quantity)
+      - Close > SMA50 by ≥0.5%
+      - RSI 50-72 (uptrend, not exhausted)
+      - 24h chg < 25% (not parabolic)
+    """
+    if df is None or df.empty or len(df) < 25:
+        return None
+    d = attach(df).dropna(subset=["high20", "atr14", "sma50", "volratio", "rsi14"])
+    if len(d) < 25:
+        return None
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+    close = float(last["Close"])
+    prev_close = float(prev["Close"])
+    # Prior high BEFORE the breakout (i.e., 2 bars back's high20, since last 2 broke above)
+    prior_high = float(d["high20"].iloc[-3])
+    sma50 = float(last["sma50"])
+    vr = float(last["volratio"])
+    rsi = float(last["rsi14"])
+    chg_24h = (close - float(d["Close"].iloc[-25])) / float(d["Close"].iloc[-25]) * 100
+    sma50_margin = (close - sma50) / sma50 * 100 if sma50 > 0 else -999
+
+    # Both last 2 closes above prior 20-bar high (sustained, not 1-bar wick)
+    if not (prev_close > prior_high and close > prior_high):
+        return None
+    # Relaxed volume (1.0× instead of 1.5×)
+    if vr < 1.0:
+        return None
+    if sma50_margin < 0.5:
+        return None
+    if not (50 <= rsi <= 72):
+        return None
+    if chg_24h >= 25:
+        return None
+
+    return {
+        "date": d.index[-1], "symbol": symbol,
+        "strategy": "slow_breakout_1h", "side": "BUY",
+        "entry_price": close,
+        "stop_price": close * 0.95,
+        "target_price": close * 1.06,  # +6% target (lower than +8% since slower setup)
+        "max_hold_bars": 18,
+        "exit_rule": "stop_target_time",
+        "reason": f"2-bar sustained breakout, vol={vr:.1f}x, RSI={rsi:.0f}, 24h+{chg_24h:.1f}%",
+    }
+
+
 # Registry: each strategy declares its native timeframe.
 # scan_crypto() loads the right kline data per strategy.
 STRATEGIES_BY_TIMEFRAME = {
@@ -504,6 +559,7 @@ STRATEGIES_BY_TIMEFRAME = {
         "breakout_1h": crypto_breakout_1h,
         "support_bounce": support_bounce_1h,
         "prebreakout_consol": prebreakout_consolidation_1h,
+        "slow_breakout_1h": slow_breakout_1h,
     },
 }
 
