@@ -1132,7 +1132,7 @@ def maybe_setup_reentry(closed_position, sell_price: float, sell_pnl_pct: float)
         max_pos = _f("crypto_max_position_usd")
     except Exception:
         max_pos = 60.0
-    size_usd = max_pos * 0.75
+    size_usd = max_pos
 
     oid = _place_reentry_limit(symbol, level, size_usd)
     if not oid:
