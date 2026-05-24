@@ -2185,8 +2185,19 @@ def execute_intent(intent: dict) -> dict:
                         intent["symbol"], e)
 
         if is_strong_continuation:
-            # Strong bar: skip smart-limit, fall through to MARKET buy below
-            pass
+            # Strong bar: skip smart-limit, fall through to MARKET buy below.
+            # WIDEN STOP to -8%: market buy pays peak price, so the position
+            # needs more breathing room for normal post-breakout pullbacks.
+            # Without this, today's ME pattern: bot market-buys $0.1059 on
+            # strong bar, normal pullback hits -5% stop ($0.1006) within hours.
+            # With -8% stop ($0.0974), position has room to retest support
+            # and recover.
+            old_stop = intent.get("stop_price", 0)
+            new_stop = intent["entry_price"] * 0.92  # -8% from scan price
+            if new_stop < old_stop:  # only widen, never tighten
+                intent["stop_price"] = new_stop
+                log.info("AGGRESSIVE ENTRY %s: widened stop $%.6f → $%.6f (-8%%)",
+                         intent["symbol"], old_stop, new_stop)
         else:
             # Weak/neutral bar: place smart-limit at pullback level
             try:
