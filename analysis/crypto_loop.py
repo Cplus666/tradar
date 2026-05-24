@@ -288,7 +288,18 @@ def run_fast_exit_check() -> None:
                 trail_pct = float(_get_setting("crypto_surge_trail_pct") or "3.0")
             except (TypeError, ValueError):
                 trail_pct = 3.0
-            high = max(float(meta.get("trail_high") or cur), cur)
+            # Use 5min bar HIGH (not just cur ticker price) so wicks/spikes
+            # get captured. Ticker price misses any intra-bar peak that
+            # happened between scans.
+            bar_high = cur
+            try:
+                from binance.client import Client
+                kl5 = Client().get_klines(symbol=pos.symbol, interval="5m", limit=3)
+                if kl5:
+                    bar_high = max(float(k[2]) for k in kl5)  # high of last 3 5m bars
+            except Exception:
+                pass
+            high = max(float(meta.get("trail_high") or 0), cur, bar_high)
             if high > float(meta.get("trail_high") or 0):
                 _set_trail_in_notes(pos, high)
             trail_stop = high * (1 - trail_pct / 100.0)
