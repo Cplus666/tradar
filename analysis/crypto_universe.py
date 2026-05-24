@@ -68,6 +68,24 @@ def get_dynamic_universe(
 
     # 1) Apply hard volume floor
     usdt = [t for t in usdt if float(t["quoteVolume"]) >= min_volume_usd]
+
+    # 1.5) Filter out symbols that aren't actively TRADING on Binance
+    #      (BREAK = suspended, HALT = emergency stop, etc.). Without this,
+    #      suspended symbols like UTKUSDT keep appearing in scans, wasting
+    #      every loop's CPU + Binance API calls. Single batch lookup via
+    #      get_exchange_info — cheap.
+    try:
+        exch = client.get_exchange_info()
+        tradeable_status = {s["symbol"] for s in exch["symbols"]
+                            if s.get("status") == "TRADING"}
+        before = len(usdt)
+        usdt = [t for t in usdt if t["symbol"] in tradeable_status]
+        dropped = before - len(usdt)
+        if dropped > 0:
+            log.info("dropped %d non-TRADING symbols (BREAK/HALT/etc)", dropped)
+    except Exception as e:
+        log.warning("exchange status filter failed (allowing all): %s", e)
+
     log.info("after volume + symbol filters: %d candidates", len(usdt))
 
     # 2) Top by volume
