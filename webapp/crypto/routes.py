@@ -647,6 +647,15 @@ def _daily_pnl(days: int = 30) -> list:
 
         # Cache read/write: deterministic from trades + deposits, so we can safely
         # overwrite stale rows. Trust source='synth' rows; overwrite anything else.
+        # Authoritative day-start rows are written from REAL balances — the
+        # midnight rollover writes source='entry_basis' (USDT + Σ qty×entry) and
+        # a true-balance snapshot writes source='live'. Both are anchored to the
+        # actual account, so they OUTRANK the trade-history synth value and must
+        # never be overwritten by it. (Bug A, 2026-05-30: this block used to
+        # clobber the entry_basis row with synth — only 'live' was protected — so
+        # the ROI graph showed day-start 260.17 while the dashboard card showed
+        # 264.62 for the same day.)
+        AUTHORITATIVE_SOURCES = ("live", "entry_basis")
         if cache_writes_enabled:
             snap = snapshots.get(date_iso)
             if snap is None:
@@ -656,19 +665,31 @@ def _daily_pnl(days: int = 30) -> list:
                     source="synth",
                 ))
                 rows_dirty = True
-            elif snap.source == "live":
-                # 'live' snapshot was written at midnight from actual Binance
-                # balance — more accurate than synth. Never overwrite it.
+            elif snap.source in AUTHORITATIVE_SOURCES:
+                # Written at midnight from actual balances — never overwrite.
                 pass
             elif abs(float(snap.total_value_usd) - synth_day_start) > 0.01:
                 snap.total_value_usd = round(synth_day_start, 4)
                 snap.source = "synth"
                 rows_dirty = True
-        # Prefer 'live' snapshot when available; fall back to synth.
+        # Prefer an authoritative (balance-anchored) snapshot; fall back to synth.
         snap = snapshots.get(date_iso)
         day_start_value = (float(snap.total_value_usd)
-                           if snap and snap.source == "live"
+                           if snap and snap.source in AUTHORITATIVE_SOURCES
                            else synth_day_start)
+        # Today's bar is bound DIRECTLY to the same setting the dashboard card
+        # reads (crypto_day_start_value_usd), so the graph and card can never
+        # disagree for today — even if this day's snapshot row was clobbered to
+        # synth before this fix shipped. That setting is the entry-basis snapshot
+        # taken at 00:00 MYT (written by update_day_start_and_check_halt).
+        if date_iso == today_myt.isoformat():
+            _ds_date = _setting("crypto_day_start_date", "")
+            try:
+                _ds_val = float(_setting("crypto_day_start_value_usd", "0") or 0)
+            except (TypeError, ValueError):
+                _ds_val = 0.0
+            if _ds_date == date_iso and _ds_val > 0:
+                day_start_value = _ds_val
 
         portfolio_pct = (v["pnl"] / day_start_value * 100) if day_start_value > 0 else 0.0
         points.append({
