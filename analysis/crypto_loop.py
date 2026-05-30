@@ -20,6 +20,32 @@ from webapp.models import CryptoRun, CryptoTrade, db
 log = logging.getLogger("crypto_loop")
 
 
+def _bar_seconds_for(strategy: str | None) -> int:
+    """Seconds-per-bar for a position's time-stop, derived from the strategy's
+    REGISTERED native timeframe in STRATEGIES_BY_TIMEFRAME — NOT string-matched
+    on the name.
+
+    Bug fixed 2026-05-30: the old heuristic forced any strategy whose name
+    contained 'momentum' or 'oversold' onto 1h bars. But momentum_surge and
+    oversold_meanrev are 4h strategies, so their max_hold_bars (authored in 4h
+    units) timed out 4x too early — e.g. momentum_surge's 12-bar "2 day" hold
+    exited at 12h, dumping MEME right before a +5% run. The same heuristic erred
+    the other way for support_bounce / prebreakout_consol: those ARE 1h
+    strategies but their names lack '1h', so they were treated as 4h and held
+    too long. Looking the timeframe up from the registry fixes both directions.
+    """
+    from analysis.crypto_strategies import STRATEGIES_BY_TIMEFRAME
+    tf_seconds = {"1h": 3600, "4h": 4 * 3600}
+    name = (strategy or "").strip()
+    for tf, strats in STRATEGIES_BY_TIMEFRAME.items():
+        if name in strats:
+            return tf_seconds.get(tf, 4 * 3600)
+    # Unregistered strategies (re-entry, manual, legacy): keep the old default
+    # of 4h unless the name explicitly carries '1h'. Crucially WITHOUT the
+    # buggy momentum/oversold special-casing.
+    return 3600 if "1h" in name.lower() else 4 * 3600
+
+
 def _trend_intact(df, peak_pnl_pct: float, current_pnl_pct: float) -> tuple[bool, str]:
     """Smart-stop trend filter. Returns (is_intact, reason).
 
@@ -121,12 +147,8 @@ def _check_exits() -> list[str]:
             continue
         cur_price = float(df["Close"].iloc[-1])
         meta = parse_entry_notes(pos.notes)
-        # Bar size depends on strategy: 1h strategies use 1-hour bars; others use 4-hour
-        strat = (pos.strategy or "").lower()
-        if "1h" in strat or "momentum" in strat or "oversold" in strat:
-            bar_seconds = 3600  # 1h
-        else:
-            bar_seconds = 4 * 3600  # 4h
+        # Bar size from the strategy's registered native timeframe (see _bar_seconds_for)
+        bar_seconds = _bar_seconds_for(pos.strategy)
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
         # Reconcile any on-exchange trail stop-limit that already filled
@@ -256,9 +278,8 @@ def run_fast_exit_check() -> None:
         if cur is None:
             continue
         meta = parse_entry_notes(pos.notes)
-        # Bar size depends on strategy
-        strat = (pos.strategy or "").lower()
-        bar_seconds = 3600 if ("1h" in strat or "momentum" in strat or "oversold" in strat) else 14400
+        # Bar size from the strategy's registered native timeframe (see _bar_seconds_for)
+        bar_seconds = _bar_seconds_for(pos.strategy)
         bars_held = int((datetime.utcnow() - pos.executed_at).total_seconds() / bar_seconds)
 
         # Reconcile any trail stop-limit order that already filled on the
