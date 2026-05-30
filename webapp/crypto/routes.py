@@ -170,7 +170,7 @@ def _account_summary(prefetched_tickers: dict | None = None) -> dict:
         # Sum CURRENT unrealized P&L (vs entry, net of estimated round-trip
         # fees) for ALL open positions — regardless of when they were opened.
         # Matches the values shown on the dashboard position cards.
-        buy_value = float(p.price) * qty
+        buy_value = float(getattr(p, "_avg_entry", p.price)) * qty
         sell_value = value
         gross = sell_value - buy_value
         fee = (buy_value + sell_value) * fee_rate
@@ -362,10 +362,10 @@ def _open_position_cards(tickers: dict | None = None) -> list:
     out = []
     for p in _open_positions(is_paper=False):
         meta = parse_entry_notes(p.notes)
+        entry = float(getattr(p, "_avg_entry", p.price))  # weighted-avg cost basis
         cur = (tickers or {}).get(p.symbol)
         if cur is None:
-            cur = float(p.price)  # placeholder = entry price (gauge centers, P&L = 0)
-        entry = float(p.price)
+            cur = entry  # placeholder = entry price (gauge centers, P&L = 0)
         stop = meta["stop"] or entry * 0.95
         target = meta["target"] or entry * 1.05
         held_h = (datetime.utcnow() - p.executed_at).total_seconds() / 3600
@@ -1483,7 +1483,7 @@ def holdings():
             open_pos_by_asset[asset] = {
                 "trade_id": p.id,
                 "symbol": p.symbol,
-                "entry_price": float(p.price),
+                "entry_price": float(getattr(p, "_avg_entry", p.price)),
                 "strategy": p.strategy,
                 "partial_done": meta.get("partial_done", False),
             }
@@ -1655,7 +1655,7 @@ def coin_detail(symbol: str):
         except (TypeError, ValueError):
             _coin_fee_rate = 0.001
         rem_qty = float(getattr(open_pos, "_remaining_qty", open_pos.qty))
-        entry_price = float(open_pos.price)
+        entry_price = float(getattr(open_pos, "_avg_entry", open_pos.price))
         buy_value = entry_price * rem_qty
         sell_value = last_close * rem_qty
         gross = sell_value - buy_value

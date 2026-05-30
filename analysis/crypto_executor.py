@@ -1759,15 +1759,28 @@ def _open_positions(is_paper: bool | None = None) -> list:
     if is_paper is not None:
         q = q.filter_by(is_paper=is_paper)
     trades = q.order_by(CryptoTrade.executed_at).all()
-    open_qty: dict[tuple[str, bool], float] = {}
+    # Track FIFO remaining lots per (symbol, paper) — [qty, price] each — so we can
+    # compute the WEIGHTED-AVERAGE entry of what's still open. A position averaged
+    # across several buys must use its blended cost basis, NOT just the last buy's
+    # price (which understated cost on add-ins and made P&L read better than real).
+    lots: dict[tuple[str, bool], list] = {}
     for t in trades:
         if t.strategy == "manual_liquidation":
             continue
         key = (t.symbol, t.is_paper)
-        sign = 1 if t.side == "BUY" else -1
-        open_qty[key] = open_qty.get(key, 0) + sign * t.qty
+        ls = lots.setdefault(key, [])
+        if t.side == "BUY":
+            ls.append([float(t.qty), float(t.price)])
+        elif t.side == "SELL":
+            sq = float(t.qty)
+            while sq > 1e-9 and ls:
+                if ls[0][0] <= sq + 1e-12:
+                    sq -= ls[0][0]; ls.pop(0)
+                else:
+                    ls[0][0] -= sq; sq = 0.0
     result = []
-    for (sym, paper), qty in open_qty.items():
+    for (sym, paper), ls in lots.items():
+        qty = sum(l[0] for l in ls)
         if qty <= 1e-9:
             continue
         last_buy = (
@@ -1778,16 +1791,17 @@ def _open_positions(is_paper: bool | None = None) -> list:
         )
         if not last_buy:
             continue
+        # Weighted-average entry across the remaining open lots (FIFO).
+        avg_entry = (sum(l[0] * l[1] for l in ls) / qty) if qty > 0 else float(last_buy.price)
         # Dust filter: ignore positions worth less than $5 — Binance MIN_NOTIONAL
         # rejects sells under $5/$10 anyway, so tracking these leads to repeated
         # SELL FAILED warnings and clutters the dashboard with un-closeable dust.
         residual_value = qty * float(last_buy.price)
         if residual_value < 5.0:
             continue
-        # Attach the remaining net qty (post-partial-sells) so callers can
-        # compute correct unrealized P&L. last_buy.qty is the ORIGINAL buy
-        # qty; _remaining_qty is what's actually still open.
+        # Attach the remaining net qty (post-partial-sells) AND the blended entry.
         last_buy._remaining_qty = qty
+        last_buy._avg_entry = avg_entry
         result.append(last_buy)
     return result
 
