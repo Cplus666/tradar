@@ -369,12 +369,11 @@ def _open_position_cards(tickers: dict | None = None) -> list:
         stop = meta["stop"] or entry * 0.95
         target = meta["target"] or entry * 1.05
         held_h = (datetime.utcnow() - p.executed_at).total_seconds() / 3600
-        max_hold_h = meta["max_hold"]  # 4h-bar count for breakout_4h, 1h-bar count for breakout_1h, etc.
-        # Heuristic: if strategy contains "1h" or "momentum" or "oversold", bars are hours; if "4h", bars are *4 hours
-        if "1h" in (p.strategy or "") or "momentum" in (p.strategy or "") or "oversold" in (p.strategy or ""):
-            max_hold_hours = max_hold_h * 1
-        else:
-            max_hold_hours = max_hold_h * 4
+        max_hold_h = meta["max_hold"]  # bar count on the strategy's native timeframe
+        # Bars are on the strategy's REGISTERED timeframe — old string heuristic
+        # treated momentum_surge/oversold (4h) as 1h, showing 4x-too-short time-stops.
+        from analysis.crypto_loop import _bar_seconds_for
+        max_hold_hours = max_hold_h * (_bar_seconds_for(p.strategy) // 3600)
         time_to_stop_h = max(0, max_hold_hours - held_h)
         # Position of price between stop and target (0 = at stop, 1 = at target)
         if target > stop:

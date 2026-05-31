@@ -34,16 +34,21 @@ def _bar_seconds_for(strategy: str | None) -> int:
     strategies but their names lack '1h', so they were treated as 4h and held
     too long. Looking the timeframe up from the registry fixes both directions.
     """
+    return {"1h": 3600, "4h": 4 * 3600}.get(_strat_timeframe(strategy), 4 * 3600)
+
+
+def _strat_timeframe(strategy: str | None) -> str:
+    """The strategy's registered native timeframe ('1h'/'4h') from
+    STRATEGIES_BY_TIMEFRAME. Used so the time-stop, the strategy-exit SMA50
+    check, and the dashboard all evaluate a position on the SAME timeframe it
+    was entered on. Unregistered strategies (re-entry/manual) default to 4h
+    unless the name carries '1h'."""
     from analysis.crypto_strategies import STRATEGIES_BY_TIMEFRAME
-    tf_seconds = {"1h": 3600, "4h": 4 * 3600}
     name = (strategy or "").strip()
     for tf, strats in STRATEGIES_BY_TIMEFRAME.items():
         if name in strats:
-            return tf_seconds.get(tf, 4 * 3600)
-    # Unregistered strategies (re-entry, manual, legacy): keep the old default
-    # of 4h unless the name explicitly carries '1h'. Crucially WITHOUT the
-    # buggy momentum/oversold special-casing.
-    return 3600 if "1h" in name.lower() else 4 * 3600
+            return tf
+    return "1h" if "1h" in name.lower() else "4h"
 
 
 def _trend_intact(df, peak_pnl_pct: float, current_pnl_pct: float) -> tuple[bool, str]:
@@ -142,7 +147,10 @@ def _check_exits() -> list[str]:
     regime_off = not _btc_trend_ok("4h")
 
     for pos in _open_positions():
-        df = load_cached(pos.symbol, "4h")
+        # Load the position's NATIVE timeframe so the sma50_break exit checks the
+        # SAME SMA50 the entry used (breakout_1h enters above 1h SMA50; using the
+        # 4h df for the exit cut coins in a 1h bounce but 4h downtrend instantly).
+        df = load_cached(pos.symbol, _strat_timeframe(pos.strategy))
         if df is None or df.empty:
             continue
         cur_price = float(df["Close"].iloc[-1])
