@@ -881,6 +881,7 @@
             ${c.trail_active
               ? `<button onclick="toggleTrail(${c.id}, false)" class="text-[11px] px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-amber-300 rounded border border-amber-800">Disable Trail</button>`
               : `<button onclick="toggleTrail(${c.id}, true)"  class="text-[11px] px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-amber-300 rounded border border-zinc-700">Enable Trail</button>`}
+            <button onclick="extendHold(${c.id})" class="text-[11px] px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-sky-300 rounded border border-zinc-700">+48h hold</button>
           </div>
         </div>`;
       }).join('');
@@ -902,6 +903,19 @@
       } else {
         alert(`Could not ${verb} trail: ${data.reason}`);
       }
+    } catch (e) {
+      alert(`Network error: ${e}`);
+    }
+  }
+
+  // ---- Extend time-stop by +48h (per position) ----
+  async function extendHold(tradeId) {
+    if (!confirm("Extend this position's time-stop by 48h?")) return;
+    try {
+      const res = await fetch(`/tradar/api/position/${tradeId}/extend-hold`, { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) { loadDashboard(); }
+      else { alert(`Could not extend: ${data.reason}`); }
     } catch (e) {
       alert(`Network error: ${e}`);
     }

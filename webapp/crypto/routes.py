@@ -895,6 +895,36 @@ def api_sell_position(trade_id: int):
     })
 
 
+@bp.route("/api/position/<int:trade_id>/extend-hold", methods=["POST"])
+def api_extend_hold(trade_id: int):
+    """Manually extend a position's time-stop by +48h from now (dashboard button).
+    DB-only — bumps the max_hold token in notes. No orders touched."""
+    from analysis.crypto_executor import _open_positions
+    from analysis.crypto_loop import _bar_seconds_for
+    from webapp.models import db
+    import datetime as _dt
+    EXTEND_HOURS = 48
+    pos = {p.id: p for p in _open_positions(is_paper=False)}.get(trade_id)
+    if not pos:
+        return jsonify({"ok": False, "reason": "position not found"}), 404
+    bs = _bar_seconds_for(pos.strategy)
+    bars_held = int((_dt.datetime.utcnow() - pos.executed_at).total_seconds() / bs)
+    new_max = bars_held + int(EXTEND_HOURS * 3600 / bs)
+    parts, found = [], False
+    for tok in (pos.notes or "").split("·"):
+        t = tok.strip()
+        if t.startswith("max_hold="):
+            parts.append("max_hold=%d" % new_max); found = True
+        elif t:
+            parts.append(t)
+    if not found:
+        parts.append("max_hold=%d" % new_max)
+    pos.notes = " · ".join(parts)
+    db.session.commit()
+    return jsonify({"ok": True,
+                    "reason": f"time-stop extended +{EXTEND_HOURS}h (max_hold={new_max} {bs//3600}h-bars)"})
+
+
 @bp.route("/api/position/<int:trade_id>/enable-trail", methods=["POST"])
 def api_enable_trail(trade_id: int):
     """Enable trail mode on a position. Sets trail_active=1 with trail_high =
