@@ -31,6 +31,27 @@ SMA50_MIN_MARGIN_PCT = 0.5
 log = logging.getLogger("crypto_strategies")
 
 
+def _atr_stop_target(close: float, atr: float, *, mult: float = 3.0,
+                     floor_pct: float = 0.04, cap_pct: float = 0.08,
+                     rr: float = 1.6) -> tuple[float, float]:
+    """Volatility-based stop, floored and capped, with a fixed reward:risk target.
+
+    stop distance = clamp(mult x ATR, floor_pct, cap_pct) of price.
+      - FLOOR (4%): stops low-vol majors (BNB) from getting a too-tight ATR stop
+        that random noise wicks (the reason breakout_1h had reverted to flat 5%).
+      - CAP (8%): bounds the single-trade loss on wild memecoins (MEME wicked at
+        the old flat 5%, which sat *inside* its normal swing range).
+    Target = entry + rr x stop_distance, so reward:risk stays ~1.6 regardless.
+
+    Params are defaults; the simulator can sweep mult/cap to tune before live.
+    """
+    if atr is None or not (atr > 0) or atr != atr:  # None / <=0 / NaN
+        dist = close * floor_pct
+    else:
+        dist = min(max(mult * atr, close * floor_pct), close * cap_pct)
+    return close - dist, close + rr * dist
+
+
 def _btc_trend_ok(interval: str = "4h") -> bool:
     """BTC must be above its SMA50 to allow long entries on alts."""
     df = load_cached("BTCUSDT", interval)
@@ -88,8 +109,7 @@ def crypto_breakout_4h(df: pd.DataFrame, symbol: str) -> dict | None:
     return {
         "date": d.index[-1], "symbol": symbol, "strategy": "breakout_4h", "side": "BUY",
         "entry_price": close,
-        "stop_price": close - 2.5 * atr,
-        "target_price": close + 4.0 * atr,
+        **dict(zip(("stop_price", "target_price"), _atr_stop_target(close, atr))),
         "max_hold_bars": 24,
         "exit_rule": "sma50_break",
         "reason": f"fresh breakout +{gap:.1f}% over prior high, vol={vr:.1f}x, RSI={rsi:.0f}",
@@ -315,15 +335,17 @@ def crypto_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     ):
         return None
 
-    # Fixed-percent stops/targets — ATR-based was too tight for low-vol majors
-    # like BNB (2-bar ATR=$5 = 0.7% stop → wicked by random noise). 5%/8% gives
-    # the trade room to breathe through normal pullbacks while keeping R:R ~1.6.
+    # Volatility-based stop (floored 4% / capped 8%) — replaces flat 5%, which
+    # was too tight for wild movers (MEME wicked then bounced) yet the floor keeps
+    # low-vol majors (BNB) from a noise-wicked tight ATR stop.
+    atr = float(last["atr14"])
+    stop_price, target_price = _atr_stop_target(close, atr)
     return {
         "date": d.index[-1], "symbol": symbol, "strategy": "breakout_1h", "side": "BUY",
         "entry_price": close,
-        "stop_price": close * 0.95,         # -5%
-        "target_price": close * 1.08,       # +8%
-        "max_hold_bars": 12,                 # 12h max — short timeframe = quick exit
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "max_hold_bars": 36,                 # 36h (was 12h — too short, cut winners pre-target)
         "exit_rule": "sma50_break",
         "reason": f"1h fresh breakout +{gap:.1f}% over prior high, vol={vr:.1f}x, RSI={rsi:.0f}",
     }
@@ -414,7 +436,7 @@ def support_bounce_1h(df: pd.DataFrame, symbol: str) -> dict | None:
     return {
         "date": d.index[-1], "symbol": symbol, "strategy": "support_bounce", "side": "BUY",
         "entry_price": close, "stop_price": stop, "target_price": target,
-        "max_hold_bars": 18, "exit_rule": "stop_target_time",
+        "max_hold_bars": 30, "exit_rule": "stop_target_time",  # 30h (was 18h)
         "reason": f"support ${support_low:.5f} held {touches}x, +{rise_12h_pct:.1f}%/12h, RSI={rsi:.0f}",
     }
 
@@ -483,9 +505,9 @@ def prebreakout_consolidation_1h(df: pd.DataFrame, symbol: str) -> dict | None:
         "date": d.index[-1], "symbol": symbol,
         "strategy": "prebreakout_consol", "side": "BUY",
         "entry_price": close,
-        "stop_price": close * 0.97,    # -3%
-        "target_price": close * 1.05,  # +5%
-        "max_hold_bars": 8,             # 8 hours — quick decision
+        **dict(zip(("stop_price", "target_price"),
+                   _atr_stop_target(close, float(last["atr14"])))),
+        "max_hold_bars": 24,            # 24h (was 8h — too short to reach target)
         "exit_rule": "stop_target_time",
         "reason": f"prebreakout: {range_pct:.1f}% range, +{rise_12h:.1f}%/12h, {near_top:.1f}% from high",
     }
@@ -538,10 +560,10 @@ def slow_breakout_1h(df: pd.DataFrame, symbol: str) -> dict | None:
         "date": d.index[-1], "symbol": symbol,
         "strategy": "slow_breakout_1h", "side": "BUY",
         "entry_price": close,
-        "stop_price": close * 0.95,
-        "target_price": close * 1.06,  # +6% target (lower than +8% since slower setup)
-        "max_hold_bars": 18,
-        "exit_rule": "stop_target_time",
+        **dict(zip(("stop_price", "target_price"),
+                   _atr_stop_target(close, float(last["atr14"])))),
+        "max_hold_bars": 48,
+        "exit_rule": "stop_target_time",  # 48h (was 18h — BIO timed out 3h before target)
         "reason": f"2-bar sustained breakout, vol={vr:.1f}x, RSI={rsi:.0f}, 24h+{chg_24h:.1f}%",
     }
 
